@@ -1,0 +1,21 @@
+[package]
+name = "inferencekey-capi"
+description = "Stable C ABI over inferencekey-core, for FFI consumers (cgo, JNI/FFM, and other languages)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "inferencekey"
+# cdylib: the shared library FFI consumers link against.
+# staticlib: for cgo / static linking. rlib: so other Rust crates (tests) can use it.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+inferencekey-core = { path = "../core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

@@ -13,6 +13,7 @@
 //! wire bodies. Tokens are forwarded to the port verbatim and only ever appear
 //! in logs through [`redact`].
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::domain::enums::OnDrift;
@@ -27,7 +28,7 @@ use crate::ports::http::{HttpMethod, HttpPort, HttpRequest};
 
 /// Addresses a workload's OpenAI-compatible data-plane endpoint
 /// (`/endpoint/:project_slug/:workload_slug/v1/...`). Handed to a `DataClient`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointRef {
     pub project_slug: String,
     pub workload_slug: String,

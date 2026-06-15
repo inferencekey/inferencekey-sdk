@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "inferencekey"
+version = "0.1.0"
+description = "Official InferenceKey SDK — declare AI workloads in code, ensure they exist, and call the resulting OpenAI-compatible endpoints."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.9"
+authors = [{ name = "InferenceKey", email = "dev@inferencekey.com" }]
+keywords = ["inferencekey", "ai", "llm", "inference", "openai-compatible", "sdk"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Developers",
+]
+
+[project.urls]
+Homepage = "https://docs.inferencekey.com"
+Repository = "https://github.com/inferencekey/inferencekey-sdk"
+
+[tool.maturin]
+# The native extension is `_inferencekey`; the pure-Python wrapper package
+# `inferencekey` (under python/) re-exports an ergonomic, typed surface over it.
+module-name = "inferencekey._inferencekey"
+python-source = "python"
+features = ["pyo3/extension-module"]
