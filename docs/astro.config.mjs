@@ -18,6 +18,33 @@ export default defineConfig({
       title: "InferenceKey SDK",
       description:
         "Declare AI workloads in code, ensure they exist on the platform, and call the resulting OpenAI-compatible endpoints.",
+      // Brand: the iK monogram as the top-bar logo + favicon, the brand theme
+      // CSS, and the brand web fonts. Assets come from docs/brand/logos.
+      logo: { src: "./src/assets/brand/symbol-ik.svg", alt: "InferenceKey" },
+      favicon: "/favicon.svg",
+      customCss: ["./src/styles/brand.css"],
+      head: [
+        {
+          tag: "link",
+          attrs: {
+            rel: "stylesheet",
+            href: "https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap",
+          },
+        },
+        // Open Graph / social preview image (brand asset).
+        {
+          tag: "meta",
+          attrs: { property: "og:image", content: "https://docs.inferencekey.com/og.png" },
+        },
+        {
+          tag: "meta",
+          attrs: { name: "twitter:image", content: "https://docs.inferencekey.com/og.png" },
+        },
+        {
+          tag: "meta",
+          attrs: { name: "twitter:card", content: "summary_large_image" },
+        },
+      ],
       defaultLocale: "en",
       locales: {
         en: { label: "English", lang: "en" },
