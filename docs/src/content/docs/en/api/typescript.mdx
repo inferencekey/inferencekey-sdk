@@ -173,6 +173,52 @@ const out = await ep.generateText({
 console.log(out.text, out.model);
 ```
 
+### `ep.generateTextStream(params)`
+
+```ts
+generateTextStream(params: {
+  prompt?: string;
+  messages?: { role: string; content: string }[];
+  temperature?: number;
+  maxTokens?: number;
+}): AsyncGenerator<TextChunk, void, unknown>
+```
+
+Streams a chat completion. Same params as `generateText`, but returns an async
+iterable yielding one [`TextChunk`](#textchunk) per server-sent event as the
+reply is produced. The connection opens eagerly (auth/validation errors throw
+here, not mid-iteration); chunks are pulled lazily as you iterate.
+
+```ts
+for await (const chunk of ep.generateTextStream({ prompt: "Hola" })) {
+  process.stdout.write(chunk.text);
+}
+```
+
+### `ep.waitUntilReady(opts?)`
+
+```ts
+async waitUntilReady(opts?: {
+  timeoutMs?: number;     // default 300_000
+  intervalMs?: number;    // default 2_000
+  maxIntervalMs?: number; // default 15_000
+}): Promise<void>
+```
+
+Resolves once the workload's endpoint is serving. The control plane has no
+readiness flag, so this sends a tiny chat probe and retries with exponential
+backoff while the worker is still starting (transport / 5xx). A `401`/`403`/`404`
+(bad key, wrong token type, unknown workload) rejects immediately rather than
+spinning. Rejects with a timeout error if `timeoutMs` elapses first. Use it right
+after `ensure()` provisions a cold worker, before the first call.
+
+```ts
+await ep.waitUntilReady({ timeoutMs: 600_000 });
+for await (const chunk of ep.generateTextStream({ prompt: "..." })) {
+  process.stdout.write(chunk.text);
+}
+```
+
 ### `ep.embed(params)`
 
 ```ts
@@ -247,6 +293,20 @@ Returned by `generateText()`.
 interface TextResult {
   text: string;
   model: string;
+  finishReason?: string;
+  raw: unknown;
+}
+```
+
+### `TextChunk`
+
+Yielded by `generateTextStream()` — one per streamed event. `text` is the delta
+for that chunk (concatenate to rebuild the full reply); `finishReason` is set
+only on the terminal chunk.
+
+```ts
+interface TextChunk {
+  text: string;
   finishReason?: string;
   raw: unknown;
 }

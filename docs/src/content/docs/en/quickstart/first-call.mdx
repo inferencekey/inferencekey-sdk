@@ -143,7 +143,29 @@ The same `DataClient` reaches an embedding workload. Open its endpoint with that
 
 ## Streaming
 
-`generate_text` returns a single completed result. The endpoint also speaks **server-sent events** — tokens stream as they're produced and the stream terminates with `data: [DONE]`. For the streaming wire contract and how to consume it, see the references and guides below.
+`generate_text` returns a single completed result. To stream tokens as they're produced, use **`generate_text_stream` / `generateTextStream`** instead — same parameters, but it yields one `TextChunk` at a time. Concatenate `chunk.text` to rebuild the full reply.
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+
+```python
+for chunk in ep.generate_text_stream(prompt="Hola"):
+    print(chunk.text, end="", flush=True)
+```
+
+  </TabItem>
+  <TabItem label="TypeScript">
+
+```ts
+for await (const chunk of ep.generateTextStream({ prompt: "Hola" })) {
+  process.stdout.write(chunk.text);
+}
+```
+
+  </TabItem>
+</Tabs>
+
+Under the hood the endpoint speaks **server-sent events**, terminated by `data: [DONE]`; the SDK parses those frames into `TextChunk`s for you. For the raw wire contract see the references below.
 
 <CardGrid>
   <LinkCard

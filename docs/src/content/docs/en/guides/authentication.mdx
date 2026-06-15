@@ -135,7 +135,7 @@ An `ik_sdk_` token carries **scopes** that bound what it may do inside its proje
 The defaults exist so that `mgmt.ensure(...)` works end to end: it needs `workload:write` to create or patch the workload and `assignment:write` to bind it to where it runs. If you mint a **read-only** token — for an audit job or a dashboard that only lists workloads — give it `workload:read` alone. Calling a write route with a read-only token raises [`scope_insufficient`](#wrong-token-errors).
 
 <Aside type="note">
-Scopes are a property of the **`ik_sdk_` control token only**. The `ik_live_` data token is not scoped this way — its reach is the single workload whose key it is, enforced by the data-plane route `/endpoint/:projectSlug/:workloadSlug/v1/...`.
+Scopes (capabilities like `workload:write`) are a property of the **`ik_sdk_` control token only**. An `ik_live_` data token is instead gated by **which endpoints it may call**, enforced by the data-plane route `/endpoint/:projectSlug/:workloadSlug/v1/...`. Its reach is whichever endpoints it was granted: one or more specific `projectSlug/workloadSlug` (per workload — the common, least-privilege case), or a `projectSlug/*` wildcard that grants **every workload in that project, including ones created later**. The project-wide form is convenient (one key, no per-workload reassignment) but has a wider blast radius — prefer per-workload keys unless a caller genuinely needs the whole project.
 </Aside>
 
 ## Resolution precedence

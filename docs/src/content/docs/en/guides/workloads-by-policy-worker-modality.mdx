@@ -33,7 +33,7 @@ Examples assume `INFERENCEKEY_SDK_TOKEN` (control plane) and `INFERENCEKEY_PROJE
 - **`autoscaling`** — replica count tracks load between a floor and a ceiling. Good for spiky chat or image traffic.
 
 <Aside type="note">
-The shape of `execution_policy_config` is validated by the Manager and may evolve; the keys shown below (`replicas`, `cron`/`window`, `min_replicas`/`max_replicas`) are illustrative. The policy *name* is the contract. See [Backends & policies](/reference/backends-and-policies/).
+The policy *name* (`fixed` / `scheduled` / `autoscaling`) is the stable contract; `execution_policy_config` is validated by the Manager. For **autoscaling on cloud GPUs** the config carries `min_workers` / `max_workers` (not `min_replicas`/`max_replicas`), a required `max_hourly_cost_usd` (> 0), and a `workers.cloud_pool` with a non-empty `gpu_pool` (catalog display names) and an optional `allowed_cuda_versions` pin. The flat `gpu_pool` at the root is a legacy form that **cannot** carry `allowed_cuda_versions` — prefer the `workers.cloud_pool` shape shown below. See [Backends & policies](/reference/backends-and-policies/).
 </Aside>
 
 ### Worker — *where it runs*
@@ -193,10 +193,26 @@ base = dict(
     command="vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
 )
 
-# Autoscaling (cloud): replica count tracks load.
+# Autoscaling (cloud): worker count tracks load between a floor and a ceiling.
+# Cloud autoscaling needs a cost ceiling and a GPU pool; worker bounds are
+# min_workers / max_workers (NOT min/max_replicas).
 mgmt.ensure(WorkloadSpec(**base,
     execution_policy=ExecutionPolicy.AUTOSCALING,
-    execution_policy_config={"min_replicas": 0, "max_replicas": 5}))
+    execution_policy_config={
+        "min_workers": 0,
+        "max_workers": 5,
+        "max_hourly_cost_usd": 5.0,        # required, must be > 0
+        "workers": {
+            "source": "cloud",
+            "cloud_pool": {
+                # display names from the cloud catalog (dashboard → GPU Resources)
+                "gpu_pool": ["NVIDIA A100-SXM4-80GB"],
+                "max_hourly_cost_usd": 5.0,
+                "max_instances": 5,
+                "allowed_cuda_versions": ["13.0"],  # optional CUDA pin
+            },
+        },
+    }))
 
 # Scheduled: daytime-only assistant.
 mgmt.ensure(WorkloadSpec(**base,
@@ -224,10 +240,26 @@ const base = {
   command: "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
 };
 
-// Autoscaling (cloud): replica count tracks load.
+// Autoscaling (cloud): worker count tracks load between a floor and a ceiling.
+// Cloud autoscaling needs a cost ceiling and a GPU pool; worker bounds are
+// min_workers / max_workers (NOT min/max_replicas).
 await mgmt.ensure({ ...base,
   executionPolicy: "autoscaling",
-  executionPolicyConfig: { min_replicas: 0, max_replicas: 5 } });
+  executionPolicyConfig: {
+    min_workers: 0,
+    max_workers: 5,
+    max_hourly_cost_usd: 5.0,            // required, must be > 0
+    workers: {
+      source: "cloud",
+      cloud_pool: {
+        // display names from the cloud catalog (dashboard → GPU Resources)
+        gpu_pool: ["NVIDIA A100-SXM4-80GB"],
+        max_hourly_cost_usd: 5.0,
+        max_instances: 5,
+        allowed_cuda_versions: ["13.0"],  // optional CUDA pin
+      },
+    },
+  } });
 
 // Scheduled: daytime-only assistant.
 await mgmt.ensure({ ...base,
@@ -344,10 +376,14 @@ base = dict(
 mgmt.ensure(WorkloadSpec(**base,
     execution_policy=ExecutionPolicy.FIXED, execution_policy_config={"replicas": 1}))
 
-# Autoscaling (private worker): scale on your own hardware.
+# Autoscaling (private worker): scale on your own hardware. See the full
+# config shapes in Backends & policies (/reference/backends-and-policies/).
 mgmt.ensure(WorkloadSpec(**base, worker_id="wrk_7Yc2...",
     execution_policy=ExecutionPolicy.AUTOSCALING,
-    execution_policy_config={"min_replicas": 1, "max_replicas": 4}))
+    execution_policy_config={
+        "min_workers": 1, "max_workers": 4,
+        "workers": {"source": "private", "private_worker_ids": ["wrk_7Yc2..."]},
+    }))
 ```
 
   </TabItem>
@@ -366,10 +402,14 @@ const base = {
 await mgmt.ensure({ ...base,
   executionPolicy: "fixed", executionPolicyConfig: { replicas: 1 } });
 
-// Autoscaling (private worker): scale on your own hardware.
+// Autoscaling (private worker): scale on your own hardware. See the full
+// config shapes in Backends & policies (/reference/backends-and-policies/).
 await mgmt.ensure({ ...base, workerId: "wrk_7Yc2...",
   executionPolicy: "autoscaling",
-  executionPolicyConfig: { min_replicas: 1, max_replicas: 4 } });
+  executionPolicyConfig: {
+    min_workers: 1, max_workers: 4,
+    workers: { source: "private", private_worker_ids: ["wrk_7Yc2..."] },
+  } });
 ```
 
   </TabItem>
@@ -402,7 +442,13 @@ ref = mgmt.ensure(WorkloadSpec(
     command="vllm-omni serve stabilityai/stable-diffusion-3.5-large",
     vllm_version="0.6.3",  # optional: pin the serving runtime
     execution_policy=ExecutionPolicy.AUTOSCALING,
-    execution_policy_config={"min_replicas": 0, "max_replicas": 3},
+    # Full autoscaling shape: see /reference/backends-and-policies/.
+    execution_policy_config={
+        "min_workers": 0, "max_workers": 3, "max_hourly_cost_usd": 5.0,
+        "workers": {"source": "cloud", "cloud_pool": {
+            "gpu_pool": ["NVIDIA A100-SXM4-80GB"], "max_hourly_cost_usd": 5.0, "max_instances": 3,
+        }},
+    },
 ))
 ```
 
@@ -423,7 +469,13 @@ const ref = await mgmt.ensure({
   command: "vllm-omni serve stabilityai/stable-diffusion-3.5-large",
   vllmVersion: "0.6.3", // optional: pin the serving runtime
   executionPolicy: "autoscaling",
-  executionPolicyConfig: { min_replicas: 0, max_replicas: 3 },
+  // Full autoscaling shape: see /reference/backends-and-policies/.
+  executionPolicyConfig: {
+    min_workers: 0, max_workers: 3, max_hourly_cost_usd: 5.0,
+    workers: { source: "cloud", cloud_pool: {
+      gpu_pool: ["NVIDIA A100-SXM4-80GB"], max_hourly_cost_usd: 5.0, max_instances: 3,
+    }},
+  },
 });
 ```
 
@@ -638,7 +690,13 @@ base = dict(
 # Autoscaling (cloud): scale with podcast/render demand.
 mgmt.ensure(WorkloadSpec(**base,
     execution_policy=ExecutionPolicy.AUTOSCALING,
-    execution_policy_config={"min_replicas": 0, "max_replicas": 4}))
+    # Compact cloud autoscaling; full shape at /reference/backends-and-policies/.
+    execution_policy_config={
+        "min_workers": 0, "max_workers": 4, "max_hourly_cost_usd": 5.0,
+        "workers": {"source": "cloud", "cloud_pool": {
+            "gpu_pool": ["NVIDIA A100-SXM4-80GB"], "max_hourly_cost_usd": 5.0, "max_instances": 4,
+        }},
+    }))
 
 # Scheduled (cloud): generate daily briefings each morning.
 mgmt.ensure(WorkloadSpec(**base,
@@ -661,7 +719,13 @@ const base = {
 // Autoscaling (cloud): scale with podcast/render demand.
 await mgmt.ensure({ ...base,
   executionPolicy: "autoscaling",
-  executionPolicyConfig: { min_replicas: 0, max_replicas: 4 } });
+  // Compact cloud autoscaling; full shape at /reference/backends-and-policies/.
+  executionPolicyConfig: {
+    min_workers: 0, max_workers: 4, max_hourly_cost_usd: 5.0,
+    workers: { source: "cloud", cloud_pool: {
+      gpu_pool: ["NVIDIA A100-SXM4-80GB"], max_hourly_cost_usd: 5.0, max_instances: 4,
+    }},
+  } });
 
 // Scheduled (cloud): generate daily briefings each morning.
 await mgmt.ensure({ ...base,
@@ -696,7 +760,13 @@ ref = mgmt.ensure(WorkloadSpec(
     task_type="audio2text",
     command="vllm-omni serve openai/whisper-large-v3",
     execution_policy=ExecutionPolicy.AUTOSCALING,
-    execution_policy_config={"min_replicas": 0, "max_replicas": 6},
+    # Full autoscaling shape: see /reference/backends-and-policies/.
+    execution_policy_config={
+        "min_workers": 0, "max_workers": 6, "max_hourly_cost_usd": 5.0,
+        "workers": {"source": "cloud", "cloud_pool": {
+            "gpu_pool": ["NVIDIA A100-SXM4-80GB"], "max_hourly_cost_usd": 5.0, "max_instances": 6,
+        }},
+    },
 ))
 ```
 
@@ -716,7 +786,13 @@ const ref = await mgmt.ensure({
   taskType: "audio2text",
   command: "vllm-omni serve openai/whisper-large-v3",
   executionPolicy: "autoscaling",
-  executionPolicyConfig: { min_replicas: 0, max_replicas: 6 },
+  // Full autoscaling shape: see /reference/backends-and-policies/.
+  executionPolicyConfig: {
+    min_workers: 0, max_workers: 6, max_hourly_cost_usd: 5.0,
+    workers: { source: "cloud", cloud_pool: {
+      gpu_pool: ["NVIDIA A100-SXM4-80GB"], max_hourly_cost_usd: 5.0, max_instances: 6,
+    }},
+  },
 });
 ```
 
@@ -836,7 +912,13 @@ mgmt.ensure(WorkloadSpec(
     task_type="reranker",   # also: "classification", "reward"
     command="vllm serve BAAI/bge-reranker-v2-m3 --task score",
     execution_policy=ExecutionPolicy.AUTOSCALING,
-    execution_policy_config={"min_replicas": 0, "max_replicas": 3},
+    # Full autoscaling shape: see /reference/backends-and-policies/.
+    execution_policy_config={
+        "min_workers": 0, "max_workers": 3, "max_hourly_cost_usd": 5.0,
+        "workers": {"source": "cloud", "cloud_pool": {
+            "gpu_pool": ["NVIDIA A100-SXM4-80GB"], "max_hourly_cost_usd": 5.0, "max_instances": 3,
+        }},
+    },
 ))
 ```
 
@@ -857,7 +939,13 @@ await mgmt.ensure({
   taskType: "reranker", // also: "classification", "reward"
   command: "vllm serve BAAI/bge-reranker-v2-m3 --task score",
   executionPolicy: "autoscaling",
-  executionPolicyConfig: { min_replicas: 0, max_replicas: 3 },
+  // Full autoscaling shape: see /reference/backends-and-policies/.
+  executionPolicyConfig: {
+    min_workers: 0, max_workers: 3, max_hourly_cost_usd: 5.0,
+    workers: { source: "cloud", cloud_pool: {
+      gpu_pool: ["NVIDIA A100-SXM4-80GB"], max_hourly_cost_usd: 5.0, max_instances: 3,
+    }},
+  },
 });
 ```
 

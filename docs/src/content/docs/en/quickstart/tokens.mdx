@@ -59,7 +59,7 @@ Both live in the [dashboard](https://cloud.inferencekey.com), but on different s
    Open your project in the dashboard and go to **Tokens**. Create an SDK token; it is bound to that project. This is the value your `ManagementClient` reads.
 
 2. **`ik_live_` — the API Keys screen.**
-   Go to **API Keys** and mint a key for the workload(s) you want an app to call. Hand each app the narrowest key it needs. This is the value you pass to `data.endpoint(...)`.
+   Go to **API Keys** and mint a key. Choose its **access scope**: either **specific endpoints** (one or more workloads — the narrowest, recommended choice) or **the entire project**. Hand each app the narrowest key it needs. This is the value you pass to `data.endpoint(...)`.
 
 </Steps>
 
@@ -68,6 +68,21 @@ Both live in the [dashboard](https://cloud.inferencekey.com), but on different s
   declares infrastructure) but several `ik_live_` keys — one per workload, or
   per consuming app — so you can rotate or revoke them independently without
   touching provisioning.
+</Aside>
+
+### Project-wide keys
+
+When you pick **"Entire project"** for a key's scope, it is granted a
+`projectSlug/*` wildcard and can call **every workload in the project, including
+ones created later**. This is handy when you don't want to re-issue or reassign
+a key every time you add a workload — for example minting the key *before* the
+workload exists, then `ensure()`-ing the workload from code.
+
+<Aside type="caution" title="Wider blast radius">
+  A project-wide key trades least privilege for convenience: a leak exposes the
+  whole project's inference, not a single workload. Prefer per-workload keys for
+  anything user-facing; reach for the project scope only when a caller genuinely
+  needs every workload (e.g. an internal gateway, or a demo/dev setup).
 </Aside>
 
 ## Environment variables

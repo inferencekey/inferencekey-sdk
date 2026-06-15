@@ -144,6 +144,46 @@ out = ep.generate_text(prompt="Hola", temperature=0.2, max_tokens=300)
 print(out.text, out.model)
 ```
 
+### generate_text_stream
+
+```python
+def generate_text_stream(
+    self,
+    *,
+    prompt: str | None = None,
+    messages: list | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> Iterator[TextChunk]
+```
+
+Run a **streaming** chat completion. Same parameters as [`generate_text`](#generate_text), but instead of one result it returns an iterator yielding one [`TextChunk`](#textchunk) per server-sent event as the reply is produced. The connection is opened eagerly (so auth/validation errors raise here, not mid-iteration); chunks are then pulled lazily as you iterate. Concatenate `chunk.text` to rebuild the full reply.
+
+```python
+for chunk in ep.generate_text_stream(prompt="Hola"):
+    print(chunk.text, end="", flush=True)
+```
+
+### wait_until_ready
+
+```python
+def wait_until_ready(
+    self,
+    *,
+    timeout: float = 300.0,
+    interval: float = 2.0,
+    max_interval: float = 15.0,
+) -> None
+```
+
+Block until the workload's endpoint is serving. The control plane has no readiness flag, so this sends a tiny chat probe and retries with exponential backoff (up to `max_interval`) while the worker is still starting (transport / 5xx). A `401`/`403`/`404` (bad key, wrong token type, unknown workload) raises immediately rather than spinning. Raises `TimeoutError` if `timeout` elapses first. Useful right after `ensure()` provisions a cold worker, before the first call.
+
+```python
+ep.wait_until_ready(timeout=600)
+for chunk in ep.generate_text_stream(prompt="..."):
+    print(chunk.text, end="", flush=True)
+```
+
 ### embed
 
 ```python
@@ -227,6 +267,24 @@ class TextResult:
 | `model` | `str` | The model that produced the result. |
 | `finish_reason` | `str \| None` | Why generation stopped (e.g. `stop`, `length`), when reported. |
 | `raw` | `dict` | The underlying provider response, untouched. |
+
+## TextChunk
+
+Frozen dataclass yielded by [`generate_text_stream`](#generate_text_stream) — one per streamed event.
+
+```python
+@dataclass(frozen=True)
+class TextChunk:
+    text: str
+    finish_reason: str | None = None
+    raw: dict = {}
+```
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `text` | `str` | The delta for this chunk. Concatenate across chunks to rebuild the full reply. |
+| `finish_reason` | `str \| None` | Set only on the terminal chunk (e.g. `stop`, `length`). |
+| `raw` | `dict` | The underlying chunk JSON, untouched. |
 
 ## EmbedResult
 

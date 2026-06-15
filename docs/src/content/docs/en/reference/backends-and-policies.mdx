@@ -177,6 +177,60 @@ const ref = await mgmt.ensure({
   </TabItem>
 </Tabs>
 
+### `execution_policy_config` shapes
+
+The policy *name* is the stable contract; `execution_policy_config` carries the per-policy parameters and is validated by the Manager. The keys below are the ones the Manager actually validates.
+
+**`fixed`** — a constant allocation:
+
+```json
+{ "replicas": 1 }
+```
+
+**`scheduled`** — a window or cron expression:
+
+```json
+{ "cron": "0 2 * * *" }              // or: { "window": "Mon-Fri 08:00-20:00 Europe/Madrid" }
+```
+
+**`autoscaling` (cloud)** — scales cloud workers between a floor and a ceiling. Worker bounds are `min_workers` / `max_workers` (**not** `min_replicas`/`max_replicas`). A cost ceiling `max_hourly_cost_usd` (> 0) is **required**, and `workers.cloud_pool` needs a non-empty `gpu_pool` of catalog display names:
+
+```json
+{
+  "min_workers": 0,
+  "max_workers": 5,
+  "max_hourly_cost_usd": 5.0,
+  "workers": {
+    "source": "cloud",
+    "cloud_pool": {
+      "gpu_pool": ["NVIDIA A100-SXM4-80GB"],
+      "max_hourly_cost_usd": 5.0,
+      "max_instances": 5,
+      "allowed_cuda_versions": ["13.0"]
+    }
+  }
+}
+```
+
+`gpu_pool` entries are GPU display names from the cloud catalog (dashboard → **GPU Resources**). `allowed_cuda_versions` is an optional CUDA pin. A flat `gpu_pool` at the root is a legacy form that **cannot** carry `allowed_cuda_versions` — prefer the `workers.cloud_pool` shape above.
+
+**`autoscaling` (private worker)** — scales across your own registered workers instead of cloud GPUs:
+
+```json
+{
+  "min_workers": 1,
+  "max_workers": 4,
+  "workers": {
+    "source": "private",
+    "private_worker_ids": ["wrk_7Yc2..."]
+  }
+}
+```
+
+<Aside type="note">
+The config schema may gain fields over time, but these keys are what the current Manager validates. The [workloads guide](/guides/workloads-by-policy-worker-modality/) shows them in context per modality.
+</Aside>
+
 ## Putting it together
 
 `backend`, `task_type`, and `execution_policy` are independent fields on the same `WorkloadSpec`. Declare them together and call `ensure()` — drift is reconciled per [OnDrift](/reference/ondrift/).
