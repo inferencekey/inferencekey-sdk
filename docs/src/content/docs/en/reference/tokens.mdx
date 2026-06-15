@@ -13,11 +13,11 @@ read prompts.
 
 <CardGrid>
   <Card title="ik_sdk_ — control plane" icon="setting">
-    Provisions and reconciles workloads. Held by your **management client**,
+    Provisions and reconciles workloads. Held by your **ManagementClient**,
     scoped to **one project**. Cannot call inference.
   </Card>
   <Card title="ik_live_ — data plane" icon="rocket">
-    Calls inference. Passed **per workload** to the data client. One app can
+    Calls inference. Passed **per workload** to the DataClient. One app can
     use many `ik_live_` keys. Cannot provision.
   </Card>
 </CardGrid>
@@ -95,7 +95,7 @@ console.log(out.text);
 
 ### Environment variables
 
-Resolution order is **explicit argument > environment variable > config file**.
+Resolution order is **explicit argument > environment variable**.
 
 ```bash title=".env"
 export INFERENCEKEY_BASE_URL="https://api.inferencekey.com"
@@ -141,12 +141,12 @@ These surface as `PermissionDenied` in the SDK. See
 
 <Steps>
 
-1. **Create in the Manager.** Both `ik_sdk_` and `ik_live_` tokens are minted in
-   the [Manager dashboard](https://manager.inferencekey.com). Control tokens are
+1. **Create in the dashboard.** Both `ik_sdk_` and `ik_live_` tokens are minted in
+   the [dashboard](https://cloud.inferencekey.com). Control tokens are
    issued for a project; data tokens are issued for a workload.
 
 2. **Copy it once.** The full secret is **shown only at creation time**. The
-   Manager stores a hash, not the raw token — if you lose it, you cannot read it
+   dashboard stores a hash, not the raw token — if you lose it, you cannot read it
    back, you rotate it.
 
 3. **Store it as a secret.** Put `ik_sdk_` in `INFERENCEKEY_SDK_TOKEN` and your
@@ -154,7 +154,7 @@ These surface as `PermissionDenied` in the SDK. See
    per workload). Never commit a token to source control.
 
 4. **Rotate or revoke.** Generate a replacement and update the environment, then
-   revoke the old token in the Manager. Revoking takes effect immediately:
+   revoke the old token in the dashboard. Revoking takes effect immediately:
    control calls start returning `403`, data calls start returning `AuthError`.
 
 </Steps>
@@ -192,5 +192,4 @@ credential lands in the wrong client, the prefix is the first thing to check.
 
 ---
 
-Questions or stuck? Open the [Manager dashboard](https://manager.inferencekey.com)
-to create an account, or head back to [inferencekey.com](https://inferencekey.com).
+New to InferenceKey? [Create an account or open the dashboard](https://cloud.inferencekey.com) · Learn more at [inferencekey.com](https://inferencekey.com).

@@ -9,11 +9,34 @@ import { Tabs, TabItem, Card, CardGrid, Aside, Steps, LinkCard } from "@astrojs/
 
 InferenceKey draws a hard line between **provisioning workloads** and **calling them**. Each side has its own token, and neither can do the other's job. This is the single most important security property of the SDK: a leaked inference key can never reconfigure your infrastructure, and a management token can never run up an inference bill.
 
+## Before you start
+
+You need an InferenceKey account and the SDK installed.
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+
+```bash title="Install (Python ≥ 3.9)"
+pip install inferencekey
+```
+
+  </TabItem>
+  <TabItem label="TypeScript">
+
+```bash title="Install (Node ≥ 18)"
+npm install @inferencekey/sdk
+```
+
+  </TabItem>
+</Tabs>
+
+Then grab two tokens from the [dashboard](https://cloud.inferencekey.com) — that's what the rest of this page covers.
+
 ## The two tokens
 
 <CardGrid>
   <Card title="ik_sdk_ — Control plane" icon="setting">
-    Provisions and reconciles workloads. Held by your **management client** and
+    Provisions and reconciles workloads. Held by your **ManagementClient** and
     scoped to **one project**. Use it from deploy scripts, CI, or a backend that
     declares what should exist. **Cannot call inference.**
   </Card>
@@ -28,12 +51,12 @@ The prefix tells you which is which: control-plane tokens start with `ik_sdk_`, 
 
 ## Where to get each one
 
-Both live in the [Manager dashboard](https://manager.inferencekey.com), but on different screens because they have different blast radius.
+Both live in the [dashboard](https://cloud.inferencekey.com), but on different screens because they have different blast radius.
 
 <Steps>
 
 1. **`ik_sdk_` — the Tokens screen.**
-   Open your project in the Manager and go to **Tokens**. Create an SDK token; it is bound to that project. This is the value your `ManagementClient` reads.
+   Open your project in the dashboard and go to **Tokens**. Create an SDK token; it is bound to that project. This is the value your `ManagementClient` reads.
 
 2. **`ik_live_` — the API Keys screen.**
    Go to **API Keys** and mint a key for the workload(s) you want an app to call. Hand each app the narrowest key it needs. This is the value you pass to `data.endpoint(...)`.
@@ -66,7 +89,6 @@ When a value can come from more than one place, the SDK resolves it in this orde
 
 1. **Explicit argument** — anything you pass in code (e.g. `project="acme"`, `api_key="ik_live_…"`) always wins.
 2. **Environment variable** — the `INFERENCEKEY_*` vars above.
-3. **Configuration file** — falls back to your local config when neither of the above is set.
 
 </Steps>
 
@@ -178,4 +200,4 @@ If a piece of code needs to do both, that's a sign it should be split into a dep
 
 ---
 
-New to InferenceKey? [Create an account or open the dashboard](https://manager.inferencekey.com) to mint your tokens. Learn more at [inferencekey.com](https://inferencekey.com).
+New to InferenceKey? [Create an account or open the dashboard](https://cloud.inferencekey.com) · Learn more at [inferencekey.com](https://inferencekey.com).

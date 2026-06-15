@@ -18,9 +18,34 @@ hero:
 
 import { Tabs, TabItem, Card, CardGrid, Aside, Steps, LinkCard } from "@astrojs/starlight/components";
 
-## First result in under 5 minutes
+<CardGrid>
+  <Card title="OpenAI-compatible" icon="rocket">
+    Your workloads expose the OpenAI chat/embeddings API. Point existing code at them — no new client to learn.
+  </Card>
+  <Card title="Open source" icon="github">
+    Apache-2.0. One audited Rust core, native Python &amp; TypeScript packages — read it, vendor it, trust it.
+  </Card>
+  <Card title="Secure by design" icon="approve-check">
+    Two tokens, least privilege: a leaked inference key can never reconfigure your infrastructure.
+  </Card>
+</CardGrid>
 
-You declare a workload with the **control plane** (`ManagementClient`, an `ik_sdk_` token) and call it with the **data plane** (`DataClient`, an `ik_live_` token). `ensure()` is idempotent on the slug, so you can run it on every deploy.
+## How it fits together
+
+```mermaid
+flowchart LR
+  subgraph You["Your code"]
+    M["ManagementClient<br/>(ik_sdk_)"]
+    D["DataClient<br/>(ik_live_)"]
+  end
+  M -->|"control plane · /api"| P["InferenceKey<br/>Manager"]
+  P --> W["Workers<br/>(vLLM · SGLang · Ollama)"]
+  D -->|"data plane · /endpoint/.../v1"| W
+```
+
+You **declare** a workload with the control plane (`ManagementClient`, an `ik_sdk_` token) and **call** it with the data plane (`DataClient`, an `ik_live_` token). `ensure()` is idempotent on the slug, so you can run it on every deploy.
+
+## First result in under 5 minutes
 
 <Steps>
 
@@ -137,6 +162,4 @@ console.log(out.text);  // generated text
 
 ---
 
-<p>
-  New to the platform? <a href="https://cloud.inferencekey.com">Create an account or open the dashboard</a> · Learn more at <a href="https://inferencekey.com">inferencekey.com</a>
-</p>
+New to InferenceKey? [Create an account or open the dashboard](https://cloud.inferencekey.com) · Learn more at [inferencekey.com](https://inferencekey.com).
