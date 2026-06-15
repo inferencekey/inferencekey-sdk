@@ -1,0 +1,52 @@
+---
+title: Go SDK
+description: Go support for the InferenceKey SDK is coming soon, via the C ABI (cgo).
+---
+
+import { Aside, LinkCard } from "@astrojs/starlight/components";
+
+The Go SDK is **coming soon**. It will bind the same Rust core as the Python and
+TypeScript SDKs through the stable [C ABI](/reference/architecture/) (cgo), so
+behaviour — `ensure()` idempotency, [`OnDrift`](/reference/ondrift/), the
+two-token split, error types — matches the shipped languages exactly.
+
+<Aside type="note">
+Go is not published yet. Today the SDK ships for **Python** (`inferencekey`) and
+**Node / TypeScript** (`@inferencekey/sdk`). Track progress on
+[GitHub](https://github.com/inferencekey/inferencekey-sdk).
+</Aside>
+
+## What to expect
+
+When it lands, the package will live at:
+
+```go title="go.mod"
+require github.com/inferencekey/inferencekey-sdk/go latest
+```
+
+The surface mirrors the other languages: a `ManagementClient` (control plane,
+`ik_sdk_` token, scoped to one project) for declaring and reconciling workloads,
+and a `DataClient` (data plane, `ik_live_` token, passed per workload) for
+calling the resulting OpenAI-compatible endpoints. The same environment
+variables apply (`INFERENCEKEY_BASE_URL`, `INFERENCEKEY_PROJECT`,
+`INFERENCEKEY_API_KEY`, `INFERENCEKEY_SDK_TOKEN`).
+
+## In the meantime
+
+The control and data planes are plain HTTP, so any Go program can talk to the
+platform directly today: the control routes under
+`/api/projects/:project_id/workloads` and the OpenAI-compatible data plane under
+`/endpoint/:projectSlug/:workloadSlug/v1/...`. See the
+[wire format](/reference/wire-format/) for the exact contract.
+
+<LinkCard
+  title="Python SDK"
+  href="/api/python/"
+  description="Shipping today — the full ManagementClient / DataClient API."
+/>
+
+<LinkCard
+  title="TypeScript SDK"
+  href="/api/typescript/"
+  description="Shipping today — the same API for Node and the browser-free runtime."
+/>

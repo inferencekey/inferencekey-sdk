@@ -1,0 +1,171 @@
+---
+title: What you can build
+description: Real workloads you can ship with the InferenceKey SDK — support chatbots, RAG embeddings, batch classification, transcription, and image generation — each on its own least-privilege key.
+---
+
+import { Tabs, TabItem, Card, CardGrid, Aside, LinkCard } from "@astrojs/starlight/components";
+
+The SDK gives you two moves: **declare a workload in code and `ensure` it exists** (control plane, `ik_sdk_`), then **call its OpenAI-compatible endpoint** (data plane, `ik_live_`). The same two moves cover every modality the platform runs — text, embeddings, classification, audio, and images. Here is what teams build on top of them.
+
+<CardGrid>
+  <Card title="Support chatbot" icon="comment">
+    Serve an instruction-tuned LLM behind a private endpoint and answer
+    customer questions with your own tone and guardrails. One `ensure`
+    provisions the model; `generate_text` turns prompts (or a full message
+    history) into replies.
+
+    [Build a support chatbot →](/quickstart/first-call/)
+  </Card>
+
+  <Card title="RAG embeddings" icon="seti:db">
+    Stand up an `embedding` workload, vectorize your documents and queries,
+    and feed the results to your vector store for retrieval-augmented answers.
+    `embed` takes one string or a batch and returns dense vectors.
+
+    [Wire up retrieval →](/guides/workloads-by-policy-worker-modality/)
+  </Card>
+
+  <Card title="Batch classification" icon="list-format">
+    Route tickets, score sentiment, or tag content with a dedicated
+    `classification` workload. These run as async-only modalities — ideal for
+    high-throughput batch jobs that don't need a synchronous round-trip.
+
+    [Pick the right modality →](/guides/workloads-by-policy-worker-modality/)
+  </Card>
+
+  <Card title="Transcription" icon="seti:audio">
+    Turn calls, meetings, and voice notes into text with an `audio2text`
+    workload on a `vllm-omni` backend. Declare it once with `ensure`, then
+    consume it over the OpenAI-compatible data plane like any other endpoint.
+
+    [Provision audio workloads →](/guides/workloads-by-policy-worker-modality/)
+  </Card>
+
+  <Card title="Image generation" icon="seti:image">
+    Generate images from prompts with a `text2image` workload. The SDK's job
+    is the same: `ensure` the spec (model, backend, command) and let the
+    platform place it — no infrastructure code on your side.
+
+    [Declare a text2image workload →](/guides/workloads-by-policy-worker-modality/)
+  </Card>
+
+  <Card title="Many apps, many keys" icon="setting">
+    One project can hold every workload above, each with its own `ik_live_`
+    key. The management token stays on your control plane and can't call
+    inference — least privilege by construction.
+
+    [Understand the token model →](/guides/authentication/)
+  </Card>
+</CardGrid>
+
+## Teaser: a chatbot and a RAG index in one project
+
+A single `ManagementClient` declares both workloads; each gets its own data-plane key.
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+
+```python title="build.py"
+from inferencekey import ManagementClient, DataClient, WorkloadSpec, Backend
+
+mgmt = ManagementClient.from_env(project="acme")   # reads INFERENCEKEY_SDK_TOKEN
+
+# 1. Support chatbot — an instruction-tuned LLM (text2text is the default).
+bot = mgmt.ensure(WorkloadSpec(
+    name="support-bot",
+    slug="support-bot",
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    backend=Backend.VLLM,
+    command="vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+))
+
+# 2. RAG embeddings — a dedicated embedding workload.
+idx = mgmt.ensure(WorkloadSpec(
+    name="docs-index",
+    slug="docs-index",
+    model="BAAI/bge-large-en-v1.5",
+    backend=Backend.VLLM,
+    task_type="embedding",
+))
+
+# Each workload is called with its own ik_live_ key.
+data = DataClient.from_env(project="acme")
+
+reply = data.endpoint(bot.workload_slug, api_key="ik_live_support_...").generate_text(
+    prompt="How do I reset my password?",
+    temperature=0.2,
+    max_tokens=300,
+)
+print(reply.text)   # also: reply.model
+
+vectors = data.endpoint(idx.workload_slug, api_key="ik_live_index_...").embed(
+    input=["billing FAQ", "password reset steps"],
+)
+print(len(vectors.embeddings))   # one vector per input → store these
+```
+
+  </TabItem>
+  <TabItem label="TypeScript">
+
+```ts title="build.ts"
+import { ManagementClient, DataClient, Backend } from "@inferencekey/sdk";
+
+const mgmt = ManagementClient.fromEnv({ project: "acme" });
+
+// 1. Support chatbot — an instruction-tuned LLM (text2text is the default).
+const bot = await mgmt.ensure({
+  name: "support-bot",
+  slug: "support-bot",
+  model: "meta-llama/Llama-3.1-8B-Instruct",
+  backend: Backend.Vllm,
+  command: "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+});
+
+// 2. RAG embeddings — a dedicated embedding workload.
+const idx = await mgmt.ensure({
+  name: "docs-index",
+  slug: "docs-index",
+  model: "BAAI/bge-large-en-v1.5",
+  backend: Backend.Vllm,
+  taskType: "embedding",
+});
+
+// Each workload is called with its own ik_live_ key.
+const data = DataClient.fromEnv({ project: "acme" });
+
+const reply = await data
+  .endpoint(bot.workloadSlug, { apiKey: process.env.SUPPORT_IK_LIVE })
+  .generateText({ prompt: "How do I reset my password?", temperature: 0.2, maxTokens: 300 });
+console.log(reply.text); // also: reply.model
+
+const vectors = await data
+  .endpoint(idx.workloadSlug, { apiKey: process.env.INDEX_IK_LIVE })
+  .embed({ input: ["billing FAQ", "password reset steps"] });
+console.log(vectors.embeddings.length); // one vector per input → store these
+```
+
+  </TabItem>
+</Tabs>
+
+<Aside type="tip" title="Modalities beyond text">
+  Classification, transcription (`audio2text`), and image generation
+  (`text2image`) are declared the same way — set `task_type` (and the matching
+  backend, e.g. <code>Backend.VllmOmni</code> for omni modalities) on the
+  <code>WorkloadSpec</code>. Reranker, classification, and reward modalities are
+  async-only, so they're consumed over the data plane rather than a synchronous
+  call. See <a href="/guides/workloads-by-policy-worker-modality/">workloads by policy, worker &amp; modality</a>.
+</Aside>
+
+## Why this scales with you
+
+Every use case above is the same contract: **your code declares intent, the platform handles placement, and inference stays behind per-workload keys.** Add a transcription pipeline next quarter or a second chatbot for a new region — it's another `ensure`, not another deployment system. Placement, GPUs, and reconciliation are the platform's job; your repo just describes what should exist.
+
+<LinkCard
+  title="Open the Manager dashboard"
+  description="Create an account, spin up a project, and mint your first ik_sdk_ and ik_live_ keys — then ship any of the workloads above."
+  href="https://manager.inferencekey.com"
+/>
+
+---
+
+Learn the platform model in [Architecture](/reference/architecture/), or start from zero in the [Quickstart: tokens](/quickstart/tokens/). New to InferenceKey? Visit the [landing page](https://inferencekey.com).

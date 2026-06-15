@@ -1,0 +1,375 @@
+---
+title: Python API reference
+description: The complete public surface of the inferencekey Python package — clients, types, enums, and the exception hierarchy.
+---
+
+import { Tabs, TabItem, Card, CardGrid, Aside, Steps, LinkCard } from "@astrojs/starlight/components";
+
+The `inferencekey` package is the typed, ergonomic Python surface over the Rust core. Declare a workload with [`WorkloadSpec`](#workloadspec), provision it idempotently with [`ManagementClient.ensure`](#ensure), then call the resulting OpenAI-compatible [`Endpoint`](#endpoint).
+
+```bash title="Install"
+pip install inferencekey
+```
+
+```python title="Imports"
+from inferencekey import (
+    ManagementClient, DataClient, Endpoint,
+    WorkloadSpec, EndpointRef, TextResult, EmbedResult,
+    Backend, TaskType, OnDrift, ExecutionPolicy,
+    InferenceKeyError, PermissionDenied, AuthError,
+    ValidationError, ConfigurationError, ApiError,
+)
+```
+
+<Aside type="note" title="Two tokens, two clients">
+The control plane (`ik_sdk_`) provisions workloads and is held by `ManagementClient`. The data plane (`ik_live_`) calls inference and is passed **per workload** to `DataClient.endpoint(...)`. A control token cannot call inference; a data token cannot provision. See [Tokens](/reference/tokens/).
+</Aside>
+
+## ManagementClient
+
+Control-plane client (`ik_sdk_` token), scoped to one project. Provisions and reconciles workloads; it has **no** inference methods.
+
+```python
+class ManagementClient:
+    def __init__(self, *, base_url: str, sdk_token: str, project: str | None = None) -> None
+```
+
+`base_url` defaults to `https://api.inferencekey.com` when constructed via [`from_env`](#from_env). A blank `sdk_token` raises [`ConfigurationError`](#configurationerror).
+
+### from_env
+
+```python
+@classmethod
+def from_env(
+    cls,
+    *,
+    base_url: str | None = None,
+    project: str | None = None,
+    sdk_token: str | None = None,
+) -> ManagementClient
+```
+
+Construct from configuration, resolving each value **explicit > environment > default**. Reads `INFERENCEKEY_BASE_URL`, `INFERENCEKEY_PROJECT`, and `INFERENCEKEY_SDK_TOKEN`.
+
+```python
+mgmt = ManagementClient.from_env(project="acme")  # reads INFERENCEKEY_SDK_TOKEN
+```
+
+### ensure
+
+```python
+def ensure(
+    self,
+    spec: WorkloadSpec,
+    *,
+    on_drift: OnDrift | str = OnDrift.RECONCILE,
+    project: str | None = None,
+) -> EndpointRef
+```
+
+Idempotently provision or reconcile `spec`, returning an [`EndpointRef`](#endpointref). Idempotency is keyed off the explicit `spec.slug`. The project is resolved from `project=` > `spec.project` > the client's project; if none is set, raises [`ConfigurationError`](#configurationerror). `on_drift` governs what happens when the live workload differs from the spec — see [OnDrift](#ondrift) and the [drift reference](/reference/ondrift/).
+
+```python
+ref = mgmt.ensure(WorkloadSpec(
+    name="support-bot", slug="support-bot",
+    model="meta-llama/Llama-3.1-8B-Instruct", backend=Backend.VLLM,
+    command="vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+))
+print(ref.project_slug, ref.workload_slug)
+```
+
+## DataClient
+
+Data-plane client. Derive an [`Endpoint`](#endpoint) per workload, each bound to its own `ik_live_` key — so one app can drive several workloads with different keys.
+
+```python
+class DataClient:
+    def __init__(self, *, base_url: str, project: str, api_key: str | None = None) -> None
+```
+
+A blank `project` raises [`ConfigurationError`](#configurationerror). `api_key` is the **default** `ik_live_` key applied when [`endpoint`](#endpoint-method) is called without one.
+
+### from_env
+
+```python
+@classmethod
+def from_env(
+    cls,
+    *,
+    base_url: str | None = None,
+    project: str | None = None,
+    api_key: str | None = None,
+) -> DataClient
+```
+
+Construct from configuration, resolving each value **explicit > environment > default**. Reads `INFERENCEKEY_BASE_URL`, `INFERENCEKEY_PROJECT`, and `INFERENCEKEY_API_KEY` (the default `ik_live_` key).
+
+```python
+data = DataClient.from_env(project="acme")
+```
+
+### endpoint
+
+```python
+def endpoint(self, workload_slug: str, *, api_key: str | None = None) -> Endpoint
+```
+
+Bind an [`Endpoint`](#endpoint) to `workload_slug` and an `ik_live_` key. The key resolves from `api_key=` > the client's default `api_key` (`INFERENCEKEY_API_KEY`); if neither is set, raises [`ConfigurationError`](#configurationerror).
+
+```python
+ep = data.endpoint(ref.workload_slug, api_key="ik_live_...")
+```
+
+## Endpoint
+
+A single workload's OpenAI-compatible endpoint, bound to one `ik_live_` key. Obtain instances via [`DataClient.endpoint`](#endpoint-method) rather than constructing directly. The bound `workload_slug` is exposed as a public attribute.
+
+### generate_text
+
+```python
+def generate_text(
+    self,
+    *,
+    prompt: str | None = None,
+    messages: list | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> TextResult
+```
+
+Run a non-streaming chat completion. Pass either `prompt` (a single user turn) or `messages` (OpenAI-style role/content dicts). Unset parameters are omitted from the request. Returns a [`TextResult`](#textresult).
+
+```python
+out = ep.generate_text(prompt="Hola", temperature=0.2, max_tokens=300)
+print(out.text, out.model)
+```
+
+### embed
+
+```python
+def embed(self, *, input: str | list[str]) -> EmbedResult
+```
+
+Create embeddings for one or more inputs. A bare string is treated as a single-element batch. Returns an [`EmbedResult`](#embedresult) with one vector per input.
+
+```python
+emb = data.endpoint("billing", api_key="ik_live_...").embed(input=["a", "b"])
+print(emb.embeddings)  # list[list[float]]
+```
+
+## WorkloadSpec
+
+The declarative workload definition handed to [`ensure`](#ensure). `name`, `slug`, `model`, and `backend` are required; everything else is optional. There is **no** `provider` and **no** `min_vram_gb` — placement is the platform's job, never the caller's.
+
+```python
+@dataclass
+class WorkloadSpec:
+    name: str
+    slug: str
+    model: str
+    backend: Backend | str
+    project: str | None = None
+    description: str | None = None
+    command: str | None = None
+    vllm_version: str | None = None
+    task_type: TaskType | str | None = None
+    config: dict | None = None
+    execution_policy: ExecutionPolicy | str | None = None
+    execution_policy_config: dict | None = None
+    worker_id: str | None = None
+    gpu_resource_id: str | None = None
+```
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | `str` | Human-readable display name. **Required.** |
+| `slug` | `str` | Stable identifier; the idempotency key for `ensure()`. **Required.** |
+| `model` | `str` | Model reference, e.g. `meta-llama/Llama-3.1-8B-Instruct`. **Required.** |
+| `backend` | [`Backend`](#backend) `\| str` | Inference engine. **Required.** |
+| `project` | `str \| None` | Project slug; overrides the client's project for this spec. |
+| `description` | `str \| None` | Free-text note shown in the dashboard. |
+| `command` | `str \| None` | Launch command (vLLM/SGLang), e.g. `vllm serve ...`. |
+| `vllm_version` | `str \| None` | Pin the vLLM image version (vllm / vllm-omni backends). |
+| `task_type` | [`TaskType`](#tasktype) `\| str \| None` | Workload modality; server default is `text2text`. |
+| `config` | `dict \| None` | Backend-specific configuration. |
+| `execution_policy` | [`ExecutionPolicy`](#executionpolicy) `\| str \| None` | How the Manager schedules the workload. |
+| `execution_policy_config` | `dict \| None` | Policy-specific settings (e.g. autoscaling bounds). |
+| `worker_id` | `str \| None` | Pin to a specific worker. |
+| `gpu_resource_id` | `str \| None` | Pin to a specific GPU resource. |
+
+## EndpointRef
+
+Frozen dataclass returned by [`ensure`](#ensure): the slugs addressing a workload's data-plane endpoint.
+
+```python
+@dataclass(frozen=True)
+class EndpointRef:
+    project_slug: str
+    workload_slug: str
+```
+
+## TextResult
+
+Frozen dataclass returned by [`generate_text`](#generate_text).
+
+```python
+@dataclass(frozen=True)
+class TextResult:
+    text: str
+    model: str
+    finish_reason: str | None = None
+    raw: dict = {}
+```
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `text` | `str` | The generated completion text. |
+| `model` | `str` | The model that produced the result. |
+| `finish_reason` | `str \| None` | Why generation stopped (e.g. `stop`, `length`), when reported. |
+| `raw` | `dict` | The underlying provider response, untouched. |
+
+## EmbedResult
+
+Frozen dataclass returned by [`embed`](#embed): one vector per input.
+
+```python
+@dataclass(frozen=True)
+class EmbedResult:
+    embeddings: list[list[float]]
+    model: str
+    raw: dict = {}
+```
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `embeddings` | `list[list[float]]` | One embedding vector per input, in order. |
+| `model` | `str` | The embedding model that produced the vectors. |
+| `raw` | `dict` | The underlying provider response, untouched. |
+
+## Enums
+
+Each enum's `value` is the exact platform wire string, so you may pass either the enum member or its string. See the [backends and policies reference](/reference/backends-and-policies/) for semantics.
+
+### Backend
+
+The inference engine for a workload (the `backend` wire string).
+
+```python
+class Backend(str, Enum):
+    OLLAMA = "ollama"
+    VLLM = "vllm"
+    VLLM_OMNI = "vllm-omni"
+    SGLANG = "sglang"
+```
+
+### TaskType
+
+The workload modality (`task_type`); the server default is `text2text`. `reranker`, `classification`, and `reward` are async-only (no sync OpenAI route).
+
+```python
+class TaskType(str, Enum):
+    TEXT2TEXT = "text2text"
+    EMBEDDING = "embedding"
+    TEXT2IMAGE = "text2image"
+    TEXT2AUDIO = "text2audio"
+    AUDIO2TEXT = "audio2text"
+    RERANKER = "reranker"
+    CLASSIFICATION = "classification"
+    REWARD = "reward"
+```
+
+### OnDrift
+
+The drift-handling strategy for [`ensure`](#ensure); defaults to `RECONCILE`. See [OnDrift](/reference/ondrift/).
+
+```python
+class OnDrift(str, Enum):
+    RECONCILE = "reconcile"
+    FAIL = "fail"
+    DRY_RUN = "dry_run"
+    WARN = "warn"
+    IGNORE = "ignore"
+```
+
+### ExecutionPolicy
+
+How the Manager schedules the workload (`execution_policy`).
+
+```python
+class ExecutionPolicy(str, Enum):
+    FIXED = "fixed"
+    SCHEDULED = "scheduled"
+    AUTOSCALING = "autoscaling"
+```
+
+## Exceptions
+
+Every SDK error derives from `InferenceKeyError`, so you can catch the base class to handle all of them. See [Common errors](/reference/common-errors/).
+
+```
+InferenceKeyError
+├── PermissionDenied      # 403 — wrong_credential_type / project_scope_mismatch / scope_insufficient
+├── AuthError             # 401 — missing or invalid credentials
+├── ValidationError       # 400 — a request argument failed local or server validation
+├── ConfigurationError    # client-side misconfiguration before any request
+└── ApiError              # any other non-2xx response or transport failure
+```
+
+| Exception | Raised when |
+| --- | --- |
+| `InferenceKeyError` | Base class for every SDK error. |
+| `PermissionDenied` | The credential may not perform the operation (e.g. a data token used for control, or a token scoped to another project). |
+| `AuthError` | Credentials are missing or invalid. |
+| `ValidationError` | A request argument failed local or server validation. |
+| `ConfigurationError` | The client is misconfigured before any request is sent (e.g. no token, no project, or no `ik_live_` key). |
+| `ApiError` | Any other non-2xx response or a transport failure. |
+
+```python
+from inferencekey import PermissionDenied, AuthError, InferenceKeyError
+
+try:
+    ref = mgmt.ensure(spec)
+except PermissionDenied:
+    print("This token cannot provision — is it an ik_sdk_ key for this project?")
+except AuthError:
+    print("Check INFERENCEKEY_SDK_TOKEN.")
+except InferenceKeyError as e:
+    print(f"Provisioning failed: {e}")
+```
+
+## End-to-end
+
+<Steps>
+
+1. Provision a workload with your control token.
+
+   ```python
+   from inferencekey import ManagementClient, WorkloadSpec, Backend
+
+   mgmt = ManagementClient.from_env(project="acme")  # reads INFERENCEKEY_SDK_TOKEN
+   ref = mgmt.ensure(WorkloadSpec(
+       name="support-bot", slug="support-bot",
+       model="meta-llama/Llama-3.1-8B-Instruct", backend=Backend.VLLM,
+       command="vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+   ))
+   ```
+
+2. Call the endpoint with that workload's data key.
+
+   ```python
+   from inferencekey import DataClient
+
+   data = DataClient.from_env(project="acme")
+   ep = data.endpoint(ref.workload_slug, api_key="ik_live_...")
+   out = ep.generate_text(prompt="Hola", temperature=0.2, max_tokens=300)
+   print(out.text)
+   ```
+
+</Steps>
+
+<CardGrid>
+  <LinkCard title="TypeScript API reference" href="/api/typescript/" description="The same surface for @inferencekey/sdk." />
+  <LinkCard title="Tokens" href="/reference/tokens/" description="Control vs data plane, scopes, and precedence." />
+  <LinkCard title="OnDrift" href="/reference/ondrift/" description="What ensure() does when the live workload diverges." />
+  <LinkCard title="Open the dashboard" href="https://manager.inferencekey.com" description="Create an account and mint your first tokens." />
+</CardGrid>

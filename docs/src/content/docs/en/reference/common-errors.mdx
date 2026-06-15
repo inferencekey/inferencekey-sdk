@@ -1,0 +1,381 @@
+---
+title: Common errors & how to fix them
+description: The real error messages and codes the InferenceKey SDK raises — wrong token type, scope and project mismatches, missing config, invalid specs, auth failures and 404s — with the cause and the fix for each, in Python and TypeScript.
+---
+
+import { Tabs, TabItem, Aside, Card, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+Every failure the SDK can surface maps to one stable shape. The core formats a
+human-readable message, and on a `403` it also carries a **machine-readable code**
+(`wrong_credential_type`, `project_scope_mismatch`, `scope_insufficient`) so you can
+branch without parsing prose.
+
+How that shape reaches your code depends on the language:
+
+<Tabs syncKey="lang">
+<TabItem label="Python">
+Errors are typed exceptions, all subclassing `InferenceKeyError`:
+
+```python
+from inferencekey.errors import (
+    InferenceKeyError,   # base class for every SDK error
+    PermissionDenied,    # 403 — wrong_credential_type / project_scope_mismatch / scope_insufficient
+    AuthError,           # 401 — missing or invalid credentials
+    ValidationError,     # a request argument failed validation (e.g. empty required field)
+    ConfigurationError,  # client-side misconfiguration before any request
+    ApiError,            # any other non-2xx response or transport failure
+)
+```
+
+Catch the specific type, fall back to the base:
+
+```python
+from inferencekey import ManagementClient, WorkloadSpec, Backend
+from inferencekey.errors import PermissionDenied, ConfigurationError, InferenceKeyError
+
+mgmt = ManagementClient.from_env(project="acme")
+try:
+    ref = mgmt.ensure(WorkloadSpec(
+        name="support-bot", slug="support-bot",
+        model="meta-llama/Llama-3.1-8B-Instruct", backend=Backend.VLLM,
+        command="vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+    ))
+except ConfigurationError as e:
+    ...  # fix your setup; no request was made
+except PermissionDenied as e:
+    print(e)  # message includes the code, e.g. "permission denied [scope_insufficient]: ..."
+except InferenceKeyError as e:
+    ...  # anything else
+```
+</TabItem>
+<TabItem label="TypeScript">
+The Node addon raises a plain `Error` whose **`message`** carries the core's formatted
+string — including the bracketed code on a `403`. Branch on the message:
+
+```ts
+import { ManagementClient, WorkloadSpec, Backend } from "@inferencekey/sdk";
+
+const mgmt = ManagementClient.fromEnv({ project: "acme" });
+try {
+  const ref = await mgmt.ensure({
+    name: "support-bot", slug: "support-bot",
+    model: "meta-llama/Llama-3.1-8B-Instruct", backend: Backend.Vllm,
+    command: "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+  });
+} catch (e) {
+  const msg = (e as Error).message;
+  if (msg.includes("[wrong_credential_type]")) { /* swapped tokens */ }
+  else if (msg.includes("[project_scope_mismatch]")) { /* wrong project */ }
+  else if (msg.includes("[scope_insufficient]")) { /* missing scope */ }
+  else if (msg.startsWith("configuration error")) { /* fix setup; no request made */ }
+  else if (msg.startsWith("authentication failed")) { /* 401 */ }
+  else if (msg.startsWith("not found")) { /* 404 */ }
+  else throw e;
+}
+```
+
+<Aside type="note" title="No typed error classes in Node">
+The TypeScript binding maps every core failure to a single `Error`. The message text and
+the bracketed `403` code are stable — match on those rather than on an exception class.
+</Aside>
+</TabItem>
+</Tabs>
+
+<Aside type="caution" title="Two tokens, two planes">
+Most credential errors come from mixing planes. `ik_sdk_` is the **control** token —
+held by `ManagementClient`, scoped to one project, cannot call inference. `ik_live_` is the
+**data** key — passed per workload to a `DataClient` endpoint, cannot provision. If an error
+mentions the *wrong* plane, you almost certainly swapped the two.
+</Aside>
+
+---
+
+## `wrong_credential_type` — you used a data key where a control token belongs (or vice-versa)
+
+A `403` whose code is `wrong_credential_type`. The token is valid, but it is the wrong *kind*
+for the plane you called. This is also caught **locally**, before any request, when you hand an
+`ik_live_` data key to `ManagementClient.ensure()` — and the token is redacted to its prefix
+in the message, never leaked in full.
+
+<Tabs syncKey="lang">
+<TabItem label="Python">
+```text
+inferencekey.errors.PermissionDenied: permission denied [wrong_credential_type]: ik_live_proj1234… is a data key; the management plane requires an ik_sdk_ token
+```
+</TabItem>
+<TabItem label="TypeScript">
+```text
+Error: permission denied [wrong_credential_type]: ik_live_proj1234… is a data key; the management plane requires an ik_sdk_ token
+```
+</TabItem>
+</Tabs>
+
+- **Symptom** — `ensure()` rejects an `ik_live_` key, or the inference endpoint rejects an `ik_sdk_` token.
+- **Cause** — control and data tokens were swapped. `ManagementClient` needs `ik_sdk_`; an `Endpoint` needs `ik_live_`.
+- **Fix** — set `INFERENCEKEY_SDK_TOKEN` to your `ik_sdk_` token (read by `ManagementClient`) and pass an `ik_live_` key as the workload's `api_key` (Python) / `apiKey` (TypeScript). Never put a data key in `INFERENCEKEY_SDK_TOKEN`.
+
+---
+
+## `project_scope_mismatch` — the token belongs to a different project
+
+A `403` with code `project_scope_mismatch`. The credential is the right *kind* but is scoped to
+another project than the one in your request path.
+
+<Tabs syncKey="lang">
+<TabItem label="Python">
+```text
+inferencekey.errors.PermissionDenied: permission denied [project_scope_mismatch]: token is not scoped to project "acme"
+```
+</TabItem>
+<TabItem label="TypeScript">
+```text
+Error: permission denied [project_scope_mismatch]: token is not scoped to project "acme"
+```
+</TabItem>
+</Tabs>
+
+- **Symptom** — a correctly-typed token is refused for a specific project.
+- **Cause** — `project=` / `INFERENCEKEY_PROJECT` (or `spec.project`) names a project the token cannot act on. An `ik_sdk_` token is scoped to exactly one project.
+- **Fix** — point the client at the project the token owns, or mint a token for the project you are targeting. Confirm the slug matches the dashboard exactly.
+
+---
+
+## `scope_insufficient` — right token, right project, missing permission
+
+A `403` with code `scope_insufficient`. The credential is valid and in the right project, but it
+lacks the scope for the operation (for example a read-only token attempting a write).
+
+<Tabs syncKey="lang">
+<TabItem label="Python">
+```text
+inferencekey.errors.PermissionDenied: permission denied [scope_insufficient]: this credential cannot perform the requested operation
+```
+</TabItem>
+<TabItem label="TypeScript">
+```text
+Error: permission denied [scope_insufficient]: this credential cannot perform the requested operation
+```
+</TabItem>
+</Tabs>
+
+- **Symptom** — the operation is refused even though the token type and project are correct.
+- **Cause** — the token was issued with fewer scopes than the call requires.
+- **Fix** — issue a token with the needed scope in the dashboard, then update your env var or the explicit token you pass in.
+
+---
+
+## Missing project — `ConfigurationError`
+
+Raised **before any request** when no project can be resolved. Provisioning needs a project; an
+endpoint needs a project + an `ik_live_` key.
+
+<Tabs syncKey="lang">
+<TabItem label="Python">
+```text
+inferencekey.errors.ConfigurationError: No project configured. Set INFERENCEKEY_PROJECT, pass project=, or set spec.project.
+```
+
+A missing data key is the same class:
+
+```text
+inferencekey.errors.ConfigurationError: No ik_live_ key for workload "support-bot". Pass api_key= or set INFERENCEKEY_API_KEY.
+```
+</TabItem>
+<TabItem label="TypeScript">
+```text
+Error: No project configured. Set INFERENCEKEY_PROJECT, pass project, or set spec.project.
+```
+
+A missing data key:
+
+```text
+Error: No ik_live_ key for workload "support-bot". Pass apiKey or set INFERENCEKEY_API_KEY.
+```
+</TabItem>
+</Tabs>
+
+- **Symptom** — the client throws immediately, no network call.
+- **Cause** — project (or, for inference, the `ik_live_` key) was never supplied. Resolution order is **explicit > env > spec**.
+- **Fix** — set `INFERENCEKEY_PROJECT` or pass `project=` / `project`, and supply the workload's `ik_live_` key via `api_key=` / `apiKey` or `INFERENCEKEY_API_KEY`.
+
+<Tabs syncKey="lang">
+<TabItem label="Python">
+```python
+mgmt = ManagementClient.from_env(project="acme")          # explicit beats env
+data = DataClient.from_env(project="acme")
+ep   = data.endpoint("support-bot", api_key="ik_live_...") # per-workload key
+```
+</TabItem>
+<TabItem label="TypeScript">
+```ts
+const mgmt = ManagementClient.fromEnv({ project: "acme" });          // explicit beats env
+const data = DataClient.fromEnv({ project: "acme" });
+const ep   = data.endpoint("support-bot", { apiKey: process.env.SUPPORT_IK_LIVE });
+```
+</TabItem>
+</Tabs>
+
+---
+
+## Invalid spec — a required field is empty (`ValidationError`)
+
+`name`, `slug` and `model` are required and validated locally (whitespace-only counts as empty).
+
+<Tabs syncKey="lang">
+<TabItem label="Python">
+```text
+inferencekey.errors.ValidationError: validation error: name must not be empty
+```
+</TabItem>
+<TabItem label="TypeScript">
+```text
+Error: validation error: name must not be empty
+```
+</TabItem>
+</Tabs>
+
+- **Symptom** — `ensure()` throws before sending anything.
+- **Cause** — one of `name` / `slug` / `model` is empty or blank.
+- **Fix** — give every required field a non-empty value. `ensure()` is idempotent on the explicit `slug`, so keep it stable across runs.
+
+### Special case: a secret in a spec field — `ConfigurationError`
+
+The core scans every string field of a spec and **refuses** any value beginning with `ik_live_`
+or `ik_sdk_`. A credential must never be inlined into a spec. This surfaces as a
+`ConfigurationError` (Python) / `configuration error` (TypeScript), not a validation error.
+
+<Tabs syncKey="lang">
+<TabItem label="Python">
+```python
+# ❌ Don't put a token in a spec field
+mgmt.ensure(WorkloadSpec(
+    name="support-bot", slug="support-bot",
+    model="meta-llama/Llama-3.1-8B-Instruct", backend=Backend.VLLM,
+    command="vllm serve ... --api-key ik_live_secret",  # leaked secret
+))
+```
+```text
+inferencekey.errors.ConfigurationError: configuration error: secrets must never go in specs
+```
+</TabItem>
+<TabItem label="TypeScript">
+```ts
+// ❌ Don't put a token in a spec field
+await mgmt.ensure({
+  name: "support-bot", slug: "support-bot",
+  model: "meta-llama/Llama-3.1-8B-Instruct", backend: Backend.Vllm,
+  command: "vllm serve ... --api-key ik_live_secret", // leaked secret
+});
+```
+```text
+Error: configuration error: secrets must never go in specs
+```
+</TabItem>
+</Tabs>
+
+- **Symptom** — `ensure()` throws locally the moment a field looks like a credential.
+- **Cause** — a token was placed in `name`, `slug`, `model`, `command`, `description`, `vllm_version`, `worker_id`, `gpu_resource_id`, or `project`.
+- **Fix** — keep tokens out of the spec entirely. `ik_sdk_` lives on the management client; `ik_live_` is passed per workload at inference time. (A value that merely *contains* the substring elsewhere — e.g. `"see ik_live_ docs"` — is fine; only a field that *starts* with the prefix is rejected.)
+
+---
+
+## Auth failed — `401`
+
+The credentials are missing or invalid at the server.
+
+<Tabs syncKey="lang">
+<TabItem label="Python">
+```text
+inferencekey.errors.AuthError: authentication failed: invalid or expired credentials
+```
+</TabItem>
+<TabItem label="TypeScript">
+```text
+Error: authentication failed: invalid or expired credentials
+```
+</TabItem>
+</Tabs>
+
+- **Symptom** — every call to a plane is rejected at the door.
+- **Cause** — the token is wrong, revoked, expired, or truncated (a partial copy/paste). Unlike the `403` family, the server cannot even identify the credential.
+- **Fix** — re-copy the full token from the dashboard, check `INFERENCEKEY_BASE_URL` points at the right environment, and confirm the token has not been rotated.
+
+<Aside type="tip" title="401 vs 403">
+A `401` (`AuthError`) means the credential could not be authenticated at all. A `403`
+(`PermissionDenied`) means it authenticated fine but may not do *this* — that is when you read
+the code: `wrong_credential_type`, `project_scope_mismatch`, or `scope_insufficient`.
+</Aside>
+
+---
+
+## Not found — `404`
+
+The targeted resource does not exist.
+
+<Tabs syncKey="lang">
+<TabItem label="Python">
+```text
+inferencekey.errors.ApiError: not found: workload "support-bot" not found in project "acme"
+```
+</TabItem>
+<TabItem label="TypeScript">
+```text
+Error: not found: workload "support-bot" not found in project "acme"
+```
+</TabItem>
+</Tabs>
+
+- **Symptom** — an inference call to `data.endpoint(slug, ...)` is rejected because the workload does not exist (or is in another project).
+- **Cause** — a typo'd workload slug, the workload was never provisioned, or the project slug is wrong.
+- **Fix** — provision it first with `mgmt.ensure(...)` and use the returned `ref.workload_slug` / `ref.workloadSlug`. `ensure()` is idempotent on the slug, so calling it again is safe.
+
+<Tabs syncKey="lang">
+<TabItem label="Python">
+```python
+ref = mgmt.ensure(WorkloadSpec(
+    name="support-bot", slug="support-bot",
+    model="meta-llama/Llama-3.1-8B-Instruct", backend=Backend.VLLM,
+    command="vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+))
+ep = data.endpoint(ref.workload_slug, api_key="ik_live_...")
+```
+</TabItem>
+<TabItem label="TypeScript">
+```ts
+const ref = await mgmt.ensure({
+  name: "support-bot", slug: "support-bot",
+  model: "meta-llama/Llama-3.1-8B-Instruct", backend: Backend.Vllm,
+  command: "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+});
+const ep = data.endpoint(ref.workloadSlug, { apiKey: process.env.SUPPORT_IK_LIVE });
+```
+</TabItem>
+</Tabs>
+
+---
+
+## Quick reference
+
+| What you see | Plane / status | Python type | Cause in one line |
+| --- | --- | --- | --- |
+| `permission denied [wrong_credential_type]` | 403 | `PermissionDenied` | Control vs data token swapped |
+| `permission denied [project_scope_mismatch]` | 403 | `PermissionDenied` | Token scoped to another project |
+| `permission denied [scope_insufficient]` | 403 | `PermissionDenied` | Token lacks the required scope |
+| `No project configured…` / `No ik_live_ key…` | local | `ConfigurationError` | Project or data key never supplied |
+| `validation error: … must not be empty` | local | `ValidationError` | Required spec field is empty |
+| `configuration error: secrets must never go in specs` | local | `ConfigurationError` | A token was inlined into a spec field |
+| `authentication failed: …` | 401 | `AuthError` | Credential missing, invalid, or expired |
+| `not found: …` | 404 | `ApiError` | Workload/project does not exist |
+
+In TypeScript every row above arrives as a single `Error`; match on the message text (and the
+bracketed code for the `403` rows).
+
+<CardGrid>
+  <LinkCard title="Tokens & the two planes" href="/quickstart/tokens/" description="Where ik_sdk_ and ik_live_ each belong." />
+  <LinkCard title="OnDrift reference" href="/reference/ondrift/" description="What ensure() does when a live workload differs from your spec." />
+</CardGrid>
+
+<Card title="Get a token">
+  Create an account or open the dashboard to mint your `ik_sdk_` and `ik_live_` credentials, then
+  set `INFERENCEKEY_SDK_TOKEN` and `INFERENCEKEY_API_KEY`. — [Open dashboard](https://app.inferencekey.com)
+</Card>

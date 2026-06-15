@@ -1,0 +1,220 @@
+---
+title: Your first ensure()
+description: Declare a vLLM chat workload with WorkloadSpec and bring it into existence on the platform with a single idempotent ensure() call.
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem, Steps, Aside, LinkCard, Card } from "@astrojs/starlight/components";
+
+`ensure()` is the one call you need to provision a workload. You describe the
+workload you want with a `WorkloadSpec`, hand it to a `ManagementClient`, and
+the platform makes reality match your description, creating the workload if it
+does not exist, reconciling it if it has drifted.
+
+This is the **control plane**: it runs with your `ik_sdk_` token and provisions
+workloads. It never calls inference. (Calling the resulting endpoint is the
+[data plane](/quickstart/first-call/), covered next.)
+
+<Aside type="note" title="Before you start">
+  You need an `ik_sdk_` token and a project slug. If you don't have those yet,
+  see [Get your tokens](/quickstart/tokens/).
+</Aside>
+
+## What you declare: WorkloadSpec
+
+A `WorkloadSpec` is a plain description of the workload you want. For a vLLM chat
+workload, four fields carry the intent and one identifies it:
+
+- **`name`** — a human-readable label for the workload.
+- **`slug`** — the stable identifier. This is the idempotency key (see below).
+- **`model`** — the model to serve, e.g. `meta-llama/Llama-3.1-8B-Instruct`.
+- **`backend`** — the serving engine, here `Backend.VLLM`.
+- **`command`** — how vLLM launches the model.
+
+That's all `ensure()` needs for a basic chat workload. `WorkloadSpec` accepts
+more optional fields (`description`, `vllm_version`, `task_type`,
+`execution_policy`, `config`, and others) when you need them, but you do **not**
+declare a provider or a VRAM floor, where the workload runs is the platform's
+job, not yours.
+
+## Idempotency is by slug
+
+`ensure()` is safe to call as many times as you like. The `slug` is the
+idempotency key: the platform looks for a workload with that exact slug in your
+project and either creates it or updates it to match your spec. Run your script
+once or a hundred times, on every deploy, in CI, on every app boot, and you
+converge on exactly one `support-bot` workload.
+
+This is what makes `ensure()` safe to put on the hot path of a deploy: declare,
+ensure, done.
+
+## onDrift defaults to RECONCILE
+
+When `ensure()` finds an existing workload whose live configuration no longer
+matches your spec, that gap is **drift**. The `on_drift` option decides what
+happens.
+
+The default is `OnDrift.RECONCILE`: the platform updates the workload to match
+your spec. Your spec is the source of truth, and `ensure()` brings the workload
+back in line. You don't pass anything to get this, it's the default.
+
+If you'd rather be warned, fail the call, or preview the change instead of
+applying it, `OnDrift` has modes for that.
+
+<LinkCard
+  title="OnDrift reference"
+  description="Every drift mode (Reconcile, Fail, DryRun, Warn, Ignore) and when to use each."
+  href="/reference/ondrift/"
+/>
+
+## Provision a chat workload
+
+<Steps>
+
+1. **Set your environment.**
+
+   The management client reads `INFERENCEKEY_SDK_TOKEN` from the environment.
+   Set it (and the base URL if you're not on the default) before you run the
+   script.
+
+   ```bash title=".env / shell"
+   export INFERENCEKEY_SDK_TOKEN="ik_sdk_xxxxxxxxxxxxxxxxxxxx"
+   # Optional: override the API host
+   # export INFERENCEKEY_BASE_URL="https://api.inferencekey.com"
+   ```
+
+2. **Describe and ensure the workload.**
+
+   Build a `WorkloadSpec` for a vLLM chat workload and pass it to `ensure()`.
+   `on_drift` is omitted, so it defaults to `RECONCILE`.
+
+   <Tabs syncKey="lang">
+     <TabItem label="Python">
+       ```python title="provision.py"
+       from inferencekey import ManagementClient, WorkloadSpec, Backend
+
+       # Control-plane client, scoped to one project.
+       # Reads INFERENCEKEY_SDK_TOKEN from the environment.
+       mgmt = ManagementClient.from_env(project="acme")
+
+       ref = mgmt.ensure(
+           WorkloadSpec(
+               name="support-bot",
+               slug="support-bot",  # idempotency key
+               model="meta-llama/Llama-3.1-8B-Instruct",
+               backend=Backend.VLLM,
+               command=(
+                   "vllm serve meta-llama/Llama-3.1-8B-Instruct "
+                   "--max-model-len 8192"
+               ),
+           )
+           # on_drift defaults to OnDrift.RECONCILE
+       )
+
+       print("project: ", ref.project_slug)
+       print("workload:", ref.workload_slug)
+       ```
+     </TabItem>
+     <TabItem label="TypeScript">
+       ```ts title="provision.ts"
+       import { ManagementClient, Backend } from "@inferencekey/sdk";
+
+       // Control-plane client, scoped to one project.
+       // Reads INFERENCEKEY_SDK_TOKEN from the environment.
+       const mgmt = ManagementClient.fromEnv({ project: "acme" });
+
+       const ref = await mgmt.ensure({
+         name: "support-bot",
+         slug: "support-bot", // idempotency key
+         model: "meta-llama/Llama-3.1-8B-Instruct",
+         backend: Backend.Vllm,
+         command:
+           "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+         // onDrift defaults to OnDrift.Reconcile
+       });
+
+       console.log("project: ", ref.projectSlug);
+       console.log("workload:", ref.workloadSlug);
+       ```
+     </TabItem>
+   </Tabs>
+
+3. **Run it.**
+
+   <Tabs syncKey="lang">
+     <TabItem label="Python">
+       ```bash
+       python provision.py
+       ```
+     </TabItem>
+     <TabItem label="TypeScript">
+       ```bash
+       node provision.ts
+       ```
+     </TabItem>
+   </Tabs>
+
+   Run it again. Nothing breaks, you still have exactly one `support-bot`
+   workload. That's idempotency by slug.
+
+</Steps>
+
+## What you get back: the EndpointRef
+
+`ensure()` returns a reference to the workload it just ensured, an
+**`EndpointRef`**. It is not the workload's full config and it is not a data
+client; it's a lightweight handle that tells you *which* workload to talk to.
+
+It carries the resolved identifiers:
+
+- **`project_slug`** / `projectSlug` — the project the workload lives in.
+- **`workload_slug`** / `workloadSlug` — the slug the platform converged on.
+
+You pass that `workload_slug` straight into the data plane to call inference,
+no need to hard-code the slug a second time:
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python title="provision.py (continued)"
+    from inferencekey import DataClient
+
+    data = DataClient.from_env(project="acme")
+    ep = data.endpoint(ref.workload_slug, api_key="ik_live_...")
+    out = ep.generate_text(prompt="Hola", temperature=0.2, max_tokens=300)
+    print(out.text)
+    ```
+  </TabItem>
+  <TabItem label="TypeScript">
+    ```ts title="provision.ts (continued)"
+    import { DataClient } from "@inferencekey/sdk";
+
+    const data = DataClient.fromEnv({ project: "acme" });
+    const ep = data.endpoint(ref.workloadSlug, { apiKey: process.env.SUPPORT_IK_LIVE });
+    const out = await ep.generateText({ prompt: "Hola", temperature: 0.2, maxTokens: 300 });
+    console.log(out.text);
+    ```
+  </TabItem>
+</Tabs>
+
+<Aside type="caution" title="Different tokens, different planes">
+  Provisioning uses your `ik_sdk_` token (control plane). Calling the endpoint
+  uses an `ik_live_` token (data plane), passed **per workload**. They are not
+  interchangeable, an `ik_sdk_` token cannot call inference, and an `ik_live_`
+  token cannot provision.
+</Aside>
+
+## Next steps
+
+<Card title="Call your endpoint" icon="rocket">
+  You've ensured a workload and have its `EndpointRef`. Now send it a prompt.
+
+  [Make your first call →](/quickstart/first-call/)
+</Card>
+
+---
+
+<small>
+  Need a place to create a project and mint tokens? [Open the dashboard](https://app.inferencekey.com).
+  Learn more at [inferencekey.com](https://inferencekey.com).
+</small>

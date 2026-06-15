@@ -1,0 +1,38 @@
+---
+title: InferenceKey SDK
+description: Déclarez vos charges de travail d'IA dans le code, assurez-vous qu'elles existent sur la plateforme et appelez les endpoints compatibles OpenAI obtenus — premier résultat en moins de 5 minutes.
+template: splash
+hero:
+  title: Des charges de travail dans le code. Des endpoints en minutes.
+  tagline: Déclarez une charge de travail d'IA, appelez ensure() et obtenez un endpoint compatible OpenAI prêt à l'emploi. Un cœur en Rust, des SDK natifs Python et TypeScript.
+  actions:
+    - text: Commencer
+      link: /fr/quickstart/tokens/
+      icon: right-arrow
+      variant: primary
+    - text: Ouvrir le tableau de bord
+      link: https://cloud.inferencekey.com
+      icon: external
+      variant: minimal
+---
+
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+## Deux jetons, moindre privilège
+
+Vous déclarez une charge de travail avec le **plan de contrôle** (`ManagementClient`, un jeton `ik_sdk_`) et vous l'appelez avec le **plan de données** (`DataClient`, un jeton `ik_live_`). `ensure()` est idempotent sur le slug : vous pouvez l'exécuter à chaque déploiement.
+
+Le jeton de contrôle `ik_sdk_` provisionne des charges de travail mais **ne peut pas** appeler l'inférence. Le jeton de données `ik_live_` appelle l'inférence mais **ne peut pas** provisionner. Passez une clé de données par charge de travail — une application peut en piloter plusieurs, chacune avec sa propre clé.
+
+## Explorer la documentation
+
+<CardGrid>
+  <LinkCard title="Démarrage" description="Obtenez vos jetons, lancez votre premier ensure() et faites votre premier appel." href="/fr/quickstart/tokens/" />
+  <LinkCard title="Guides" description="Authentification, charges par politique / worker / modalité, et cas d'usage de bout en bout." href="/fr/guides/authentication/" />
+  <LinkCard title="Référence" description="Architecture, jetons, OnDrift, backends et politiques, format wire et erreurs courantes." href="/fr/reference/architecture/" />
+  <LinkCard title="Référence API" description="Surface complète Python et TypeScript. Go et Java bientôt disponibles (via la C ABI)." href="/fr/api/" />
+</CardGrid>
+
+---
+
+<p>Nouveau sur la plateforme ? <a href="https://cloud.inferencekey.com">Créez un compte ou ouvrez le tableau de bord</a> · En savoir plus sur <a href="https://inferencekey.com">inferencekey.com</a></p>
