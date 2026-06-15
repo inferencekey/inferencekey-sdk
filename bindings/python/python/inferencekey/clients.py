@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
-from typing import Iterator, List, Optional, Union
+from typing import Callable, Iterator, List, Optional, Union
 
 from . import _inferencekey  # native extension
 from .enums import OnDrift
@@ -27,7 +28,7 @@ from .errors import (
     PermissionDenied,
     ValidationError,
 )
-from .types import EmbedResult, EndpointRef, TextChunk, TextResult, WorkloadSpec
+from .types import EmbedResult, EndpointRef, ReadinessEvent, TextChunk, TextResult, WorkloadSpec
 
 _DEFAULT_BASE_URL = "https://api.inferencekey.com"
 
@@ -109,6 +110,72 @@ class ManagementClient:
         )
         data = json.loads(raw)
         return EndpointRef(project_slug=data["project_slug"], workload_slug=data["workload_slug"])
+
+    def wait_until_ready(
+        self,
+        workload_slug: str,
+        *,
+        project: Optional[str] = None,
+        timeout: float = 600.0,
+        on_progress: Optional[Callable[[ReadinessEvent], None]] = None,
+        silent: bool = False,
+    ) -> None:
+        """Wait until ``workload_slug`` is serving, reporting progress as the
+        platform schedules a worker, provisions a cloud GPU, and boots the runtime.
+
+        Returns when the platform reports the ``ready`` phase; raises on an
+        ``error`` phase or after ``timeout`` seconds. By default it prints a live
+        progress view to the terminal; pass your own ``on_progress`` to handle
+        events yourself, or ``silent=True`` to suppress output. Progress is
+        streamed over the ``ik_sdk_`` control token, so it lives here on the
+        management client (no data key needed)::
+
+            ref = mgmt.ensure(spec)
+            mgmt.wait_until_ready(ref.workload_slug, timeout=600)
+        """
+        project_id = project or self._project
+        if not project_id:
+            raise ConfigurationError(
+                "No project configured. Set INFERENCEKEY_PROJECT or pass project=."
+            )
+        render = on_progress or (_noop_progress if silent else _make_progress_renderer())
+
+        native_iter = _call(
+            self._native.readiness_events,
+            self._sdk_token,
+            project_id,
+            workload_slug,
+        )
+        deadline = time.monotonic() + timeout
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f'workload "{workload_slug}" not ready after {timeout:.0f}s'
+                )
+            try:
+                raw = next(native_iter)
+            except StopIteration:
+                return  # stream ended without an explicit ready
+            except PermissionError as e:
+                raise PermissionDenied(str(e)) from None
+            except ValueError as e:
+                raise _value_error(str(e)) from None
+            except RuntimeError as e:
+                raise ApiError(str(e)) from None
+            data = json.loads(raw)
+            event = ReadinessEvent(
+                phase=data["phase"],
+                message=data["message"],
+                elapsed_ms=data.get("elapsed_ms", 0),
+                step=data.get("step"),
+            )
+            render(event)
+            if event.phase == "ready":
+                return
+            if event.phase == "error":
+                raise ApiError(
+                    f'workload "{workload_slug}" failed to become ready: {event.message}'
+                )
 
 
 class DataClient:
@@ -243,46 +310,6 @@ class Endpoint:
                 raw=data.get("raw", {}),
             )
 
-    def wait_until_ready(
-        self,
-        *,
-        timeout: float = 300.0,
-        interval: float = 2.0,
-        max_interval: float = 15.0,
-    ) -> None:
-        """Block until the workload's endpoint is serving, by probing it.
-
-        The control plane has no readiness flag, so this sends a tiny chat probe
-        and treats a transport/5xx failure as "still starting" — retrying with
-        exponential backoff up to ``max_interval`` — while a 401/403/404 (bad
-        key, wrong token type, unknown workload) is a real error that raises
-        immediately. Raises :class:`TimeoutError` if ``timeout`` elapses first.
-
-        Call this after ``ensure()`` provisions a cold worker, before streaming::
-
-            ep.wait_until_ready(timeout=600)
-            for chunk in ep.generate_text_stream(prompt="..."):
-                ...
-        """
-        deadline = time.monotonic() + timeout
-        delay = interval
-        while True:
-            try:
-                self.generate_text(prompt="ping", max_tokens=1)
-                return  # a successful completion means the worker is up.
-            except (PermissionDenied, AuthError, ValidationError) as e:
-                # Fatal: a wrong/instufficient credential or unknown workload
-                # will never become ready — surface it, do not spin.
-                raise e
-            except (ApiError, InferenceKeyError):
-                # Transport error or 5xx: the worker is likely still booting.
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        f'workload "{self.workload_slug}" not ready after {timeout:.0f}s'
-                    ) from None
-                time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
-                delay = min(delay * 2, max_interval)
-
     def embed(self, *, input: Union[str, List[str]]) -> EmbedResult:
         """Create embeddings for one or more inputs."""
         items = [input] if isinstance(input, str) else list(input)
@@ -303,3 +330,46 @@ class Endpoint:
 
 def _drop_none(d: dict) -> dict:
     return {k: v for k, v in d.items() if v is not None}
+
+
+_READINESS_PHASES = ["scheduling", "provisioning", "bootstrapping", "ready"]
+
+
+def _noop_progress(_event: ReadinessEvent) -> None:
+    pass
+
+
+def _make_progress_renderer() -> Callable[[ReadinessEvent], None]:
+    """Default terminal progress renderer for :meth:`ManagementClient.wait_until_ready`.
+
+    On a TTY it redraws a single line of phase dots with the current message and
+    elapsed time; off a TTY (CI / piped) it prints one plain line per event.
+    """
+    is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+
+    def render(event: ReadinessEvent) -> None:
+        secs = round(event.elapsed_ms / 1000)
+        if not is_tty:
+            step = f" [{event.step}]" if event.step else ""
+            print(f"[{secs}s] {event.phase}{step}: {event.message}")
+            return
+        if event.phase == "error":
+            reached = len(_READINESS_PHASES) - 1
+        else:
+            reached = _READINESS_PHASES.index(event.phase) if event.phase in _READINESS_PHASES else 0
+        dots = []
+        for i, _p in enumerate(_READINESS_PHASES):
+            if event.phase == "ready" or i < reached:
+                dots.append("\x1b[32m●\x1b[0m")      # done
+            elif i == reached:
+                dots.append("\x1b[36m◐\x1b[0m")      # in progress
+            else:
+                dots.append("\x1b[90m○\x1b[0m")      # pending
+        label = f"\x1b[31m{event.message}\x1b[0m" if event.phase == "error" else event.message
+        # \r returns to line start; \x1b[K clears to end of line before redraw.
+        sys.stdout.write(f"\r\x1b[K{' '.join(dots)}  {label} ({secs}s)")
+        if event.phase in ("ready", "error"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    return render

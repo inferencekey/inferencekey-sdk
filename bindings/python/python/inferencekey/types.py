@@ -87,6 +87,22 @@ class TextChunk:
 
 
 @dataclass(frozen=True)
+class ReadinessEvent:
+    """One readiness progress update from :meth:`ManagementClient.wait_until_ready`.
+
+    ``phase`` is one of ``scheduling`` / ``provisioning`` / ``bootstrapping`` /
+    ``ready`` / ``error``; ``ready`` means the workload is serving and ``error``
+    is a terminal failure. ``elapsed_ms`` is time since the wait started; ``step``
+    is an allow-listed bootstrap step name when applicable.
+    """
+
+    phase: str
+    message: str
+    elapsed_ms: int = 0
+    step: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class EmbedResult:
     """An embeddings result, one vector per input."""
 

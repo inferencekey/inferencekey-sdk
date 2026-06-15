@@ -56,7 +56,7 @@ pub use errors::{CoreError, CoreResult, PermissionCode};
 pub use domain::enums::*;
 pub use domain::spec::WorkloadSpec;
 
-pub use pipelines::management::{ensure, EndpointRef};
+pub use pipelines::management::{ensure, readiness_events, EndpointRef, ReadinessEvent};
 pub use pipelines::data::{
     embed, generate_text, generate_text_stream, ChatMessage, EmbedParams, EmbedResult,
     GenerateTextParams, TextChunk, TextResult,

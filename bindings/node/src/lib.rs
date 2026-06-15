@@ -18,8 +18,8 @@ use tokio::sync::Mutex;
 
 use inferencekey_core::ports::http::HttpPort;
 use inferencekey_core::{
-    embed, ensure, generate_text, generate_text_stream, CoreError, EmbedParams, GenerateTextParams,
-    OnDrift, ReqwestHttp, TextChunk,
+    embed, ensure, generate_text, generate_text_stream, readiness_events, CoreError, EmbedParams,
+    GenerateTextParams, OnDrift, ReadinessEvent, ReqwestHttp, TextChunk,
 };
 use inferencekey_core::WorkloadSpec;
 
@@ -66,6 +66,30 @@ impl Client {
         .await
         .map_err(map_core_error)?;
         to_json(result)
+    }
+
+    /// Open the readiness progress stream for a workload (control plane).
+    /// Resolves to a [`ReadinessStream`] whose `next()` yields one
+    /// `ReadinessEvent` JSON string per SSE frame and `null` at end of stream.
+    #[napi]
+    pub async fn readiness_events(
+        &self,
+        sdk_token: String,
+        project_id: String,
+        workload_slug: String,
+    ) -> Result<ReadinessStream> {
+        let http = self.http.clone();
+        let base_url = self.base_url.clone();
+        let stream = readiness_events(
+            http.clone() as Arc<dyn HttpPort>,
+            &base_url,
+            &sdk_token,
+            &project_id,
+            &workload_slug,
+        )
+        .await
+        .map_err(map_core_error)?;
+        Ok(ReadinessStream::new(http, stream))
     }
 
     /// Run a non-streaming chat completion. `params_json` is a JSON
@@ -191,6 +215,66 @@ impl ChatStream {
             Some(Ok(chunk)) => to_json(chunk).map(Some),
             Some(Err(e)) => Err(map_core_error(e)),
         }
+    }
+}
+
+/// A live readiness progress stream handed to JavaScript. Same shape as
+/// [`ChatStream`]: `next()` pulls one `ReadinessEvent` JSON string, or `null`
+/// when the stream ends.
+#[napi]
+pub struct ReadinessStream {
+    _http: Arc<ReqwestHttp>,
+    inner: Mutex<BoxStream<'static, inferencekey_core::CoreResult<ReadinessEvent>>>,
+    // Signalled by `close()`. A pending `next()` races the stream against this
+    // notify, so a finished/timed-out wait can unblock the in-flight pull and
+    // let the SSE connection drop instead of keeping the event loop alive.
+    closed: tokio::sync::Notify,
+    is_closed: std::sync::atomic::AtomicBool,
+}
+
+impl ReadinessStream {
+    fn new(
+        http: Arc<ReqwestHttp>,
+        inner: BoxStream<'static, inferencekey_core::CoreResult<ReadinessEvent>>,
+    ) -> Self {
+        Self {
+            _http: http,
+            inner: Mutex::new(inner),
+            closed: tokio::sync::Notify::new(),
+            is_closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+#[napi]
+impl ReadinessStream {
+    /// Pull the next `ReadinessEvent` as a JSON string, or `null` when the
+    /// stream is exhausted or has been closed.
+    #[napi]
+    pub async fn next(&self) -> Result<Option<String>> {
+        use std::sync::atomic::Ordering;
+        if self.is_closed.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let mut stream = self.inner.lock().await;
+        tokio::select! {
+            biased;
+            _ = self.closed.notified() => Ok(None),
+            item = stream.next() => match item {
+                None => Ok(None),
+                Some(Ok(ev)) => to_json(ev).map(Some),
+                Some(Err(e)) => Err(map_core_error(e)),
+            },
+        }
+    }
+
+    /// Close the stream so a pending `next()` unblocks and the SSE connection
+    /// is released. Idempotent. The wrapper calls this once the wait is decided.
+    #[napi]
+    pub fn close(&self) {
+        self.is_closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.closed.notify_waiters();
     }
 }
 

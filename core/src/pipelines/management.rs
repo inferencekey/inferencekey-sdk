@@ -13,6 +13,10 @@
 //! wire bodies. Tokens are forwarded to the port verbatim and only ever appear
 //! in logs through [`redact`].
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::stream::{self, BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -24,7 +28,7 @@ use crate::domain::wire::{
     WorkloadResponse,
 };
 use crate::errors::{CoreError, CoreResult};
-use crate::ports::http::{HttpMethod, HttpPort, HttpRequest};
+use crate::ports::http::{HttpMethod, HttpPort, HttpRequest, JsonStream};
 
 /// Addresses a workload's OpenAI-compatible data-plane endpoint
 /// (`/endpoint/:project_slug/:workload_slug/v1/...`). Handed to a `DataClient`.
@@ -32,6 +36,240 @@ use crate::ports::http::{HttpMethod, HttpPort, HttpRequest};
 pub struct EndpointRef {
     pub project_slug: String,
     pub workload_slug: String,
+}
+
+/// One readiness progress update streamed while waiting for a workload to come
+/// up. Mirrors the Manager's sanitized SSE payload: a normalized `phase`, a
+/// human-readable `message`, milliseconds since the stream opened, and an
+/// optional allow-listed bootstrap `step`. `phase == "ready"` means the
+/// workload is serving; `phase == "error"` is a terminal failure.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReadinessEvent {
+    pub phase: String,
+    pub message: String,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+}
+
+/// Backoff schedule for reconnecting a dropped readiness stream: 1s, 2s, 4s,
+/// then capped. Bounded so a flapping server can't blow the budget per attempt;
+/// the caller's overall `timeoutMs` (enforced in the binding) is the hard
+/// ceiling on total wait, so we don't also count attempts here.
+const RECONNECT_BACKOFF_MS: [u64; 3] = [1_000, 2_000, 4_000];
+const RECONNECT_BACKOFF_CAP_MS: u64 = 5_000;
+
+/// Backoff delay (ms) for the Nth consecutive failed (re)connect, 0-indexed.
+fn backoff_ms(consecutive_failures: usize) -> u64 {
+    RECONNECT_BACKOFF_MS
+        .get(consecutive_failures)
+        .copied()
+        .unwrap_or(RECONNECT_BACKOFF_CAP_MS)
+}
+
+/// The sleep primitive used between reconnect attempts. Real runs use
+/// [`TokioSleeper`]; tests inject a no-op/recording sleeper so the backoff is
+/// exercised without real time passing.
+pub trait Sleeper: Send + Sync {
+    /// Sleep for `duration`, then resolve.
+    fn sleep<'a>(&'a self, duration: Duration) -> BoxFuture<'a, ()>;
+}
+
+/// A future that resolves to `()` after a delay (no error channel).
+type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// Production sleeper backed by `tokio::time::sleep`.
+pub struct TokioSleeper;
+
+impl Sleeper for TokioSleeper {
+    fn sleep<'a>(&'a self, duration: Duration) -> BoxFuture<'a, ()> {
+        Box::pin(tokio::time::sleep(duration))
+    }
+}
+
+/// Is this error transient (worth reconnecting) rather than permanent? A
+/// dropped/refused connection or a 502/503/504 is transient — the manager may
+/// be restarting. Auth/permission/not-found/bad-request and local errors are
+/// permanent: reconnecting would only repeat them.
+fn is_transient(err: &CoreError) -> bool {
+    match err {
+        CoreError::Network(_) => true,
+        CoreError::Api { status, .. } => matches!(status, 502 | 503 | 504),
+        _ => false,
+    }
+}
+
+/// Whether a decoded event is terminal — the only legitimate way the stream
+/// ends. A stream that closes *without* a terminal frame is a mid-flight drop
+/// and triggers a reconnect (this is the bug being fixed: a bare end-of-stream
+/// must not look like success).
+fn is_terminal(event: &ReadinessEvent) -> bool {
+    event.phase == "ready" || event.phase == "error"
+}
+
+/// Open the readiness progress stream for `workload_slug`, yielding one
+/// [`ReadinessEvent`] per server-sent event until a terminal (`ready`/`error`)
+/// frame arrives.
+///
+/// **Reconnection.** The control plane has no `Last-Event-ID`/offset, but it
+/// emits a snapshot of the current phase on connect. So if the underlying SSE
+/// stream drops mid-flight (e.g. the manager restarts) before a terminal frame,
+/// this transparently reopens it — after a bounded backoff (1s, 2s, 4s, capped
+/// at 5s) — and re-syncs from the fresh snapshot. A workload that reached
+/// `ready` during the gap is observed on reconnect. Only a *terminal* frame
+/// ends the stream; a permanent error (401/403/404/400) ends it too, propagated
+/// as-is. Reconnection is intentionally housed here in the core so both the
+/// Node and Python bindings get it for free; the caller's `timeoutMs` remains
+/// the hard ceiling on total wait.
+///
+/// Control plane: authenticated with the `ik_sdk_` token, scoped to
+/// `project_id` server-side. Non-readiness SSE frames (comments/keepalives) are
+/// dropped by the transport, so every item here is a decoded payload.
+pub async fn readiness_events(
+    http: Arc<dyn HttpPort>,
+    base_url: &str,
+    sdk_token: &str,
+    project_id: &str,
+    workload_slug: &str,
+) -> CoreResult<BoxStream<'static, CoreResult<ReadinessEvent>>> {
+    readiness_events_with_sleeper(
+        http,
+        base_url,
+        sdk_token,
+        project_id,
+        workload_slug,
+        Arc::new(TokioSleeper),
+    )
+    .await
+}
+
+/// State threaded through the reconnecting [`stream::unfold`]. Owns everything
+/// needed to reopen the SSE connection so the produced stream is `'static`.
+struct ReadinessState {
+    http: Arc<dyn HttpPort>,
+    sleeper: Arc<dyn Sleeper>,
+    req: HttpRequest,
+    slug: String,
+    token: String,
+    /// The live SSE frame stream, or `None` before the first / after a drop.
+    frames: Option<JsonStream>,
+    /// Consecutive failed (re)connect attempts, for backoff. Reset on any frame.
+    failures: usize,
+    /// Set once a terminal frame is seen so the stream stops cleanly.
+    done: bool,
+}
+
+/// [`readiness_events`] with an injectable [`Sleeper`] for deterministic tests.
+pub async fn readiness_events_with_sleeper(
+    http: Arc<dyn HttpPort>,
+    base_url: &str,
+    sdk_token: &str,
+    project_id: &str,
+    workload_slug: &str,
+    sleeper: Arc<dyn Sleeper>,
+) -> CoreResult<BoxStream<'static, CoreResult<ReadinessEvent>>> {
+    let url = join_url(
+        base_url,
+        &format!("/api/projects/{project_id}/workloads/{workload_slug}/readiness-events"),
+    );
+    let req = HttpRequest::empty(HttpMethod::Get, url, sdk_token);
+
+    let state = ReadinessState {
+        http,
+        sleeper,
+        req,
+        slug: workload_slug.to_string(),
+        token: sdk_token.to_string(),
+        frames: None,
+        failures: 0,
+        done: false,
+    };
+
+    let stream = stream::unfold(state, |state| async move {
+        next_readiness(state).await
+    });
+    Ok(stream.boxed())
+}
+
+/// Pull the next [`ReadinessEvent`], reconnecting on a mid-flight drop. Returns
+/// `None` to end the stream after a terminal frame, a permanent error, or once
+/// `done`. Drives one step of the [`stream::unfold`] state machine.
+async fn next_readiness(mut state: ReadinessState) -> Option<(CoreResult<ReadinessEvent>, ReadinessState)> {
+    if state.done {
+        return None;
+    }
+    loop {
+        // Ensure we have a live frame stream, reconnecting (with backoff) if not.
+        if state.frames.is_none() {
+            if state.failures > 0 {
+                let delay = backoff_ms(state.failures - 1);
+                tracing::info!(
+                    workload = %state.slug,
+                    attempt = state.failures,
+                    backoff_ms = delay,
+                    token = %redact(&state.token),
+                    "readiness stream dropped; reconnecting after backoff",
+                );
+                state.sleeper.sleep(Duration::from_millis(delay)).await;
+            }
+            match state.http.stream_sse(state.req.clone()).await {
+                Ok(frames) => state.frames = Some(frames),
+                Err(err) if is_transient(&err) => {
+                    // Couldn't reopen — count it and loop to back off and retry.
+                    state.failures += 1;
+                    continue;
+                }
+                Err(err) => {
+                    // Permanent: surface once, then end the stream.
+                    state.done = true;
+                    return Some((Err(err), state));
+                }
+            }
+        }
+
+        let frames = state.frames.as_mut().expect("frames set above");
+        match frames.next().await {
+            Some(Ok(value)) => {
+                state.failures = 0; // a healthy frame resets the backoff
+                match parse_readiness_event(&value) {
+                    Ok(event) => {
+                        if is_terminal(&event) {
+                            state.done = true;
+                        }
+                        return Some((Ok(event), state));
+                    }
+                    // A malformed payload is a local decode error, not a drop:
+                    // surface it and end (reconnecting wouldn't fix bad JSON).
+                    Err(err) => {
+                        state.done = true;
+                        return Some((Err(err), state));
+                    }
+                }
+            }
+            Some(Err(err)) if is_transient(&err) => {
+                // Mid-stream transport blip: drop the stream and reconnect.
+                state.frames = None;
+                state.failures += 1;
+            }
+            Some(Err(err)) => {
+                // Permanent error mid-stream: surface and end.
+                state.done = true;
+                return Some((Err(err), state));
+            }
+            None => {
+                // Stream ended WITHOUT a terminal frame — a mid-flight drop, not
+                // success. Reconnect. (This is the core bug fix.)
+                state.frames = None;
+                state.failures += 1;
+            }
+        }
+    }
+}
+
+/// Decode one readiness SSE payload into a [`ReadinessEvent`].
+fn parse_readiness_event(value: &Value) -> CoreResult<ReadinessEvent> {
+    serde_json::from_value(value.clone()).map_err(CoreError::from)
 }
 
 /// The per-call context shared by every step: the transport handle plus the
@@ -363,5 +601,187 @@ mod tests {
             worker_id: None,
             gpu_resource_id: None,
         }
+    }
+
+    // ── readiness reconnection ────────────────────────────────────────────
+    use crate::ports::http::{BoxFuture, JsonStream};
+    use futures_util::stream;
+    use std::sync::Mutex;
+
+    /// One scripted outcome of a `stream_sse` call: either a sequence of frames
+    /// (each Ok value or a transient/permanent error) that then ends, or an
+    /// immediate connect error.
+    enum Attempt {
+        /// A stream that yields these results in order, then ends (`None`).
+        Stream(Vec<CoreResult<Value>>),
+        /// `stream_sse` itself fails before returning a stream.
+        ConnectErr(CoreError),
+    }
+
+    /// Fake transport: hands out one scripted [`Attempt`] per `stream_sse` call,
+    /// in order. Reconnects pull the next attempt — exactly the manager-restart
+    /// shape. Records how many times `stream_sse` was called.
+    struct FakeHttp {
+        attempts: Mutex<std::collections::VecDeque<Attempt>>,
+        connects: Mutex<usize>,
+    }
+
+    impl FakeHttp {
+        fn new(attempts: Vec<Attempt>) -> Self {
+            Self {
+                attempts: Mutex::new(attempts.into_iter().collect()),
+                connects: Mutex::new(0),
+            }
+        }
+        fn connect_count(&self) -> usize {
+            *self.connects.lock().unwrap()
+        }
+    }
+
+    impl HttpPort for FakeHttp {
+        fn request_json<'a>(&'a self, _req: HttpRequest) -> BoxFuture<'a, Value> {
+            Box::pin(async { Err(CoreError::NotImplemented("request_json".into())) })
+        }
+        fn stream_sse<'a>(&'a self, _req: HttpRequest) -> BoxFuture<'a, JsonStream> {
+            *self.connects.lock().unwrap() += 1;
+            let attempt = self.attempts.lock().unwrap().pop_front();
+            Box::pin(async move {
+                match attempt {
+                    Some(Attempt::Stream(items)) => {
+                        let s: JsonStream = Box::new(stream::iter(items));
+                        Ok(s)
+                    }
+                    Some(Attempt::ConnectErr(err)) => Err(err),
+                    // Ran out of script: behave like a connection refused so a
+                    // runaway reconnect loop surfaces rather than hanging.
+                    None => Err(CoreError::Network("no more attempts".into())),
+                }
+            })
+        }
+    }
+
+    /// Sleeper that never actually sleeps; it records each requested delay so a
+    /// test can assert the backoff schedule without real time passing.
+    struct RecordingSleeper {
+        delays_ms: Mutex<Vec<u64>>,
+    }
+    impl RecordingSleeper {
+        fn new() -> Arc<Self> {
+            Arc::new(Self { delays_ms: Mutex::new(Vec::new()) })
+        }
+        fn delays(&self) -> Vec<u64> {
+            self.delays_ms.lock().unwrap().clone()
+        }
+    }
+    impl Sleeper for RecordingSleeper {
+        fn sleep<'a>(&'a self, duration: Duration) -> super::BoxFuture<'a, ()> {
+            self.delays_ms.lock().unwrap().push(duration.as_millis() as u64);
+            Box::pin(async {})
+        }
+    }
+
+    fn ev(phase: &str) -> Value {
+        json!({ "phase": phase, "message": phase, "elapsed_ms": 0 })
+    }
+
+    async fn collect_readiness(
+        http: Arc<dyn HttpPort>,
+        sleeper: Arc<dyn Sleeper>,
+    ) -> Vec<CoreResult<ReadinessEvent>> {
+        let stream = readiness_events_with_sleeper(
+            http, "https://api.test", "ik_sdk_x", "proj", "wl", sleeper,
+        )
+        .await
+        .expect("open stream");
+        stream.collect::<Vec<_>>().await
+    }
+
+    #[tokio::test]
+    async fn reconnects_after_a_mid_flight_drop_and_resolves_ready() {
+        // The user's case: first stream emits one progress frame then ends with
+        // NO terminal frame (manager restarted); reconnect sees `ready`.
+        let http = Arc::new(FakeHttp::new(vec![
+            Attempt::Stream(vec![Ok(ev("provisioning"))]), // drops without terminal
+            Attempt::Stream(vec![Ok(ev("ready"))]),
+        ]));
+        let sleeper = RecordingSleeper::new();
+        let out = collect_readiness(http.clone(), sleeper.clone()).await;
+
+        let phases: Vec<String> = out.iter().map(|r| r.as_ref().unwrap().phase.clone()).collect();
+        assert_eq!(phases, vec!["provisioning", "ready"]);
+        assert_eq!(http.connect_count(), 2, "should reconnect exactly once");
+        assert_eq!(sleeper.delays(), vec![1_000], "one backoff before the reconnect");
+    }
+
+    #[tokio::test]
+    async fn happy_path_does_not_reconnect() {
+        // Regression: `ready` on the first stream means zero reconnects.
+        let http = Arc::new(FakeHttp::new(vec![Attempt::Stream(vec![
+            Ok(ev("scheduling")),
+            Ok(ev("ready")),
+        ])]));
+        let sleeper = RecordingSleeper::new();
+        let out = collect_readiness(http.clone(), sleeper.clone()).await;
+
+        let phases: Vec<String> = out.iter().map(|r| r.as_ref().unwrap().phase.clone()).collect();
+        assert_eq!(phases, vec!["scheduling", "ready"]);
+        assert_eq!(http.connect_count(), 1);
+        assert!(sleeper.delays().is_empty(), "no backoff on the happy path");
+    }
+
+    #[tokio::test]
+    async fn permanent_error_on_reconnect_does_not_retry() {
+        // First stream drops; the reconnect hits a 404 — surface it and stop,
+        // no further attempts.
+        let http = Arc::new(FakeHttp::new(vec![
+            Attempt::Stream(vec![Ok(ev("scheduling"))]),
+            Attempt::ConnectErr(CoreError::NotFound("workload gone".into())),
+            Attempt::Stream(vec![Ok(ev("ready"))]), // must NOT be reached
+        ]));
+        let sleeper = RecordingSleeper::new();
+        let out = collect_readiness(http.clone(), sleeper.clone()).await;
+
+        assert_eq!(out[0].as_ref().unwrap().phase, "scheduling");
+        assert!(matches!(out[1], Err(CoreError::NotFound(_))));
+        assert_eq!(out.len(), 2, "stream ends after the permanent error");
+        assert_eq!(http.connect_count(), 2, "no attempt after the 404");
+    }
+
+    #[tokio::test]
+    async fn transient_connect_errors_back_off_then_succeed() {
+        // Two failed reconnects (network), then a stream that reaches ready.
+        // Asserts the 1s, 2s backoff schedule.
+        let http = Arc::new(FakeHttp::new(vec![
+            Attempt::Stream(vec![Ok(ev("scheduling"))]), // drop #1
+            Attempt::ConnectErr(CoreError::Network("refused".into())), // reconnect fails
+            Attempt::ConnectErr(CoreError::Api { status: 503, message: "starting".into() }),
+            Attempt::Stream(vec![Ok(ev("ready"))]),
+        ]));
+        let sleeper = RecordingSleeper::new();
+        let out = collect_readiness(http.clone(), sleeper.clone()).await;
+
+        let phases: Vec<String> = out.iter().map(|r| r.as_ref().unwrap().phase.clone()).collect();
+        assert_eq!(phases, vec!["scheduling", "ready"]);
+        // Backoff before each of the 3 reconnect attempts: 1s, 2s, 4s.
+        assert_eq!(sleeper.delays(), vec![1_000, 2_000, 4_000]);
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_the_stream_without_hanging() {
+        // Dropping the consumer (the stream) must not deadlock or panic even
+        // mid-reconnect. Take one event, then drop.
+        let http = Arc::new(FakeHttp::new(vec![
+            Attempt::Stream(vec![Ok(ev("scheduling"))]),
+            Attempt::Stream(vec![Ok(ev("ready"))]),
+        ]));
+        let sleeper = RecordingSleeper::new();
+        let mut stream = readiness_events_with_sleeper(
+            http, "https://api.test", "ik_sdk_x", "proj", "wl", sleeper,
+        )
+        .await
+        .expect("open stream");
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.phase, "scheduling");
+        drop(stream); // no hang, no panic
     }
 }
