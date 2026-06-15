@@ -10,6 +10,20 @@
 // The native addon. napi-rs emits `index.js` (loader) + `index.d.ts` at build.
 import { Client as NativeClient, ChatStream as NativeChatStream } from "./index.js";
 
+/** A readiness phase reported while waiting for a workload to come up. */
+export type ReadinessPhase = "scheduling" | "provisioning" | "bootstrapping" | "ready" | "error";
+
+/** One readiness progress update from `ManagementClient.waitUntilReady`. */
+export interface ReadinessEvent {
+  phase: ReadinessPhase;
+  /** Short, printable line describing what the platform is doing. */
+  message: string;
+  /** Milliseconds since the wait started. */
+  elapsedMs: number;
+  /** Allow-listed bootstrap step (e.g. `model_load`), when applicable. */
+  step?: string;
+}
+
 // `as const` objects (not TS `enum`) so the file is plain type-strippable TS and
 // carries no runtime enum machinery — same wire strings either way.
 export const Backend = {
@@ -81,24 +95,71 @@ function env(name: string): string | undefined {
   return v && v.length > 0 ? v : undefined;
 }
 
-/** Pause for `ms` milliseconds (used by readiness backoff). */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/** Ordered phases for the progress view; the index drives the step display. */
+const READINESS_PHASES: ReadinessPhase[] = ["scheduling", "provisioning", "bootstrapping", "ready"];
+
+/** The default terminal progress view. `render` paints on each readiness event;
+ * `tick` repaints the same line with a freshly elapsed clock between events so
+ * the seconds counter keeps moving during long waits (cold starts can take
+ * minutes between server-sent events). On a non-TTY there is no clock to animate,
+ * so `tick` is a no-op and each event prints one plain line. */
+export interface ProgressRenderer {
+  /** Paint on a new event. `elapsedMs`, when given, overrides the server's
+   * `event.elapsedMs` for the on-screen clock (TTY only) so it stays monotonic
+   * with `tick`'s local clock. */
+  render(event: ReadinessEvent, elapsedMs?: number): void;
+  tick(elapsedMs: number): void;
 }
 
 /**
- * A readiness probe error that will never resolve by waiting: a bad/insufficient
- * credential, wrong token type, or unknown workload. The native layer renders
- * these as CoreError strings with stable prefixes, so we match on those.
+ * Build the default terminal progress renderer used by `waitUntilReady`.
+ *
+ * On a TTY it shows a single redrawn line of phase dots with the current
+ * message and elapsed time; off a TTY (CI / piped) it prints one plain line per
+ * event so logs stay readable. The returned object exposes `render` (call per
+ * event) and `tick` (call ~1×/s to advance the clock between events).
  */
-function isFatalReadinessError(err: unknown): boolean {
-  const message = err instanceof Error ? err.message : String(err);
-  return (
-    message.startsWith("authentication failed") ||
-    message.startsWith("permission denied") ||
-    message.startsWith("not found") ||
-    message.startsWith("validation error")
-  );
+export function makeProgressRenderer(): ProgressRenderer {
+  const isTty = Boolean((process.stdout as { isTTY?: boolean }).isTTY);
+  // The most recent event, retained so `tick` can repaint the same phase/message
+  // with an updated clock. Cleared once we reach a terminal phase.
+  let last: ReadinessEvent | undefined;
+  let done = false;
+
+  const paint = (event: ReadinessEvent, elapsedMs: number) => {
+    const secs = Math.round(elapsedMs / 1000);
+    const reached =
+      event.phase === "error" ? READINESS_PHASES.length - 1 : READINESS_PHASES.indexOf(event.phase);
+    const dots = READINESS_PHASES.map((p, i) => {
+      if (event.phase === "ready" || i < reached) return `\x1b[32m●\x1b[0m`; // done
+      if (i === reached) return `\x1b[36m◐\x1b[0m`; // in progress
+      return `\x1b[90m○\x1b[0m`; // pending
+    }).join(" ");
+    const label = event.phase === "error" ? `\x1b[31m${event.message}\x1b[0m` : event.message;
+    // \r returns to line start; \x1b[K clears to end of line before redraw.
+    process.stdout.write(`\r\x1b[K${dots}  ${label} (${secs}s)`);
+  };
+
+  return {
+    render(event: ReadinessEvent, elapsedMs?: number): void {
+      if (!isTty) {
+        const secs = Math.round(event.elapsedMs / 1000);
+        const step = event.step ? ` [${event.step}]` : "";
+        process.stdout.write(`[${secs}s] ${event.phase}${step}: ${event.message}\n`);
+        return;
+      }
+      last = event;
+      paint(event, elapsedMs ?? event.elapsedMs);
+      if (event.phase === "ready" || event.phase === "error") {
+        done = true;
+        process.stdout.write("\n");
+      }
+    },
+    tick(elapsedMs: number): void {
+      if (!isTty || done || !last) return;
+      paint(last, elapsedMs);
+    },
+  };
 }
 
 // `NativeChatStream` is the type returned by the native `generateTextStream`;
@@ -164,6 +225,101 @@ export class ManagementClient {
     // `as` cast, which would silently leave the fields `undefined`.
     const ref = JSON.parse(raw) as { project_slug: string; workload_slug: string };
     return { projectSlug: ref.project_slug, workloadSlug: ref.workload_slug };
+  }
+
+  /**
+   * Wait until `workloadSlug` is serving, reporting progress as the platform
+   * schedules a worker, provisions a cloud GPU, and boots the runtime.
+   *
+   * Resolves when the platform reports the `ready` phase; rejects on an `error`
+   * phase or after `timeoutMs`. By default it prints a live progress view to
+   * the terminal; pass your own `onProgress` to handle events yourself, or
+   * `silent: true` to suppress output. Subscribing to progress uses the
+   * `ik_sdk_` control token, so this lives on the management client (no data
+   * key needed).
+   *
+   * ```ts
+   * const ref = await mgmt.ensure(spec);
+   * await mgmt.waitUntilReady(ref.workloadSlug, { timeoutMs: 600_000 });
+   * ```
+   */
+  async waitUntilReady(
+    workloadSlug: string,
+    opts: {
+      project?: string;
+      timeoutMs?: number;
+      onProgress?: (event: ReadinessEvent) => void;
+      silent?: boolean;
+    } = {},
+  ): Promise<void> {
+    const projectId = opts.project ?? this.project;
+    if (!projectId) {
+      throw new Error("No project configured. Set INFERENCEKEY_PROJECT or pass project.");
+    }
+    const timeoutMs = opts.timeoutMs ?? 600_000;
+    // Default render is the built-in terminal progress view, unless the caller
+    // brings their own onProgress or asks for silence. The built-in view also
+    // animates a clock between events (`ticker`); a caller's onProgress and the
+    // silent path get events only, no clock. `renderer` is set only for the
+    // built-in path; otherwise events go to `onEvent`.
+    const renderer = opts.onProgress || opts.silent ? undefined : makeProgressRenderer();
+    const onEvent = opts.onProgress ?? (() => {});
+
+    const stream = await this.native.readinessEvents(this.sdkToken, projectId, workloadSlug);
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`workload "${workloadSlug}" not ready after ${Math.round(timeoutMs / 1000)}s`)),
+        timeoutMs,
+      );
+    });
+
+    // Advance the on-screen seconds counter ~1×/s between server events so a long
+    // cold start doesn't look frozen. Keyed off a local clock (the server only
+    // restamps elapsed on each event). No-op until the first event arrives, and
+    // off for custom/silent renderers.
+    const startedAt = Date.now();
+    const ticker = renderer
+      ? setInterval(() => renderer.tick(Date.now() - startedAt), 1000)
+      : undefined;
+    if (ticker && typeof ticker.unref === "function") ticker.unref();
+
+    let stopped = false;
+    const drive = (async () => {
+      for (;;) {
+        const raw = await stream.next();
+        // Once the race is decided (ready / error / timeout) stop pulling so we
+        // don't keep the SSE connection open past the point we care about.
+        if (stopped) return;
+        if (raw === null) return; // stream ended without an explicit ready
+        const data = JSON.parse(raw) as { phase: ReadinessPhase; message: string; elapsed_ms: number; step?: string };
+        const event: ReadinessEvent = {
+          phase: data.phase,
+          message: data.message,
+          elapsedMs: data.elapsed_ms,
+          step: data.step,
+        };
+        // The built-in renderer shares the ticker's local clock so the counter
+        // never jumps; a caller's onProgress gets the event verbatim.
+        if (renderer) renderer.render(event, Date.now() - startedAt);
+        else onEvent(event);
+        if (event.phase === "ready") return;
+        if (event.phase === "error") throw new Error(`workload "${workloadSlug}" failed to become ready: ${event.message}`);
+      }
+    })();
+
+    try {
+      await Promise.race([drive, timeout]);
+    } finally {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      if (ticker) clearInterval(ticker);
+      // Close the native stream so the in-flight next() unblocks and the SSE
+      // connection is released (otherwise it keeps the event loop alive).
+      stream.close();
+      drive.catch(() => {});
+    }
   }
 }
 
@@ -257,39 +413,6 @@ export class Endpoint {
       if (raw === null) return;
       const data = JSON.parse(raw) as { text: string; finish_reason?: string; raw: unknown };
       yield { text: data.text, finishReason: data.finish_reason, raw: data.raw };
-    }
-  }
-
-  /**
-   * Resolve once the workload's endpoint is serving, by probing it.
-   *
-   * The control plane has no readiness flag, so this sends a tiny chat probe
-   * and treats a transport/5xx failure as "still starting" — retrying with
-   * exponential backoff up to `maxIntervalMs` — while a 401/403/404 (bad key,
-   * wrong token type, unknown workload) is a real error that rejects
-   * immediately. Rejects with a timeout error if `timeoutMs` elapses first.
-   * Call this after `ensure()` provisions a cold worker, before streaming.
-   */
-  async waitUntilReady(opts: { timeoutMs?: number; intervalMs?: number; maxIntervalMs?: number } = {}): Promise<void> {
-    const timeoutMs = opts.timeoutMs ?? 300_000;
-    const maxIntervalMs = opts.maxIntervalMs ?? 15_000;
-    const deadline = Date.now() + timeoutMs;
-    let delay = opts.intervalMs ?? 2_000;
-    for (;;) {
-      try {
-        await this.generateText({ prompt: "ping", maxTokens: 1 });
-        return; // a successful completion means the worker is up.
-      } catch (err) {
-        // A wrong/insufficient credential or unknown workload never becomes
-        // ready — surface it instead of spinning. Everything else (transport
-        // error, 5xx) means the worker is likely still booting, so retry.
-        if (isFatalReadinessError(err)) throw err;
-        if (Date.now() >= deadline) {
-          throw new Error(`workload "${this.workloadSlug}" not ready after ${Math.round(timeoutMs / 1000)}s`);
-        }
-        await sleep(Math.min(delay, Math.max(0, deadline - Date.now())));
-        delay = Math.min(delay * 2, maxIntervalMs);
-      }
     }
   }
 
