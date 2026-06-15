@@ -12,7 +12,7 @@ This tutorial takes you from an empty terminal to your first chat response. You 
 It should take a few minutes. By the end you will have a `support-bot` workload running and a script that talks to it.
 
 <Aside type="note" title="Two tokens, two jobs">
-InferenceKey separates **control** from **data**. You provision workloads with a control token (`ik_sdk_`) and call inference with a data token (`ik_live_`). You will use both below. See [Tokens & scopes](/quickstart/tokens/) for the full model.
+InferenceKey separates **control** from **data**. You provision workloads with a control token (`ik_sdk_`) and call inference with a data token (`ik_live_`). You will use both below. See [Tokens & scopes](/en/quickstart/tokens/) for the full model.
 </Aside>
 
 ## Before you start
@@ -57,7 +57,7 @@ You need:
    - **Data token** — starts with `ik_live_`. Used to call inference. You pass it **per workload**, so one app can hold several `ik_live_` keys with different scopes.
 
    <Aside type="caution" title="Don't mix them up">
-   Using the wrong token type returns a `403`: `wrong_credential_type` (data token on a control route or vice-versa), `project_scope_mismatch`, or `scope_insufficient`. See [Common errors](/reference/common-errors/) if you hit one.
+   Using the wrong token type returns a `403`: `wrong_credential_type` (data token on a control route or vice-versa), `project_scope_mismatch`, or `scope_insufficient`. See [Common errors](/en/reference/common-errors/) if you hit one.
    </Aside>
 
 3. ### Set your environment
@@ -120,7 +120,7 @@ You need:
    </Tabs>
 
    <Aside type="note" title="What about drift?">
-   `on_drift` defaults to `OnDrift.RECONCILE` — if the live workload no longer matches your spec, `ensure()` brings it back into line. Other modes (`FAIL`, `DRY_RUN`, `WARN`, `IGNORE`) let you observe instead of change. See [OnDrift](/reference/ondrift/).
+   `on_drift` defaults to `OnDrift.RECONCILE` — if the live workload no longer matches your spec, `ensure()` brings it back into line. Other modes (`FAIL`, `DRY_RUN`, `WARN`, `IGNORE`) let you observe instead of change. See [OnDrift](/en/reference/ondrift/).
    </Aside>
 
 5. ### Call it with `generate_text()`
@@ -220,16 +220,16 @@ You need:
 ## Next steps
 
 <CardGrid>
-  <LinkCard title="Tokens & scopes" href="/quickstart/tokens/" description="The full least-privilege model: ik_sdk_ vs ik_live_ and how scopes resolve." />
-  <LinkCard title="Your first ensure()" href="/quickstart/first-ensure/" description="Go deeper on declarative provisioning and reconciliation." />
-  <LinkCard title="Your first call" href="/quickstart/first-call/" description="More on the data plane, including embeddings with embed()." />
-  <LinkCard title="OnDrift modes" href="/reference/ondrift/" description="RECONCILE, FAIL, DRY_RUN, WARN, IGNORE — pick the safety level you want." />
-  <LinkCard title="Backends & policies" href="/reference/backends-and-policies/" description="vLLM, Ollama, SGLang, plus fixed / scheduled / autoscaling execution policies." />
-  <LinkCard title="Use cases" href="/guides/use-cases/" description="Patterns for chat, embeddings, and the other task types." />
+  <LinkCard title="Tokens & scopes" href="/en/quickstart/tokens/" description="The full least-privilege model: ik_sdk_ vs ik_live_ and how scopes resolve." />
+  <LinkCard title="Your first ensure()" href="/en/quickstart/first-ensure/" description="Go deeper on declarative provisioning and reconciliation." />
+  <LinkCard title="Your first call" href="/en/quickstart/first-call/" description="More on the data plane, including embeddings with embed()." />
+  <LinkCard title="OnDrift modes" href="/en/reference/ondrift/" description="RECONCILE, FAIL, DRY_RUN, WARN, IGNORE — pick the safety level you want." />
+  <LinkCard title="Backends & policies" href="/en/reference/backends-and-policies/" description="vLLM, Ollama, SGLang, plus fixed / scheduled / autoscaling execution policies." />
+  <LinkCard title="Use cases" href="/en/guides/use-cases/" description="Patterns for chat, embeddings, and the other task types." />
 </CardGrid>
 
 <Aside type="tip" title="Embeddings, too">
-The same `DataClient` does embeddings. For example, in Python: `data.endpoint("billing", api_key="ik_live_...").embed(input=["a", "b"]).embeddings`. See [Your first call](/quickstart/first-call/).
+The same `DataClient` does embeddings. For example, in Python: `data.endpoint("billing", api_key="ik_live_...").embed(input=["a", "b"]).embeddings`. See [Your first call](/en/quickstart/first-call/).
 </Aside>
 
 ---

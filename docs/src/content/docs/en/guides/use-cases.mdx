@@ -14,7 +14,7 @@ The SDK gives you two moves: **declare a workload in code and `ensure` it exists
     provisions the model; `generate_text` turns prompts (or a full message
     history) into replies.
 
-    [Build a support chatbot →](/quickstart/first-call/)
+    [Build a support chatbot →](/en/quickstart/first-call/)
   </Card>
 
   <Card title="RAG embeddings" icon="seti:db">
@@ -22,7 +22,7 @@ The SDK gives you two moves: **declare a workload in code and `ensure` it exists
     and feed the results to your vector store for retrieval-augmented answers.
     `embed` takes one string or a batch and returns dense vectors.
 
-    [Wire up retrieval →](/guides/workloads-by-policy-worker-modality/)
+    [Wire up retrieval →](/en/guides/workloads-by-policy-worker-modality/)
   </Card>
 
   <Card title="Batch classification" icon="list-format">
@@ -30,7 +30,7 @@ The SDK gives you two moves: **declare a workload in code and `ensure` it exists
     `classification` workload. These run as async-only modalities — ideal for
     high-throughput batch jobs that don't need a synchronous round-trip.
 
-    [Pick the right modality →](/guides/workloads-by-policy-worker-modality/)
+    [Pick the right modality →](/en/guides/workloads-by-policy-worker-modality/)
   </Card>
 
   <Card title="Transcription" icon="seti:audio">
@@ -38,7 +38,7 @@ The SDK gives you two moves: **declare a workload in code and `ensure` it exists
     workload on a `vllm-omni` backend. Declare it once with `ensure`, then
     consume it over the OpenAI-compatible data plane like any other endpoint.
 
-    [Provision audio workloads →](/guides/workloads-by-policy-worker-modality/)
+    [Provision audio workloads →](/en/guides/workloads-by-policy-worker-modality/)
   </Card>
 
   <Card title="Image generation" icon="seti:image">
@@ -46,7 +46,7 @@ The SDK gives you two moves: **declare a workload in code and `ensure` it exists
     is the same: `ensure` the spec (model, backend, command) and let the
     platform place it — no infrastructure code on your side.
 
-    [Declare a text2image workload →](/guides/workloads-by-policy-worker-modality/)
+    [Declare a text2image workload →](/en/guides/workloads-by-policy-worker-modality/)
   </Card>
 
   <Card title="Many apps, many keys" icon="setting">
@@ -54,7 +54,7 @@ The SDK gives you two moves: **declare a workload in code and `ensure` it exists
     key. The management token stays on your control plane and can't call
     inference — least privilege by construction.
 
-    [Understand the token model →](/guides/authentication/)
+    [Understand the token model →](/en/guides/authentication/)
   </Card>
 </CardGrid>
 
@@ -153,7 +153,7 @@ console.log(vectors.embeddings.length); // one vector per input → store these
   backend, e.g. <code>Backend.VllmOmni</code> for omni modalities) on the
   <code>WorkloadSpec</code>. Reranker, classification, and reward modalities are
   async-only, so they're consumed over the data plane rather than a synchronous
-  call. See <a href="/guides/workloads-by-policy-worker-modality/">workloads by policy, worker &amp; modality</a>.
+  call. See <a href="/en/guides/workloads-by-policy-worker-modality/">workloads by policy, worker &amp; modality</a>.
 </Aside>
 
 ## Why this scales with you
@@ -166,7 +166,7 @@ Every use case above is the same contract: **your code declares intent, the plat
   href="https://cloud.inferencekey.com"
 />
 
-Learn the platform model in [Architecture](/reference/architecture/), or start from zero in the [Quickstart: tokens](/quickstart/tokens/).
+Learn the platform model in [Architecture](/en/reference/architecture/), or start from zero in the [Quickstart: tokens](/en/quickstart/tokens/).
 
 ---
 

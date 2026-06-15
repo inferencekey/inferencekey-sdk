@@ -20,7 +20,7 @@ C ABI yourself. Everything the SDK does maps onto the requests below.
 ## Two planes, two tokens
 
 There are two independent surfaces, each gated by a different token type. See
-[Tokens](/reference/tokens/) for the full model.
+[Tokens](/en/reference/tokens/) for the full model.
 
 <CardGrid>
   <Card title="Control plane" icon="setting">
@@ -61,7 +61,7 @@ error code (see [Wrong-token errors](#wrong-token-errors)).
 The control plane is where `mgmt.ensure(...)` does its work. Under the hood,
 `ensure()` is idempotent by the explicit **`slug`**: it lists/looks up the
 workload, then issues a `POST` to create it or a `PATCH` to reconcile drift
-(driven by [`OnDrift`](/reference/ondrift/), default `RECONCILE`).
+(driven by [`OnDrift`](/en/reference/ondrift/), default `RECONCILE`).
 
 ### Routes
 
@@ -149,7 +149,7 @@ In the SDK the `Backend` enum maps to these wire strings:
 ### UpdateWorkloadRequest
 
 Body for `PATCH /api/workloads/:id`. Same fields as create, but **all optional** —
-send only what changes. This is what [`OnDrift.RECONCILE`](/reference/ondrift/)
+send only what changes. This is what [`OnDrift.RECONCILE`](/en/reference/ondrift/)
 emits when `ensure()` detects the live workload differs from your spec.
 
 ```json title="PATCH /api/workloads/wl_01h... — reconcile the launch command"
@@ -402,7 +402,7 @@ And the same call through the SDK:
 
 Presenting the wrong token type — or the right type with insufficient scope —
 returns a `403` with a typed `code`. The SDK turns these into
-`PermissionDenied`. See [Common errors](/reference/common-errors/).
+`PermissionDenied`. See [Common errors](/en/reference/common-errors/).
 
 | `code`                    | Meaning                                                             |
 | ------------------------- | ------------------------------------------------------------------- |
@@ -424,10 +424,10 @@ returns a `403` with a typed `code`. The SDK turns these into
 ## See also
 
 <CardGrid>
-  <LinkCard title="Tokens" href="/reference/tokens/" description="ik_sdk_ vs ik_live_, scopes, and precedence." />
-  <LinkCard title="OnDrift" href="/reference/ondrift/" description="How ensure() decides between POST, PATCH, and failing." />
-  <LinkCard title="Backends & policies" href="/reference/backends-and-policies/" description="Backend wire strings and execution policies." />
-  <LinkCard title="Common errors" href="/reference/common-errors/" description="Typed error codes and how the SDK maps them." />
+  <LinkCard title="Tokens" href="/en/reference/tokens/" description="ik_sdk_ vs ik_live_, scopes, and precedence." />
+  <LinkCard title="OnDrift" href="/en/reference/ondrift/" description="How ensure() decides between POST, PATCH, and failing." />
+  <LinkCard title="Backends & policies" href="/en/reference/backends-and-policies/" description="Backend wire strings and execution policies." />
+  <LinkCard title="Common errors" href="/en/reference/common-errors/" description="Typed error codes and how the SDK maps them." />
 </CardGrid>
 
 ---

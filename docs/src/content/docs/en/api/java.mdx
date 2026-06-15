@@ -15,7 +15,7 @@ The Java SDK is not released yet. It is planned as a thin binding over the same 
 
 - **Distribution.** Published to Maven Central under the intended coordinates `dev.inferencekey:inferencekey-sdk`.
 - **Same surface.** The API will mirror the other languages: a `ManagementClient` for the control plane (`ik_sdk_` tokens) and a `DataClient` for the data plane (`ik_live_` tokens), with `ensure(...)` for idempotent provisioning and `endpoint(...)` for inference. Feature parity is reached over time — newer conveniences such as streaming and readiness helpers may land after the first release.
-- **Same model.** Two tokens, two clients, least privilege. The control client provisions and reconciles workloads; the data client calls inference per workload. See [Tokens](/quickstart/tokens/) for the split.
+- **Same model.** Two tokens, two clients, least privilege. The control client provisions and reconciles workloads; the data client calls inference per workload. See [Tokens](/en/quickstart/tokens/) for the split.
 - **Same configuration.** The shared environment variables apply: `INFERENCEKEY_BASE_URL`, `INFERENCEKEY_PROJECT`, `INFERENCEKEY_API_KEY`, and `INFERENCEKEY_SDK_TOKEN`.
 
 ## In the meantime
@@ -25,13 +25,13 @@ You can use any of the shipped languages today, or call the wire API directly (O
 <LinkCard
   title="Python SDK"
   description="Shipped today: pip install inferencekey."
-  href="/api/python/"
+  href="/en/api/python/"
 />
 
 <LinkCard
   title="Node / TypeScript SDK"
   description="Shipped today: @inferencekey/sdk."
-  href="/api/typescript/"
+  href="/en/api/typescript/"
 />
 
 ---

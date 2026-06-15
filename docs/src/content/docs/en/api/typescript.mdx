@@ -55,7 +55,7 @@ variable > default**.
 <Aside type="caution" title="Two tokens, two clients">
   An `ik_sdk_` token provisions but cannot call inference; an `ik_live_` token
   calls inference but cannot provision. Mixing them up yields a `403`. See
-  [Tokens](/reference/tokens/).
+  [Tokens](/en/reference/tokens/).
 </Aside>
 
 ## ManagementClient
@@ -91,7 +91,7 @@ async ensure(
 
 Idempotently declares a workload. If it does not exist it is created; if it
 exists, drift between your spec and the live state is handled per `onDrift`
-(default [`OnDrift.Reconcile`](/reference/ondrift/)). Idempotency is keyed by
+(default [`OnDrift.Reconcile`](/en/reference/ondrift/)). Idempotency is keyed by
 the explicit `slug`. The project is resolved from `opts.project`, then
 `spec.project`, then the client's configured project.
 
@@ -271,7 +271,7 @@ interface WorkloadSpec {
 <Aside type="note">
   There is no `provider` or `minVramGb` field — placement on a worker/GPU is the
   platform's job, not the spec's. See
-  [Backends &amp; policies](/reference/backends-and-policies/).
+  [Backends &amp; policies](/en/reference/backends-and-policies/).
 </Aside>
 
 ### `EndpointRef`
@@ -353,7 +353,7 @@ const OnDrift = {
 ```
 
 `Reconcile` is the default for `ensure()`. See
-[OnDrift](/reference/ondrift/) for what each mode does.
+[OnDrift](/en/reference/ondrift/) for what each mode does.
 
 ## End to end
 
@@ -415,17 +415,17 @@ Methods reject with subclasses of `InferenceKeyError`:
 `PermissionDenied`, `AuthError`, `ValidationError`, `ConfigurationError`,
 `ApiError`. Using the wrong token kind surfaces as a `403`
 (`wrong_credential_type`, `project_scope_mismatch`, `scope_insufficient`). See
-[Common errors](/reference/common-errors/).
+[Common errors](/en/reference/common-errors/).
 
 <CardGrid>
   <LinkCard
     title="Quickstart: first call"
-    href="/quickstart/first-call/"
+    href="/en/quickstart/first-call/"
     description="Get from token to generated text in minutes."
   />
   <LinkCard
     title="Python API"
-    href="/api/python/"
+    href="/en/api/python/"
     description="The same surface for the inferencekey Python package."
   />
 </CardGrid>

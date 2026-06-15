@@ -228,27 +228,27 @@ The policy *name* is the stable contract; `execution_policy_config` carries the 
 ```
 
 <Aside type="note">
-The config schema may gain fields over time, but these keys are what the current Manager validates. The [workloads guide](/guides/workloads-by-policy-worker-modality/) shows them in context per modality.
+The config schema may gain fields over time, but these keys are what the current Manager validates. The [workloads guide](/en/guides/workloads-by-policy-worker-modality/) shows them in context per modality.
 </Aside>
 
 ## Putting it together
 
-`backend`, `task_type`, and `execution_policy` are independent fields on the same `WorkloadSpec`. Declare them together and call `ensure()` — drift is reconciled per [OnDrift](/reference/ondrift/).
+`backend`, `task_type`, and `execution_policy` are independent fields on the same `WorkloadSpec`. Declare them together and call `ensure()` — drift is reconciled per [OnDrift](/en/reference/ondrift/).
 
 <CardGrid>
   <LinkCard
     title="OnDrift"
-    href="/reference/ondrift/"
+    href="/en/reference/ondrift/"
     description="How ensure() reconciles a workload when its spec drifts from the platform."
   />
   <LinkCard
     title="Tokens"
-    href="/reference/tokens/"
+    href="/en/reference/tokens/"
     description="ik_sdk_ for the control plane, ik_live_ per workload for the data plane."
   />
   <LinkCard
     title="Workloads by policy, worker & modality"
-    href="/guides/workloads-by-policy-worker-modality/"
+    href="/en/guides/workloads-by-policy-worker-modality/"
     description="A guide to combining policies, workers, and task types in practice."
   />
   <LinkCard
