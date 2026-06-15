@@ -8,23 +8,26 @@
  */
 
 // The native addon. napi-rs emits `index.js` (loader) + `index.d.ts` at build.
-// eslint-disable-next-line @typescript-eslint/no-var-requires
 import { Client as NativeClient } from "./index.js";
 
-export enum Backend {
-  Ollama = "ollama",
-  Vllm = "vllm",
-  VllmOmni = "vllm-omni",
-  Sglang = "sglang",
-}
+// `as const` objects (not TS `enum`) so the file is plain type-strippable TS and
+// carries no runtime enum machinery — same wire strings either way.
+export const Backend = {
+  Ollama: "ollama",
+  Vllm: "vllm",
+  VllmOmni: "vllm-omni",
+  Sglang: "sglang",
+} as const;
+export type Backend = (typeof Backend)[keyof typeof Backend];
 
-export enum OnDrift {
-  Reconcile = "reconcile",
-  Fail = "fail",
-  DryRun = "dry_run",
-  Warn = "warn",
-  Ignore = "ignore",
-}
+export const OnDrift = {
+  Reconcile: "reconcile",
+  Fail: "fail",
+  DryRun: "dry_run",
+  Warn: "warn",
+  Ignore: "ignore",
+} as const;
+export type OnDrift = (typeof OnDrift)[keyof typeof OnDrift];
 
 /** A declarative workload definition (the intent handed to `ensure()`). */
 export interface WorkloadSpec {
