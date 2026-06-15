@@ -18,8 +18,8 @@ use pyo3::prelude::*;
 
 use inferencekey_core::ports::http::HttpPort;
 use inferencekey_core::{
-    embed, ensure, generate_text, generate_text_stream, CoreError, CoreResult, EmbedParams,
-    GenerateTextParams, OnDrift, ReqwestHttp, TextChunk, WorkloadSpec,
+    embed, ensure, generate_text, generate_text_stream, readiness_events, CoreError, CoreResult,
+    EmbedParams, GenerateTextParams, OnDrift, ReadinessEvent, ReqwestHttp, TextChunk, WorkloadSpec,
 };
 
 /// The native client: a base URL, the HTTP transport, and a blocking runtime.
@@ -73,6 +73,34 @@ impl Client {
             ))
         });
         result.map_err(map_core_error).and_then(to_json)
+    }
+
+    /// Open the readiness progress stream for a workload (control plane).
+    /// Returns a [`ReadinessStream`] iterator whose `__next__` yields one
+    /// `ReadinessEvent` JSON string per SSE frame.
+    fn readiness_events(
+        &self,
+        py: Python<'_>,
+        sdk_token: &str,
+        project_id: &str,
+        workload_slug: &str,
+    ) -> PyResult<ReadinessStream> {
+        let http = self.http.clone() as Arc<dyn HttpPort>;
+        let stream = py.allow_threads(|| {
+            self.block_on(readiness_events(
+                http,
+                &self.base_url,
+                sdk_token,
+                project_id,
+                workload_slug,
+            ))
+        });
+        let stream = stream.map_err(map_core_error)?;
+        Ok(ReadinessStream {
+            runtime: self.runtime.clone(),
+            _http: self.http.clone(),
+            inner: Some(stream),
+        })
     }
 
     /// Run a non-streaming chat completion. `params_json` is a JSON
@@ -209,6 +237,39 @@ impl ChatStream {
     }
 }
 
+/// A live readiness progress stream exposed to Python as an iterator. Same
+/// shape as [`ChatStream`]: each `__next__` pulls one `ReadinessEvent` JSON
+/// string (raising `StopIteration` at end of stream).
+#[pyclass]
+struct ReadinessStream {
+    runtime: Arc<tokio::runtime::Runtime>,
+    _http: Arc<ReqwestHttp>,
+    inner: Option<BoxStream<'static, CoreResult<ReadinessEvent>>>,
+}
+
+#[pymethods]
+impl ReadinessStream {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<String> {
+        let runtime = self.runtime.clone();
+        let Some(stream) = self.inner.as_mut() else {
+            return Err(PyStopIteration::new_err(()));
+        };
+        let next = py.allow_threads(|| runtime.block_on(stream.next()));
+        match next {
+            Some(Ok(ev)) => to_json(ev),
+            Some(Err(e)) => Err(map_core_error(e)),
+            None => {
+                self.inner = None;
+                Err(PyStopIteration::new_err(()))
+            }
+        }
+    }
+}
+
 /// Parse a `Deserialize` value from a JSON string, mapping errors to `ValueError`.
 fn parse_json<T: serde::de::DeserializeOwned>(json: &str) -> PyResult<T> {
     serde_json::from_str(json).map_err(|e| PyValueError::new_err(format!("invalid json: {e}")))
@@ -249,5 +310,6 @@ fn map_core_error(err: CoreError) -> PyErr {
 fn _inferencekey(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Client>()?;
     m.add_class::<ChatStream>()?;
+    m.add_class::<ReadinessStream>()?;
     Ok(())
 }
