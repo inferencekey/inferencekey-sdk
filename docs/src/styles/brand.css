@@ -1,0 +1,48 @@
+/* InferenceKey brand theme for Starlight.
+   Maps the brand design tokens (docs/brand/inferencekey-tokens.css) onto
+   Starlight's CSS variables so the docs match the landing and the Manager:
+   cyan accent (#1fd4c8), dark surfaces (#07090b), and the brand fonts. */
+
+:root {
+  --ik-cyan: #1fd4c8;
+  --ik-cyan-strong: #2ce6d9;
+  --ik-cyan-ink: #0fa89e;
+  --ik-bg-dark: #07090b;
+  --ik-bg-panel: #0c1013;
+
+  --sl-font: "Inter", system-ui, -apple-system, sans-serif;
+  --sl-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Dark theme (brand default): cyan accent on the brand's near-black surface. */
+:root[data-theme="dark"] {
+  --sl-color-accent-low: #0c2b29;
+  --sl-color-accent: #1fd4c8;
+  --sl-color-accent-high: #9af0e9;
+
+  --sl-color-bg: #07090b;
+  --sl-color-bg-nav: #07090b;
+  --sl-color-bg-sidebar: #090c0e;
+  --sl-color-bg-inline-code: rgba(31, 212, 200, 0.12);
+  --sl-color-hairline-shade: rgba(255, 255, 255, 0.08);
+}
+
+/* Light theme: the accessible cyan ink so contrast holds on white. */
+:root[data-theme="light"] {
+  --sl-color-accent-low: #c7f2ee;
+  --sl-color-accent: #0fa89e;
+  --sl-color-accent-high: #064f49;
+}
+
+/* Brand display font for headings + the site title. */
+.sl-markdown-content h1,
+.sl-markdown-content h2,
+.sl-markdown-content h3,
+.site-title {
+  font-family: "Space Grotesk", "Inter", system-ui, sans-serif;
+}
+
+/* Inline code in the brand's cyan-tinted style. */
+:root[data-theme="dark"] .sl-markdown-content code:not(:where(.expressive-code *)) {
+  color: var(--ik-cyan);
+}
