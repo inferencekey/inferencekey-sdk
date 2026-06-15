@@ -228,6 +228,27 @@ export class ManagementClient {
   }
 
   /**
+   * Delete a workload by slug. Resolves to `true` if it existed, `false` if it
+   * was already gone — idempotent, so it's safe to call on shutdown/cleanup
+   * without checking first.
+   *
+   * Cloud GPUs the autoscaler provisioned for the workload are torn down on the
+   * platform (private workers are only unassigned), so deleting also stops the
+   * billable capacity. Uses the `ik_sdk_` control token.
+   *
+   * ```ts
+   * process.on("SIGINT", async () => { await mgmt.delete(slug); process.exit(0); });
+   * ```
+   */
+  async delete(workloadSlug: string, opts: { project?: string } = {}): Promise<boolean> {
+    const projectId = opts.project ?? this.project;
+    if (!projectId) {
+      throw new Error("No project configured. Set INFERENCEKEY_PROJECT or pass project.");
+    }
+    return this.native.delete(this.sdkToken, projectId, workloadSlug);
+  }
+
+  /**
    * Wait until `workloadSlug` is serving, reporting progress as the platform
    * schedules a worker, provisions a cloud GPU, and boots the runtime.
    *

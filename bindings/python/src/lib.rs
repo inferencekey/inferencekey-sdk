@@ -18,8 +18,9 @@ use pyo3::prelude::*;
 
 use inferencekey_core::ports::http::HttpPort;
 use inferencekey_core::{
-    embed, ensure, generate_text, generate_text_stream, readiness_events, CoreError, CoreResult,
-    EmbedParams, GenerateTextParams, OnDrift, ReadinessEvent, ReqwestHttp, TextChunk, WorkloadSpec,
+    delete as core_delete, embed, ensure, generate_text, generate_text_stream, readiness_events,
+    CoreError, CoreResult, EmbedParams, GenerateTextParams, OnDrift, ReadinessEvent, ReqwestHttp,
+    TextChunk, WorkloadSpec,
 };
 
 /// The native client: a base URL, the HTTP transport, and a blocking runtime.
@@ -73,6 +74,28 @@ impl Client {
             ))
         });
         result.map_err(map_core_error).and_then(to_json)
+    }
+
+    /// Delete a workload by slug (control plane). Returns `True` if it existed,
+    /// `False` if it was already absent (idempotent). Cloud GPUs the autoscaler
+    /// provisioned are torn down server-side.
+    fn delete(
+        &self,
+        py: Python<'_>,
+        sdk_token: &str,
+        project_id: &str,
+        workload_slug: &str,
+    ) -> PyResult<bool> {
+        let result = py.allow_threads(|| {
+            self.block_on(core_delete(
+                self.port(),
+                &self.base_url,
+                sdk_token,
+                project_id,
+                workload_slug,
+            ))
+        });
+        result.map_err(map_core_error)
     }
 
     /// Open the readiness progress stream for a workload (control plane).

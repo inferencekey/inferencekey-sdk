@@ -112,6 +112,25 @@ class ManagementClient:
         data = json.loads(raw)
         return EndpointRef(project_slug=data["project_slug"], workload_slug=data["workload_slug"])
 
+    def delete(self, workload_slug: str, *, project: Optional[str] = None) -> bool:
+        """Delete a workload by slug. Returns ``True`` if it existed, ``False`` if
+        it was already gone — idempotent, so it's safe to call on cleanup/exit
+        without checking first.
+
+        Cloud GPUs the autoscaler provisioned for the workload are torn down on
+        the platform (private workers are only unassigned), so deleting also
+        stops the billable capacity. Uses the ``ik_sdk_`` control token::
+
+            import signal
+            signal.signal(signal.SIGINT, lambda *_: (mgmt.delete(slug), sys.exit(0)))
+        """
+        project_id = project or self._project
+        if not project_id:
+            raise ConfigurationError(
+                "No project configured. Set INFERENCEKEY_PROJECT or pass project=."
+            )
+        return _call(self._native.delete, self._sdk_token, project_id, workload_slug)
+
     def wait_until_ready(
         self,
         workload_slug: str,
