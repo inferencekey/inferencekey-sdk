@@ -1,0 +1,308 @@
+---
+title: Authentication
+description: How InferenceKey tokens work in depth — the ik_sdk_ control token and the ik_live_ data token, their formats, scopes, resolution precedence, redaction, and the typed errors you get when the wrong token reaches the wrong client.
+---
+
+import { Tabs, TabItem, Card, CardGrid, Aside, Steps, LinkCard } from "@astrojs/starlight/components";
+
+InferenceKey uses **two kinds of token**, one per plane, so that the credentials your application ships with can only do what that application actually needs. This guide covers the token formats, what each can and cannot do, the scopes on the control token, how a token is resolved from your environment, how tokens are redacted in logs and errors, and the typed errors you get when a token lands on the wrong client.
+
+If you just want to get a key and make a call, start with [Tokens](/quickstart/tokens/). For the API surface, see the [Python](/api/python/) and [TypeScript](/api/typescript/) references.
+
+## Two tokens, two planes
+
+InferenceKey separates the **control plane** (provision and reconcile workloads) from the **data plane** (call inference). Each plane has its own token type and its own client, and neither token can do the other's job.
+
+<CardGrid>
+  <Card title="ik_sdk_ — control plane" icon="setting">
+    Held by the **`ManagementClient`**. Scoped to **one project**. Used to declare workloads and reconcile them with `ensure()`. **Cannot call inference.**
+  </Card>
+  <Card title="ik_live_ — data plane" icon="rocket">
+    Passed **per workload** to the **`DataClient`** endpoint. Used to call the OpenAI-compatible inference routes. **Cannot provision workloads.**
+  </Card>
+</CardGrid>
+
+One application typically holds **one `ik_sdk_` token** (it manages a project's workloads) and **many `ik_live_` tokens** — one per workload, so that the credential for your `support-bot` cannot call your `billing` embedder. This is the least-privilege model: a leaked data key exposes exactly one workload's inference, never your provisioning.
+
+<Aside type="tip">
+Mint `ik_sdk_` and `ik_live_` tokens in the **[Manager dashboard](https://manager.inferencekey.com)**. Create an account or open the dashboard there to generate keys for your project and workloads.
+</Aside>
+
+## Token formats
+
+Both tokens share the same shape: a fixed prefix that names the plane, an 8-hex public identifier, and a 64-hex secret.
+
+| Token | Format | Plane | Example (redacted) |
+| --- | --- | --- | --- |
+| Control | `ik_sdk_<8hex>_<64hex>` | Control | `ik_sdk_…` |
+| Data | `ik_live_<8hex>_<64hex>` | Data | `ik_live_…` |
+
+- The **`<8hex>`** segment is a public token identifier — safe to show in dashboards and logs, useful for telling two keys apart.
+- The **`<64hex>`** segment is the secret. Treat the whole string as a secret and never log it; see [Redaction](#redaction).
+- The **prefix is load-bearing**: the SDK inspects `ik_sdk_` vs `ik_live_` to route the token to the correct plane and to raise a [`wrong_credential_type`](#wrong-token-errors) error early if it is on the wrong client.
+
+```text title="Token anatomy"
+ik_sdk_  a1b2c3d4  _  e5f6...<64 hex chars total>...9a0b
+└─prefix─┘└─8 hex─┘    └──────────── 64 hex secret ─────────────┘
+  plane     id                       never log this
+```
+
+## Can and cannot
+
+<Tabs syncKey="lang">
+<TabItem label="Python">
+
+```python title="ik_sdk_ — control plane only"
+from inferencekey import ManagementClient, WorkloadSpec, Backend
+
+mgmt = ManagementClient.from_env(project="acme")  # reads INFERENCEKEY_SDK_TOKEN
+
+# CAN: provision / reconcile workloads in the acme project
+ref = mgmt.ensure(WorkloadSpec(
+    name="support-bot", slug="support-bot",
+    model="meta-llama/Llama-3.1-8B-Instruct", backend=Backend.VLLM,
+    command="vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+))
+
+# CANNOT: call inference. An ik_sdk_ token has no data-plane access.
+```
+
+```python title="ik_live_ — data plane only"
+from inferencekey import DataClient
+
+data = DataClient.from_env(project="acme")
+
+# CAN: call inference on a workload you hold the ik_live_ key for
+ep = data.endpoint("support-bot", api_key="ik_live_...")
+out = ep.generate_text(prompt="Hola", temperature=0.2, max_tokens=300)
+print(out.text, out.model)
+
+# CANNOT: create or patch workloads. An ik_live_ token has no control-plane access.
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts title="ik_sdk_ — control plane only"
+import { ManagementClient, Backend } from "@inferencekey/sdk";
+
+const mgmt = ManagementClient.fromEnv({ project: "acme" }); // reads INFERENCEKEY_SDK_TOKEN
+
+// CAN: provision / reconcile workloads in the acme project
+const ref = await mgmt.ensure({
+  name: "support-bot", slug: "support-bot",
+  model: "meta-llama/Llama-3.1-8B-Instruct", backend: Backend.Vllm,
+  command: "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+});
+
+// CANNOT: call inference. An ik_sdk_ token has no data-plane access.
+```
+
+```ts title="ik_live_ — data plane only"
+import { DataClient } from "@inferencekey/sdk";
+
+const data = DataClient.fromEnv({ project: "acme" });
+
+// CAN: call inference on a workload you hold the ik_live_ key for
+const ep = data.endpoint("support-bot", { apiKey: process.env.SUPPORT_IK_LIVE });
+const out = await ep.generateText({ prompt: "Hola", temperature: 0.2, maxTokens: 300 });
+console.log(out.text, out.model);
+
+// CANNOT: create or patch workloads. An ik_live_ token has no control-plane access.
+```
+
+</TabItem>
+</Tabs>
+
+| Capability | `ik_sdk_` (control) | `ik_live_` (data) |
+| --- | --- | --- |
+| Create / reconcile workloads (`ensure`) | Yes | No |
+| Patch / list workloads | Yes | No |
+| Call inference (`generate_text`, `embed`, …) | No | Yes |
+| Scope | One **project** | One **workload** |
+| Held by | `ManagementClient` | `DataClient` endpoint (per call) |
+
+## Control token scopes
+
+An `ik_sdk_` token carries **scopes** that bound what it may do inside its project. A token minted for the SDK provisioning flow gets the **two write scopes by default**:
+
+| Scope | Grants | Default on new SDK tokens |
+| --- | --- | --- |
+| `workload:write` | Create and patch workloads (`POST /workloads`, `PATCH /workloads/:id`). | Yes |
+| `assignment:write` | Assign workloads to workers / GPU resources during reconcile. | Yes |
+| `workload:read` | List and read workloads (`GET` list). | Read-only tokens |
+
+The defaults exist so that `mgmt.ensure(...)` works end to end: it needs `workload:write` to create or patch the workload and `assignment:write` to bind it to where it runs. If you mint a **read-only** token — for an audit job or a dashboard that only lists workloads — give it `workload:read` alone. Calling a write route with a read-only token raises [`scope_insufficient`](#wrong-token-errors).
+
+<Aside type="note">
+Scopes are a property of the **`ik_sdk_` control token only**. The `ik_live_` data token is not scoped this way — its reach is the single workload whose key it is, enforced by the data-plane route `/endpoint/:projectSlug/:workloadSlug/v1/...`.
+</Aside>
+
+## Resolution precedence
+
+Both clients resolve their token and project from three sources, in this order. **Explicit argument wins, then environment variable, then a config file.**
+
+<Steps>
+
+1. **Explicit** — a value you pass in code (`api_key="ik_live_..."`, `project="acme"`). Highest precedence; always wins.
+
+2. **Environment variable** — `INFERENCEKEY_SDK_TOKEN`, `INFERENCEKEY_API_KEY`, `INFERENCEKEY_PROJECT`, `INFERENCEKEY_BASE_URL`. This is what `from_env` / `fromEnv` read.
+
+3. **Config file** — on-disk defaults, used only when neither of the above is set.
+
+</Steps>
+
+This is why `DataClient.from_env(project="acme")` then `data.endpoint(slug, api_key="ik_live_...")` works cleanly: the **per-call `api_key`** is explicit and overrides any `INFERENCEKEY_API_KEY` in the environment, so one `DataClient` can fan out to many workloads each with its own key.
+
+<Tabs syncKey="lang">
+<TabItem label="Python">
+
+```python title="Precedence in practice"
+import os
+from inferencekey import DataClient
+
+os.environ["INFERENCEKEY_API_KEY"] = "ik_live_default..."  # env default
+
+data = DataClient.from_env(project="acme")
+
+# Uses the env default (INFERENCEKEY_API_KEY)
+data.endpoint("support-bot").generate_text(prompt="hi")
+
+# Explicit api_key overrides the env default for this workload
+data.endpoint("billing", api_key="ik_live_billing...").embed(input=["a", "b"])
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts title="Precedence in practice"
+import { DataClient } from "@inferencekey/sdk";
+
+process.env.INFERENCEKEY_API_KEY = "ik_live_default..."; // env default
+
+const data = DataClient.fromEnv({ project: "acme" });
+
+// Uses the env default (INFERENCEKEY_API_KEY)
+await data.endpoint("support-bot").generateText({ prompt: "hi" });
+
+// Explicit apiKey overrides the env default for this workload
+await data.endpoint("billing", { apiKey: "ik_live_billing..." }).embed({ input: ["a", "b"] });
+```
+
+</TabItem>
+</Tabs>
+
+## Environment variables
+
+The four environment variables and which client reads each. The control client never reads `INFERENCEKEY_API_KEY`; the data client never reads `INFERENCEKEY_SDK_TOKEN`.
+
+| Variable | `ManagementClient` (control) | `DataClient` (data) | Purpose |
+| --- | --- | --- | --- |
+| `INFERENCEKEY_SDK_TOKEN` | Yes | — | The `ik_sdk_` control token. |
+| `INFERENCEKEY_API_KEY` | — | Yes | The default `ik_live_` data token (overridable per call). |
+| `INFERENCEKEY_PROJECT` | Yes | Yes | Default project slug when `project=` is not passed. |
+| `INFERENCEKEY_BASE_URL` | Yes | Yes | API base URL (point at staging or self-hosted). |
+
+```bash title=".env — set once, resolve everywhere"
+export INFERENCEKEY_BASE_URL="https://api.inferencekey.com"
+export INFERENCEKEY_PROJECT="acme"
+export INFERENCEKEY_SDK_TOKEN="ik_sdk_a1b2c3d4_..."   # control client
+export INFERENCEKEY_API_KEY="ik_live_e5f6a7b8_..."     # data client default
+```
+
+## Redaction
+
+The SDK and the platform **redact tokens to their prefix only** in logs, error messages, and diagnostics. The 8-hex identifier and the 64-hex secret are never emitted together.
+
+- A token that appears in an error or log is shown as its prefix — `ik_sdk_…` or `ik_live_…` — so you can tell *which plane* the offending credential belongs to without leaking the secret.
+- This applies to the typed [wrong-token errors](#wrong-token-errors) below: the message tells you the credential type that was rejected, not the credential itself.
+- You should follow the same rule in your own code: never log a raw token. If you must identify a key, log only its prefix (and, if you must, its public `<8hex>` id from the dashboard — never the secret).
+
+## Wrong-token errors
+
+When a token reaches the wrong client or lacks the scope for a route, the platform returns a **403** with a typed reason. The three reasons:
+
+| Reason | Meaning | Typical cause |
+| --- | --- | --- |
+| `wrong_credential_type` | Right format, wrong plane. | An `ik_live_` token on the `ManagementClient`, or an `ik_sdk_` token on a `DataClient` endpoint. |
+| `project_scope_mismatch` | The token is valid but scoped to a **different project** than the one the call targets. | `ManagementClient.from_env(project="acme")` with an `ik_sdk_` token minted for another project. |
+| `scope_insufficient` | Right plane and project, but the token's [scopes](#control-token-scopes) don't cover the route. | A read-only (`workload:read`) `ik_sdk_` token calling `ensure()`. |
+
+### How they surface per language
+
+Both bindings map these 403s onto the typed `PermissionDenied` exception (a subclass of `InferenceKeyError`), so you can catch them and branch on the reason. Related auth failures surface as `AuthError` (bad or expired token) and validation problems as `ValidationError`.
+
+<Tabs syncKey="lang">
+<TabItem label="Python">
+
+```python title="Catching wrong-token errors"
+from inferencekey import (
+    ManagementClient, DataClient, WorkloadSpec, Backend,
+    PermissionDenied, AuthError,
+)
+
+mgmt = ManagementClient.from_env(project="acme")
+
+try:
+    mgmt.ensure(WorkloadSpec(
+        name="support-bot", slug="support-bot",
+        model="meta-llama/Llama-3.1-8B-Instruct", backend=Backend.VLLM,
+        command="vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+    ))
+except PermissionDenied as e:
+    # e carries the typed reason: wrong_credential_type,
+    # project_scope_mismatch, or scope_insufficient.
+    print("rejected:", e)
+except AuthError:
+    print("token is missing, malformed, or expired")
+```
+
+</TabItem>
+<TabItem label="TypeScript">
+
+```ts title="Catching wrong-token errors"
+import {
+  ManagementClient, Backend,
+  PermissionDenied, AuthError,
+} from "@inferencekey/sdk";
+
+const mgmt = ManagementClient.fromEnv({ project: "acme" });
+
+try {
+  await mgmt.ensure({
+    name: "support-bot", slug: "support-bot",
+    model: "meta-llama/Llama-3.1-8B-Instruct", backend: Backend.Vllm,
+    command: "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+  });
+} catch (e) {
+  if (e instanceof PermissionDenied) {
+    // e carries the typed reason: wrong_credential_type,
+    // project_scope_mismatch, or scope_insufficient.
+    console.error("rejected:", e.message);
+  } else if (e instanceof AuthError) {
+    console.error("token is missing, malformed, or expired");
+  } else {
+    throw e;
+  }
+}
+```
+
+</TabItem>
+</Tabs>
+
+<Aside type="caution">
+The single most common 403 is `wrong_credential_type` from swapping the two tokens. If `ensure()` is denied, check that `INFERENCEKEY_SDK_TOKEN` holds an **`ik_sdk_`** value — not your `ik_live_` data key — and vice versa for the `DataClient`.
+</Aside>
+
+## Where to next
+
+<CardGrid>
+  <LinkCard title="Tokens (quickstart)" href="/quickstart/tokens/" description="Get a key and make your first call." />
+  <LinkCard title="Tokens (reference)" href="/reference/tokens/" description="The full token model and wire details." />
+  <LinkCard title="Common errors" href="/reference/common-errors/" description="Every typed error and how to recover." />
+  <LinkCard title="OnDrift" href="/reference/ondrift/" description="What ensure() does when reality diverges from your spec." />
+</CardGrid>
+
+---
+
+Need keys? Open the **[Manager dashboard](https://manager.inferencekey.com)** to create an account and mint `ik_sdk_` and `ik_live_` tokens for your project. Learn more at [inferencekey.com](https://inferencekey.com).

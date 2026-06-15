@@ -1,0 +1,209 @@
+---
+title: OnDrift
+description: How ensure() decides what to do when a workload already exists — the five OnDrift values, their meaning, and how to pass them per language.
+---
+
+import { Tabs, TabItem, Card, CardGrid, Aside, Steps, LinkCard } from "@astrojs/starlight/components";
+
+`OnDrift` controls what [`ensure()`](/quickstart/first-ensure/) does when it finds a
+workload that already exists but no longer matches the [`WorkloadSpec`](/reference/wire-format/)
+you declared in code. It is the one knob that turns `ensure()` from a blunt
+"create or overwrite" into a predictable, reviewable reconcile step.
+
+The default is `RECONCILE`. If you never pass `on_drift`, `ensure()` brings the
+existing workload back in line with your spec.
+
+## The decision `ensure()` makes
+
+Every call to `ensure()` resolves to one of three situations. Only the middle
+one — **present and drifted** — is governed by `OnDrift`.
+
+| Situation | What `ensure()` does | Role of `OnDrift` |
+| --- | --- | --- |
+| **Absent** — no workload with this slug | **Always creates it.** | Ignored. A create is never "drift". |
+| **Present + in sync** — exists and matches the spec | **No-op.** Returns the existing reference. | Ignored. Nothing to do. |
+| **Present + drift** — exists but differs from the spec | Depends on the value below. | **This is what `OnDrift` decides.** |
+
+<Aside type="note" title="Drift is matched by slug">
+Drift is keyed on the **explicit `slug`** in your `WorkloadSpec` — that is the
+idempotency key. `ensure()` looks up the workload by `slug`, then compares the
+desired spec against the live state **client-side** and computes a plan of the
+fields that differ. The `name`, `description`, and other fields can change
+freely; the `slug` is what makes a call idempotent. Pick it once and keep it
+stable.
+</Aside>
+
+## The five values
+
+<CardGrid>
+  <Card title="RECONCILE — default" icon="approve-check">
+    Apply the computed plan: update the live workload so it matches your spec,
+    then return the reference. This is what you want in CI and deploy scripts.
+  </Card>
+  <Card title="FAIL" icon="error">
+    Raise a `ValidationError` describing the drift and make **no** change. Use
+    when an out-of-band edit must stop the pipeline so a human can look.
+  </Card>
+  <Card title="DRY_RUN" icon="seti:plan">
+    Compute and **return the plan** of what would change — but mutate nothing.
+    Perfect for a "plan" stage you review before a "reconcile" stage applies it.
+  </Card>
+  <Card title="WARN" icon="warning">
+    Emit a warning about the drift, make **no** change, and return the existing
+    reference. The call still succeeds.
+  </Card>
+  <Card title="IGNORE" icon="seti:lock">
+    Silently leave the live workload untouched and return the existing
+    reference. No warning, no mutation, no error.
+  </Card>
+</CardGrid>
+
+### Behavior matrix
+
+The "Absent" and "In sync" columns are identical for every value — `OnDrift`
+only changes the **drift** column.
+
+| `OnDrift` | Absent | Present + in sync | Present + drift |
+| --- | --- | --- | --- |
+| `RECONCILE` *(default)* | create | no-op | **update to match spec** |
+| `FAIL` | create | no-op | **raise `ValidationError`, no change** |
+| `DRY_RUN` | create | no-op | **return the plan, no change** |
+| `WARN` | create | no-op | **warn, no change** |
+| `IGNORE` | create | no-op | **no change, no warning** |
+
+<Aside type="caution">
+`DRY_RUN` never mutates the platform. It returns the diff/plan so you can decide
+whether to apply it. To actually apply it, run `ensure()` again with
+`RECONCILE`.
+</Aside>
+
+## Passing `on_drift`
+
+Pass it alongside (Python) or inside (TypeScript) the `WorkloadSpec` you hand to
+`ensure()`. Omit it to get `RECONCILE`.
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+
+```python title="ensure_with_ondrift.py"
+from inferencekey import ManagementClient, WorkloadSpec, Backend, OnDrift
+
+mgmt = ManagementClient.from_env(project="acme")  # reads INFERENCEKEY_SDK_TOKEN
+
+spec = WorkloadSpec(
+    name="support-bot",
+    slug="support-bot",  # the idempotency key drift is matched on
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    backend=Backend.VLLM,
+    command="vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+)
+
+# Default — RECONCILE — brings a drifted workload back in line:
+ref = mgmt.ensure(spec)
+
+# Stop the pipeline if someone changed it out of band:
+ref = mgmt.ensure(spec, on_drift=OnDrift.FAIL)
+
+# Plan stage: see what would change without touching the platform:
+ref = mgmt.ensure(spec, on_drift=OnDrift.DRY_RUN)
+
+print(ref.project_slug, ref.workload_slug)
+```
+
+  </TabItem>
+  <TabItem label="TypeScript">
+
+```ts title="ensureWithOnDrift.ts"
+import { ManagementClient, Backend, OnDrift } from "@inferencekey/sdk";
+
+const mgmt = ManagementClient.fromEnv({ project: "acme" });
+
+const spec = {
+  name: "support-bot",
+  slug: "support-bot", // the idempotency key drift is matched on
+  model: "meta-llama/Llama-3.1-8B-Instruct",
+  backend: Backend.Vllm,
+  command: "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+};
+
+// Default — Reconcile — brings a drifted workload back in line:
+let ref = await mgmt.ensure(spec);
+
+// Stop the pipeline if someone changed it out of band:
+ref = await mgmt.ensure({ ...spec, onDrift: OnDrift.Fail });
+
+// Plan stage: see what would change without touching the platform:
+ref = await mgmt.ensure({ ...spec, onDrift: OnDrift.DryRun });
+
+console.log(ref.projectSlug, ref.workloadSlug);
+```
+
+  </TabItem>
+</Tabs>
+
+<Aside type="note">
+The enum is `OnDrift` in both languages. Python uses `SCREAMING_SNAKE`
+(`OnDrift.RECONCILE`, `OnDrift.DRY_RUN`); TypeScript uses `PascalCase`
+(`OnDrift.Reconcile`, `OnDrift.DryRun`). The five members map one-to-one:
+`RECONCILE`/`Reconcile`, `FAIL`/`Fail`, `DRY_RUN`/`DryRun`, `WARN`/`Warn`,
+`IGNORE`/`Ignore`.
+</Aside>
+
+## A plan-then-apply flow
+
+Because `DRY_RUN` computes the diff client-side and returns it without mutating,
+you can gate every reconcile behind a review.
+
+<Steps>
+
+1. **Plan.** Run `ensure()` with `DRY_RUN` in your CI "plan" job. It reports the
+   fields that differ from the live workload and changes nothing.
+
+2. **Review.** A human (or a required approval on the merge) reads the plan.
+
+3. **Apply.** Re-run `ensure()` with the default `RECONCILE` in the "deploy" job
+   to bring the workload in line with the spec.
+
+</Steps>
+
+## Which value to reach for
+
+<CardGrid>
+  <Card title="Deploy / CI apply" icon="rocket">
+    Use the default **`RECONCILE`**. Code is the source of truth; let `ensure()`
+    converge the platform to it on every deploy.
+  </Card>
+  <Card title="Detect tampering" icon="error">
+    Use **`FAIL`**. A drifted workload means something changed outside your repo
+    — fail loudly instead of silently overwriting it.
+  </Card>
+  <Card title="Preview changes" icon="seti:plan">
+    Use **`DRY_RUN`** in a plan stage, then `RECONCILE` to apply.
+  </Card>
+  <Card title="Shared / manually-tuned workloads" icon="seti:lock">
+    Use **`WARN`** or **`IGNORE`** when an operator owns the live config and your
+    spec should observe, not overwrite.
+  </Card>
+</CardGrid>
+
+<Aside type="tip">
+`FAIL` raises a `ValidationError`, a subclass of `InferenceKeyError`. See
+[Common errors](/reference/common-errors/) for the full hierarchy
+(`PermissionDenied`, `AuthError`, `ValidationError`, `ConfigurationError`,
+`ApiError`).
+</Aside>
+
+## See also
+
+<CardGrid>
+  <LinkCard title="Your first ensure()" href="/quickstart/first-ensure/" description="Declare a WorkloadSpec and reconcile it onto the platform." />
+  <LinkCard title="WorkloadSpec & wire format" href="/reference/wire-format/" description="Every field ensure() compares, and the control-plane routes it calls." />
+  <LinkCard title="Common errors" href="/reference/common-errors/" description="What FAIL raises and how the error types relate." />
+  <LinkCard title="Backends & policies" href="/reference/backends-and-policies/" description="The backends, task types, and execution policies a spec can declare." />
+</CardGrid>
+
+---
+
+Ready to reconcile your first workload? [Open the dashboard](https://manager.inferencekey.com)
+to create an account and grab an `ik_sdk_` token, or head back to the
+[InferenceKey landing](https://inferencekey.com).

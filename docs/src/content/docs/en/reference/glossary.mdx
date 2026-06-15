@@ -1,0 +1,166 @@
+---
+title: Glossary
+description: Definitions of the core InferenceKey concepts — workloads, slugs, projects, tokens, control vs data plane, policies, modalities, backends, ensure(), drift, and workers.
+---
+
+import { Aside, LinkCard, CardGrid } from "@astrojs/starlight/components";
+
+A quick reference for the vocabulary used across the SDK and the Manager. Terms
+are grouped so related ideas sit next to each other; jump to the deeper pages
+linked at the bottom when you need more than a sentence.
+
+## Resources
+
+<dl>
+
+<dt id="workload">Workload</dt>
+<dd>
+A single deployable inference unit: one model, one backend, one configuration.
+An app can own many workloads (for example a chat model, an embedding model,
+and a reranker), each with its own slug and its own <a href="#ik-live"><code>ik_live_</code></a> key.
+</dd>
+
+<dt id="slug">Slug</dt>
+<dd>
+The stable, URL-safe identifier for a workload (and for its project). It is what
+makes <a href="#ensure"><code>ensure()</code></a> idempotent and what appears in the
+endpoint path, so pick it once and keep it: <code>support-bot</code>, not a name
+that might change.
+</dd>
+
+<dt id="project">Project</dt>
+<dd>
+The container that groups workloads, members, and keys. A <a href="#ik-sdk"><code>ik_sdk_</code></a>
+token is scoped to exactly one project; both clients take a <code>project</code>
+slug (<code>ManagementClient.from_env(project="acme")</code>).
+</dd>
+
+<dt id="tenant">Tenant</dt>
+<dd>
+The account/organization that owns one or more projects. Tenancy is the platform's
+isolation boundary — keys, workers, and billing never cross it.
+</dd>
+
+</dl>
+
+## Tokens & planes
+
+<dl>
+
+<dt id="ik-live"><code>ik_live_</code></dt>
+<dd>
+A <strong>data-plane</strong> key. It calls inference and nothing else — it cannot
+provision. Pass it per workload (<code>data.endpoint(slug, api_key="ik_live_...")</code>),
+so each workload can carry its own least-privilege key.
+</dd>
+
+<dt id="ik-sdk"><code>ik_sdk_</code></dt>
+<dd>
+A <strong>control-plane</strong> token. It provisions and reconciles workloads for
+one project and is held by the <code>ManagementClient</code>; it cannot call
+inference. Read from <code>INFERENCEKEY_SDK_TOKEN</code>.
+</dd>
+
+<dt id="control-plane">Control plane</dt>
+<dd>
+The provisioning side: creating, listing, and reconciling workloads via the
+<code>ManagementClient</code>. Authenticated with <a href="#ik-sdk"><code>ik_sdk_</code></a>.
+</dd>
+
+<dt id="data-plane">Data plane</dt>
+<dd>
+The serving side: the OpenAI-compatible endpoints you call for text, embeddings,
+and other modalities via the <code>DataClient</code>. Authenticated with
+<a href="#ik-live"><code>ik_live_</code></a>.
+</dd>
+
+</dl>
+
+<Aside type="caution" title="Wrong token, clear error">
+Calling inference with a <code>ik_sdk_</code> token (or provisioning with
+<code>ik_live_</code>) fails with a 403 — <code>wrong_credential_type</code>,
+<code>project_scope_mismatch</code>, or <code>scope_insufficient</code>. See
+<a href="/reference/tokens/">Tokens</a>.
+</Aside>
+
+## Configuration
+
+<dl>
+
+<dt id="execution-policy">Execution policy</dt>
+<dd>
+How the workload is kept running: <code>fixed</code> (always on), <code>scheduled</code>
+(on a time window), or <code>autoscaling</code> (scales with load). Set via
+<code>execution_policy</code> on the <code>WorkloadSpec</code>.
+</dd>
+
+<dt id="modality">Modality / task_type</dt>
+<dd>
+What the workload does — one of 12 task types (<code>text2text</code> is the default;
+others include <code>embedding</code>, <code>text2image</code>, <code>audio2text</code>,
+<code>reranker</code>, <code>classification</code>, <code>reward</code>). <code>reranker</code>,
+<code>classification</code>, and <code>reward</code> are async-only (no synchronous
+OpenAI route).
+</dd>
+
+<dt id="backend">Backend</dt>
+<dd>
+The serving engine that runs the model: <code>Backend.Ollama</code>, <code>Vllm</code>,
+<code>VllmOmni</code>, or <code>Sglang</code> (wire: <code>ollama</code> / <code>vllm</code>
+/ <code>vllm-omni</code> / <code>sglang</code>). The vLLM backends take a
+<code>command</code> and an optional <code>vllm_version</code>.
+</dd>
+
+<dt id="worker">Worker (cloud / private)</dt>
+<dd>
+The compute host where a workload actually runs. A <strong>cloud</strong> worker is
+platform-managed capacity; a <strong>private</strong> worker is your own machine
+attached to the platform. Target a specific one with <code>worker_id</code> — but
+placement is normally the platform's job, so you usually leave it unset.
+</dd>
+
+</dl>
+
+## SDK behavior
+
+<dl>
+
+<dt id="ensure"><code>ensure()</code></dt>
+<dd>
+The single control-plane call that declares a workload and makes the platform match
+it: it creates the workload if it is missing and reconciles it if it has drifted.
+Idempotent by the explicit <a href="#slug">slug</a>, so re-running with the same
+spec is a no-op.
+</dd>
+
+<dt id="drift">Drift / OnDrift</dt>
+<dd>
+<em>Drift</em> is any difference between your declared <code>WorkloadSpec</code> and
+what exists on the platform. <code>on_drift</code> decides what <code>ensure()</code>
+does about it: <code>OnDrift.Reconcile</code> (default — fix it), <code>Fail</code>,
+<code>DryRun</code>, <code>Warn</code>, or <code>Ignore</code>.
+</dd>
+
+<dt id="endpointref">EndpointRef</dt>
+<dd>
+The handle returned by <code>data.endpoint(slug, ...)</code>. You call inference on it
+— <code>generate_text(...)</code>, <code>embed(...)</code> — and the result carries
+the output plus its model (<code>out.text</code>, <code>out.model</code>,
+<code>emb.embeddings</code>).
+</dd>
+
+</dl>
+
+## Keep reading
+
+<CardGrid>
+  <LinkCard title="Architecture" href="/reference/architecture/" description="How the core, C ABI, and bindings fit together." />
+  <LinkCard title="Tokens" href="/reference/tokens/" description="ik_live_ vs ik_sdk_, scopes, and env precedence." />
+  <LinkCard title="OnDrift" href="/reference/ondrift/" description="Every drift mode and when to use it." />
+  <LinkCard title="Backends & policies" href="/reference/backends-and-policies/" description="Engines, modalities, and execution policies in depth." />
+</CardGrid>
+
+---
+
+Ready to put these to work? [Open the dashboard](https://manager.inferencekey.com)
+to create a project, or read the [quickstart](/quickstart/tokens/).

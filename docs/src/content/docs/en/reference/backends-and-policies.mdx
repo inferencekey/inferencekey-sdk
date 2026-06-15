@@ -1,0 +1,209 @@
+---
+title: Backends & policies
+description: Reference for InferenceKey backends (ollama, vllm, vllm-omni, sglang), the 12 task-type modalities, and the fixed/scheduled/autoscaling execution policies.
+---
+
+import { Tabs, TabItem, Aside, LinkCard, CardGrid } from "@astrojs/starlight/components";
+
+A `WorkloadSpec` describes *what* to run. Three fields shape how the platform runs it:
+
+- **`backend`** — which serving engine launches the model.
+- **`task_type`** — the modality the model serves (text, embeddings, audio, …).
+- **`execution_policy`** — how the workload is scheduled and scaled.
+
+Placement onto hardware is the platform's job — a `WorkloadSpec` has no `provider` and no `min_vram_gb`. You declare the workload; the platform reconciles it.
+
+## Backends
+
+The `backend` field selects the serving engine. In code you pass the `Backend` enum; on the wire it is a string.
+
+| Backend enum | Wire string | When to use |
+| --- | --- | --- |
+| `Backend.OLLAMA` / `Backend.Ollama` | `ollama` | Quick local-style serving and broad GGUF model coverage. Simplest to stand up. |
+| `Backend.VLLM` / `Backend.Vllm` | `vllm` | High-throughput production text generation. You control the launch command. |
+| `Backend.VLLM_OMNI` / `Backend.VllmOmni` | `vllm-omni` | vLLM for multimodal / omni models. Same command-driven config as `vllm`. |
+| `Backend.SGLANG` / `Backend.Sglang` | `sglang` | Structured / programmatic generation workloads on the SGLang runtime. |
+
+<Aside type="note">
+Python uses the `UPPER_SNAKE` members (`Backend.VLLM`); TypeScript uses the `PascalCase` members (`Backend.Vllm`). They map to the same wire strings shown above.
+</Aside>
+
+### Backend config
+
+The `vllm` and `vllm-omni` backends are command-driven: you provide the `command` that launches the server, and optionally pin `vllm_version`. The backend-specific config on the wire is `{ command, vllm_version? }`.
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+```python title="vllm_workload.py"
+from inferencekey import ManagementClient, WorkloadSpec, Backend
+
+mgmt = ManagementClient.from_env(project="acme")
+
+ref = mgmt.ensure(WorkloadSpec(
+    name="support-bot",
+    slug="support-bot",
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    backend=Backend.VLLM,
+    command="vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+    vllm_version="0.6.3",  # optional: pin the engine version
+))
+```
+  </TabItem>
+  <TabItem label="TypeScript">
+```ts title="vllm_workload.ts"
+import { ManagementClient, Backend } from "@inferencekey/sdk";
+
+const mgmt = ManagementClient.fromEnv({ project: "acme" });
+
+const ref = await mgmt.ensure({
+  name: "support-bot",
+  slug: "support-bot",
+  model: "meta-llama/Llama-3.1-8B-Instruct",
+  backend: Backend.Vllm,
+  command: "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+  vllmVersion: "0.6.3", // optional: pin the engine version
+});
+```
+  </TabItem>
+</Tabs>
+
+<Aside type="tip">
+`command` and `vllm_version` only apply to `vllm` / `vllm-omni`. For `ollama` and `sglang`, leave `command` unset and let the backend launch the `model` you declared.
+</Aside>
+
+## Task types (modalities)
+
+`task_type` declares the modality the workload serves. There are 12 task types; the default is `text2text`. The data-plane surface depends on the modality.
+
+| Task type | Modality | Data plane |
+| --- | --- | --- |
+| `text2text` | Text in → text out (chat / completions). **Default.** | OpenAI-compatible chat/completions |
+| `embedding` | Text in → vector out | OpenAI-compatible embeddings (`embed`) |
+| `text2image` | Text in → image out | OpenAI-compatible |
+| `text2audio` | Text in → audio out | OpenAI-compatible |
+| `audio2text` | Audio in → text out (transcription) | OpenAI-compatible |
+| `reranker` | Query + documents → ranked order | Async-only (no sync OpenAI route) |
+| `classification` | Input → label / scores | Async-only (no sync OpenAI route) |
+| `reward` | Input → scalar reward score | Async-only (no sync OpenAI route) |
+| … | Additional modalities (12 total) | — |
+
+<Aside type="caution">
+`reranker`, `classification`, and `reward` are **async-only** — they have no synchronous OpenAI-compatible route. The synchronous `generate_text` / `generateText` and `embed` calls target `text2text` and `embedding` workloads.
+</Aside>
+
+### Declaring a task type
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+```python title="embedding_workload.py"
+from inferencekey import ManagementClient, DataClient, WorkloadSpec, Backend
+
+mgmt = ManagementClient.from_env(project="acme")
+
+ref = mgmt.ensure(WorkloadSpec(
+    name="billing-embeddings",
+    slug="billing",
+    model="BAAI/bge-large-en-v1.5",
+    backend=Backend.VLLM,
+    command="vllm serve BAAI/bge-large-en-v1.5",
+    task_type="embedding",
+))
+
+data = DataClient.from_env(project="acme")
+emb = data.endpoint("billing", api_key="ik_live_...").embed(input=["a", "b"])
+# emb.embeddings
+```
+  </TabItem>
+  <TabItem label="TypeScript">
+```ts title="embedding_workload.ts"
+import { ManagementClient, DataClient, Backend } from "@inferencekey/sdk";
+
+const mgmt = ManagementClient.fromEnv({ project: "acme" });
+
+const ref = await mgmt.ensure({
+  name: "billing-embeddings",
+  slug: "billing",
+  model: "BAAI/bge-large-en-v1.5",
+  backend: Backend.Vllm,
+  command: "vllm serve BAAI/bge-large-en-v1.5",
+  taskType: "embedding",
+});
+
+const data = DataClient.fromEnv({ project: "acme" });
+const emb = await data.endpoint("billing", { apiKey: "ik_live_..." }).embed({ input: ["a", "b"] });
+// emb.embeddings
+```
+  </TabItem>
+</Tabs>
+
+## Execution policies
+
+`execution_policy` controls how the workload is scheduled and scaled. There are three policies.
+
+| Execution policy | Behavior | When to use |
+| --- | --- | --- |
+| `fixed` | Runs with a fixed allocation that does not scale. | Steady, predictable load; reserved capacity. |
+| `scheduled` | Runs on a schedule. | Batch / periodic jobs; off-hours work. |
+| `autoscaling` | Scales with demand. | Spiky or unpredictable traffic. |
+
+<Aside type="note">
+Policy-specific tuning is carried in `execution_policy_config`. Set `execution_policy` to one of `fixed`, `scheduled`, or `autoscaling`; pair it with `execution_policy_config` for the parameters that policy expects.
+</Aside>
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+```python title="autoscaling_workload.py"
+ref = mgmt.ensure(WorkloadSpec(
+    name="support-bot",
+    slug="support-bot",
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    backend=Backend.VLLM,
+    command="vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+    execution_policy="autoscaling",
+))
+```
+  </TabItem>
+  <TabItem label="TypeScript">
+```ts title="autoscaling_workload.ts"
+const ref = await mgmt.ensure({
+  name: "support-bot",
+  slug: "support-bot",
+  model: "meta-llama/Llama-3.1-8B-Instruct",
+  backend: Backend.Vllm,
+  command: "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+  executionPolicy: "autoscaling",
+});
+```
+  </TabItem>
+</Tabs>
+
+## Putting it together
+
+`backend`, `task_type`, and `execution_policy` are independent fields on the same `WorkloadSpec`. Declare them together and call `ensure()` — drift is reconciled per [OnDrift](/reference/ondrift/).
+
+<CardGrid>
+  <LinkCard
+    title="OnDrift"
+    href="/reference/ondrift/"
+    description="How ensure() reconciles a workload when its spec drifts from the platform."
+  />
+  <LinkCard
+    title="Tokens"
+    href="/reference/tokens/"
+    description="ik_sdk_ for the control plane, ik_live_ per workload for the data plane."
+  />
+  <LinkCard
+    title="Workloads by policy, worker & modality"
+    href="/guides/workloads-by-policy-worker-modality/"
+    description="A guide to combining policies, workers, and task types in practice."
+  />
+  <LinkCard
+    title="Open the dashboard"
+    href="https://app.inferencekey.com"
+    description="Create an account or open the Manager dashboard to see your workloads."
+  />
+</CardGrid>
+
+---
+
+Built with [InferenceKey](https://inferencekey.com).

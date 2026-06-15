@@ -1,0 +1,38 @@
+---
+title: InferenceKey SDK
+description: Declara cargas de trabajo de IA en código, asegúrate de que existen en la plataforma y llama a los endpoints compatibles con OpenAI resultantes — primer resultado en menos de 5 minutos.
+template: splash
+hero:
+  title: Cargas de trabajo en código. Endpoints en minutos.
+  tagline: Declara una carga de trabajo de IA, llama a ensure() y obtén un endpoint compatible con OpenAI listo para usar. Un núcleo en Rust, SDKs nativos de Python y TypeScript.
+  actions:
+    - text: Empezar
+      link: /es/quickstart/tokens/
+      icon: right-arrow
+      variant: primary
+    - text: Abrir panel
+      link: https://cloud.inferencekey.com
+      icon: external
+      variant: minimal
+---
+
+import { CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+## Dos tokens, mínimo privilegio
+
+Declaras una carga de trabajo con el **plano de control** (`ManagementClient`, un token `ik_sdk_`) y la llamas con el **plano de datos** (`DataClient`, un token `ik_live_`). `ensure()` es idempotente por el slug, así que puedes ejecutarlo en cada despliegue.
+
+El token de control `ik_sdk_` aprovisiona cargas de trabajo pero **no** puede llamar a inferencia. El token de datos `ik_live_` llama a inferencia pero **no** puede aprovisionar. Pasa una clave de datos por carga de trabajo — una app puede usar varias, cada una con su propia clave.
+
+## Explora la documentación
+
+<CardGrid>
+  <LinkCard title="Quickstart" description="Consigue tus tokens, ejecuta tu primer ensure() y haz tu primera llamada." href="/es/quickstart/tokens/" />
+  <LinkCard title="Guías" description="Autenticación, cargas por política / worker / modalidad, y casos de uso de principio a fin." href="/es/guides/authentication/" />
+  <LinkCard title="Referencia" description="Arquitectura, tokens, OnDrift, backends y políticas, formato wire y errores comunes." href="/es/reference/architecture/" />
+  <LinkCard title="Referencia de API" description="Superficie completa de Python y TypeScript. Go y Java próximamente (sobre la C ABI)." href="/es/api/" />
+</CardGrid>
+
+---
+
+<p>¿Nuevo en la plataforma? <a href="https://cloud.inferencekey.com">Crea una cuenta o abre el panel</a> · Más en <a href="https://inferencekey.com">inferencekey.com</a></p>

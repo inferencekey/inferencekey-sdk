@@ -1,0 +1,237 @@
+---
+title: "Tutorial: from zero to your first chat"
+description: "Install the SDK, get your tokens, provision a workload with ensure(), and run your first generate_text() chat call — end to end in a few minutes."
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem, Steps, Aside, Card, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+This tutorial takes you from an empty terminal to your first chat response. You will install the SDK, grab two tokens, provision an inference workload from code with `ensure()`, and call the resulting OpenAI-compatible endpoint with `generate_text()`.
+
+It should take a few minutes. By the end you will have a `support-bot` workload running and a script that talks to it.
+
+<Aside type="note" title="Two tokens, two jobs">
+InferenceKey separates **control** from **data**. You provision workloads with a control token (`ik_sdk_`) and call inference with a data token (`ik_live_`). You will use both below. See [Tokens & scopes](/quickstart/tokens/) for the full model.
+</Aside>
+
+## Before you start
+
+You need:
+
+- An InferenceKey account and a project. <LinkCard title="Create an account / open the dashboard" href="https://manager.inferencekey.com" description="Sign up or open the Manager dashboard to create your project and tokens." />
+- Python 3.9+ **or** Node.js 18+.
+
+<Steps>
+
+1. ### Install the SDK
+
+   Install the package for your language.
+
+   <Tabs syncKey="lang">
+   <TabItem label="Python">
+
+   ```bash
+   pip install inferencekey
+   ```
+
+   </TabItem>
+   <TabItem label="TypeScript">
+
+   ```bash
+   npm i @inferencekey/sdk
+   ```
+
+   </TabItem>
+   </Tabs>
+
+   <Aside type="tip">
+   Go and Java are **coming soon** (they bind the same C ABI). For now, Python and TypeScript are the shipped, supported languages.
+   </Aside>
+
+2. ### Get your tokens
+
+   Open the [Manager dashboard](https://manager.inferencekey.com) and create two tokens **for the same project**:
+
+   - **Control token** — starts with `ik_sdk_`. Scoped to one project. Used to provision and reconcile workloads. It **cannot** call inference.
+   - **Data token** — starts with `ik_live_`. Used to call inference. You pass it **per workload**, so one app can hold several `ik_live_` keys with different scopes.
+
+   <Aside type="caution" title="Don't mix them up">
+   Using the wrong token type returns a `403`: `wrong_credential_type` (data token on a control route or vice-versa), `project_scope_mismatch`, or `scope_insufficient`. See [Common errors](/reference/common-errors/) if you hit one.
+   </Aside>
+
+3. ### Set your environment
+
+   The SDK reads configuration from environment variables. Precedence is **explicit argument > environment variable > config file**, so anything you pass in code wins.
+
+   ```bash title=".env (or export in your shell)"
+   export INFERENCEKEY_BASE_URL="https://api.inferencekey.com"
+   export INFERENCEKEY_PROJECT="acme"
+   export INFERENCEKEY_SDK_TOKEN="ik_sdk_xxxxxxxxxxxxxxxxxxxxxxxx"   # control plane
+   export INFERENCEKEY_API_KEY="ik_live_xxxxxxxxxxxxxxxxxxxxxxxx"    # data plane (default ik_live_)
+   ```
+
+   - `INFERENCEKEY_SDK_TOKEN` is read by `ManagementClient.from_env()`.
+   - `INFERENCEKEY_API_KEY` is the default `ik_live_` key for the `DataClient`. You can still override it per endpoint, which is the recommended pattern when you run many workloads.
+
+4. ### Provision a workload with `ensure()`
+
+   `ensure()` is **declarative and idempotent**: you describe the workload you want, and the platform creates it or reconciles it to match. Idempotency is keyed on the explicit `slug`, so running this twice is safe — the second run reconciles instead of creating a duplicate.
+
+   <Tabs syncKey="lang">
+   <TabItem label="Python">
+
+   ```python title="provision.py"
+   from inferencekey import ManagementClient, WorkloadSpec, Backend
+
+   mgmt = ManagementClient.from_env(project="acme")  # reads INFERENCEKEY_SDK_TOKEN
+
+   ref = mgmt.ensure(WorkloadSpec(
+       name="support-bot",
+       slug="support-bot",
+       model="meta-llama/Llama-3.1-8B-Instruct",
+       backend=Backend.VLLM,
+       command="vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+   ))
+
+   print("ready:", ref.project_slug, "/", ref.workload_slug)
+   ```
+
+   </TabItem>
+   <TabItem label="TypeScript">
+
+   ```ts title="provision.ts"
+   import { ManagementClient, Backend } from "@inferencekey/sdk";
+
+   const mgmt = ManagementClient.fromEnv({ project: "acme" }); // reads INFERENCEKEY_SDK_TOKEN
+
+   const ref = await mgmt.ensure({
+     name: "support-bot",
+     slug: "support-bot",
+     model: "meta-llama/Llama-3.1-8B-Instruct",
+     backend: Backend.Vllm,
+     command: "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+   });
+
+   console.log("ready:", ref.projectSlug, "/", ref.workloadSlug);
+   ```
+
+   </TabItem>
+   </Tabs>
+
+   <Aside type="note" title="What about drift?">
+   `on_drift` defaults to `OnDrift.RECONCILE` — if the live workload no longer matches your spec, `ensure()` brings it back into line. Other modes (`FAIL`, `DRY_RUN`, `WARN`, `IGNORE`) let you observe instead of change. See [OnDrift](/reference/ondrift/).
+   </Aside>
+
+5. ### Call it with `generate_text()`
+
+   Now switch to the **data plane**. Build a `DataClient`, get an endpoint for the workload slug, and pass your `ik_live_` token. Then call `generate_text()`.
+
+   <Tabs syncKey="lang">
+   <TabItem label="Python">
+
+   ```python title="chat.py"
+   from inferencekey import DataClient
+
+   data = DataClient.from_env(project="acme")
+
+   ep = data.endpoint("support-bot", api_key="ik_live_xxxxxxxxxxxxxxxxxxxxxxxx")
+
+   out = ep.generate_text(
+       prompt="Hola, ¿en qué puedes ayudarme?",
+       temperature=0.2,
+       max_tokens=300,
+   )
+
+   print(out.text)   # the reply
+   print(out.model)  # which model produced it
+   ```
+
+   </TabItem>
+   <TabItem label="TypeScript">
+
+   ```ts title="chat.ts"
+   import { DataClient } from "@inferencekey/sdk";
+
+   const data = DataClient.fromEnv({ project: "acme" });
+
+   const ep = data.endpoint("support-bot", {
+     apiKey: process.env.SUPPORT_IK_LIVE, // your ik_live_ token
+   });
+
+   const out = await ep.generateText({
+     prompt: "Hola, ¿en qué puedes ayudarme?",
+     temperature: 0.2,
+     maxTokens: 300,
+   });
+
+   console.log(out.text); // the reply
+   ```
+
+   </TabItem>
+   </Tabs>
+
+   <Aside type="tip" title="Passing the data token per workload">
+   Passing `api_key` / `apiKey` explicitly to `endpoint()` is the recommended pattern: one app can serve many workloads, each with its own `ik_live_` key and its own scope. If you omit it, the SDK falls back to `INFERENCEKEY_API_KEY`.
+   </Aside>
+
+6. ### Run it
+
+   <Tabs syncKey="lang">
+   <TabItem label="Python">
+
+   ```bash
+   python provision.py   # create / reconcile the workload
+   python chat.py        # get your first reply
+   ```
+
+   </TabItem>
+   <TabItem label="TypeScript">
+
+   ```bash
+   node provision.ts   # create / reconcile the workload
+   node chat.ts        # get your first reply
+   ```
+
+   </TabItem>
+   </Tabs>
+
+   You should see a chat reply printed to your terminal. That response came from the `support-bot` workload you just provisioned — running on the OpenAI-compatible endpoint at `/endpoint/acme/support-bot/v1/...`.
+
+</Steps>
+
+## What you just did
+
+<CardGrid>
+  <Card title="Provisioned from code" icon="setting">
+    `ensure()` declared `support-bot` and reconciled it on the platform — idempotent by slug, with `OnDrift.RECONCILE` keeping it in spec.
+  </Card>
+  <Card title="Called inference" icon="rocket">
+    `generate_text()` hit the OpenAI-compatible data plane with your `ik_live_` token and returned `out.text` / `out.model`.
+  </Card>
+  <Card title="Kept tokens least-privilege" icon="approve-check">
+    Control (`ik_sdk_`) provisions; data (`ik_live_`) calls. Neither can do the other's job.
+  </Card>
+  <Card title="Stayed config-light" icon="open-book">
+    Env vars carried base URL, project, and tokens — overridable in code when you need to.
+  </Card>
+</CardGrid>
+
+## Next steps
+
+<CardGrid>
+  <LinkCard title="Tokens & scopes" href="/quickstart/tokens/" description="The full least-privilege model: ik_sdk_ vs ik_live_ and how scopes resolve." />
+  <LinkCard title="Your first ensure()" href="/quickstart/first-ensure/" description="Go deeper on declarative provisioning and reconciliation." />
+  <LinkCard title="Your first call" href="/quickstart/first-call/" description="More on the data plane, including embeddings with embed()." />
+  <LinkCard title="OnDrift modes" href="/reference/ondrift/" description="RECONCILE, FAIL, DRY_RUN, WARN, IGNORE — pick the safety level you want." />
+  <LinkCard title="Backends & policies" href="/reference/backends-and-policies/" description="vLLM, Ollama, SGLang, plus fixed / scheduled / autoscaling execution policies." />
+  <LinkCard title="Use cases" href="/guides/use-cases/" description="Patterns for chat, embeddings, and the other task types." />
+</CardGrid>
+
+<Aside type="tip" title="Embeddings, too">
+The same `DataClient` does embeddings. For example, in Python: `data.endpoint("billing", api_key="ik_live_...").embed(input=["a", "b"]).embeddings`. See [Your first call](/quickstart/first-call/).
+</Aside>
+
+---
+
+Built something with this? [Open the Manager dashboard](https://manager.inferencekey.com) to watch your workload, or head back to [inferencekey.com](https://inferencekey.com).

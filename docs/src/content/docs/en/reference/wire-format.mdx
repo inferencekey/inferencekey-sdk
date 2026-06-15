@@ -1,0 +1,435 @@
+---
+title: Wire format
+description: The real HTTP wire format behind the SDK — control-plane workload requests and responses, and the OpenAI-compatible data-plane endpoints. snake_case JSON.
+---
+
+import { Tabs, TabItem, Card, CardGrid, Aside, Steps, LinkCard } from "@astrojs/starlight/components";
+
+The SDK is a thin, typed wrapper over a plain HTTP API. This page documents the
+**actual JSON on the wire** so you can debug requests, build a binding for a
+language we don't ship yet, or call the platform directly with `curl`. Field
+names are **`snake_case`** in JSON, regardless of the casing the SDK exposes in
+each language.
+
+<Aside type="note">
+You almost never need this page to *use* the SDK. Reach for it when you're
+inspecting traffic, integrating from an unsupported runtime, or binding the
+C ABI yourself. Everything the SDK does maps onto the requests below.
+</Aside>
+
+## Two planes, two tokens
+
+There are two independent surfaces, each gated by a different token type. See
+[Tokens](/reference/tokens/) for the full model.
+
+<CardGrid>
+  <Card title="Control plane" icon="setting">
+    Provision and reconcile workloads. Authenticated with an **`ik_sdk_`** token,
+    scoped to one project. Cannot call inference. Used by `ManagementClient`.
+  </Card>
+  <Card title="Data plane" icon="rocket">
+    Call inference against a workload. Authenticated with an **`ik_live_`** token,
+    passed per workload. Cannot provision. Used by `DataClient`. OpenAI-compatible.
+  </Card>
+</CardGrid>
+
+Base URL comes from `INFERENCEKEY_BASE_URL` (or the explicit client config). All
+control-plane paths below are relative to it.
+
+## Authentication header
+
+Both planes use a bearer token in the `Authorization` header. The token *prefix*
+decides which plane you're allowed to touch.
+
+```http title="Control plane"
+Authorization: Bearer ik_sdk_xxxxxxxxxxxxxxxxxxxxxxxx
+Content-Type: application/json
+```
+
+```http title="Data plane"
+Authorization: Bearer ik_live_xxxxxxxxxxxxxxxxxxxxxxxx
+Content-Type: application/json
+```
+
+If you present the wrong prefix for the route, you get a `403` with a typed
+error code (see [Wrong-token errors](#wrong-token-errors)).
+
+---
+
+## Control plane
+
+The control plane is where `mgmt.ensure(...)` does its work. Under the hood,
+`ensure()` is idempotent by the explicit **`slug`**: it lists/looks up the
+workload, then issues a `POST` to create it or a `PATCH` to reconcile drift
+(driven by [`OnDrift`](/reference/ondrift/), default `RECONCILE`).
+
+### Routes
+
+| Method   | Path                                         | Purpose                       |
+| -------- | -------------------------------------------- | ----------------------------- |
+| `POST`   | `/api/projects/:project_id/workloads`        | Create a workload             |
+| `PATCH`  | `/api/workloads/:id`                         | Update / reconcile a workload |
+| `GET`    | `/api/projects/:project_id/workloads`        | List workloads in a project   |
+
+`:project_id` is the project slug the `ik_sdk_` token is scoped to. `:id` is the
+workload's server-assigned id (or slug) returned by create/list.
+
+### CreateWorkloadRequest
+
+Body for `POST /api/projects/:project_id/workloads`.
+
+| Field             | Type     | Required | Notes                                                                 |
+| ----------------- | -------- | -------- | --------------------------------------------------------------------- |
+| `name`            | string   | yes      | Human-readable name.                                                  |
+| `description`     | string   | no       | Free text.                                                            |
+| `task_type`       | string   | yes      | Modality. Defaults to `text2text` if omitted. See [Task types](#task_type-values). |
+| `backend`         | string   | yes      | One of `ollama`, `vllm`, `vllm-omni`, `sglang`.                       |
+| `model_name`      | string   | yes      | Model identifier the backend serves.                                  |
+| `config`          | object   | no       | Backend-specific. For `vllm`/`vllm-omni`: `{ command, vllm_version? }`. |
+| `worker_id`       | string   | no       | Pin to a specific worker.                                             |
+| `gpu_resource_id` | string   | no       | Pin to a specific GPU resource.                                       |
+
+<Aside type="caution">
+There is **no** `provider` and **no** `min_vram_gb` field. Placement (which
+worker, which GPU) is the platform's job — you only *optionally* pin with
+`worker_id` / `gpu_resource_id`.
+</Aside>
+
+```json title="POST /api/projects/acme/workloads — vLLM text2text"
+{
+  "name": "Support Bot",
+  "description": "Customer support assistant",
+  "task_type": "text2text",
+  "backend": "vllm",
+  "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+  "config": {
+    "command": "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+    "vllm_version": "0.6.3"
+  }
+}
+```
+
+```json title="POST /api/projects/acme/workloads — Ollama embedding"
+{
+  "name": "Billing Embeddings",
+  "task_type": "embedding",
+  "backend": "ollama",
+  "model_name": "nomic-embed-text"
+}
+```
+
+#### `task_type` values
+
+There are 12 modalities. The default is **`text2text`**.
+
+```text
+text2text, embedding, text2image, text2audio, audio2text,
+reranker, classification, reward, ...
+```
+
+<Aside type="note">
+`reranker`, `classification`, and `reward` are **async-only**: they have no
+synchronous OpenAI-compatible route on the data plane. The OpenAI-compatible
+endpoints below cover `text2text` (chat/completions) and `embedding`.
+</Aside>
+
+#### `backend` and `config`
+
+| `backend`     | `config` shape                  |
+| ------------- | ------------------------------- |
+| `ollama`      | *(none required)*               |
+| `vllm`        | `{ command, vllm_version? }`    |
+| `vllm-omni`   | `{ command, vllm_version? }`    |
+| `sglang`      | backend-specific                |
+
+In the SDK the `Backend` enum maps to these wire strings:
+`Backend.Ollama` → `"ollama"`, `Backend.Vllm` → `"vllm"`,
+`Backend.VllmOmni` → `"vllm-omni"`, `Backend.Sglang` → `"sglang"`.
+
+### UpdateWorkloadRequest
+
+Body for `PATCH /api/workloads/:id`. Same fields as create, but **all optional** —
+send only what changes. This is what [`OnDrift.RECONCILE`](/reference/ondrift/)
+emits when `ensure()` detects the live workload differs from your spec.
+
+```json title="PATCH /api/workloads/wl_01h... — reconcile the launch command"
+{
+  "config": {
+    "command": "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 16384",
+    "vllm_version": "0.6.3"
+  }
+}
+```
+
+```json title="PATCH /api/workloads/wl_01h... — change task type and description"
+{
+  "description": "Now also serves the docs assistant",
+  "task_type": "text2text"
+}
+```
+
+### Workload response shape
+
+Returned by `POST` (the created workload), `PATCH` (the updated workload), and as
+each element of the `GET` list. The SDK surfaces `project_slug` and
+`workload_slug` from this on the returned `ref`.
+
+```json title="Workload response"
+{
+  "id": "wl_01h8x6m3q2k9z7v4t0n5b1c2d3",
+  "name": "Support Bot",
+  "description": "Customer support assistant",
+  "slug": "support-bot",
+  "project_id": "proj_01h8...",
+  "project_slug": "acme",
+  "workload_slug": "support-bot",
+  "task_type": "text2text",
+  "backend": "vllm",
+  "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+  "config": {
+    "command": "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+    "vllm_version": "0.6.3"
+  },
+  "worker_id": null,
+  "gpu_resource_id": null,
+  "created_at": "2026-06-15T09:12:44Z",
+  "updated_at": "2026-06-15T09:12:44Z"
+}
+```
+
+`GET /api/projects/:project_id/workloads` returns an array of these objects.
+
+### curl example
+
+<Steps>
+
+1. Create (or look up) the workload with your `ik_sdk_` token:
+
+   ```bash title="Create a workload"
+   curl -X POST "$INFERENCEKEY_BASE_URL/api/projects/acme/workloads" \
+     -H "Authorization: Bearer $INFERENCEKEY_SDK_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "name": "Support Bot",
+       "task_type": "text2text",
+       "backend": "vllm",
+       "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+       "config": {
+         "command": "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192"
+       }
+     }'
+   ```
+
+2. Grab `workload_slug` (and `project_slug`) from the response — you'll need them
+   to build the data-plane URL below.
+
+</Steps>
+
+This is exactly what `mgmt.ensure(...)` does:
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python title="ensure() → POST/PATCH under the hood"
+    from inferencekey import ManagementClient, WorkloadSpec, Backend
+
+    mgmt = ManagementClient.from_env(project="acme")  # reads INFERENCEKEY_SDK_TOKEN
+    ref = mgmt.ensure(WorkloadSpec(
+        name="support-bot",
+        slug="support-bot",
+        model="meta-llama/Llama-3.1-8B-Instruct",
+        backend=Backend.VLLM,
+        command="vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+    ))
+    print(ref.project_slug, ref.workload_slug)
+    ```
+  </TabItem>
+  <TabItem label="TypeScript">
+    ```ts title="ensure() → POST/PATCH under the hood"
+    import { ManagementClient, Backend } from "@inferencekey/sdk";
+
+    const mgmt = ManagementClient.fromEnv({ project: "acme" });
+    const ref = await mgmt.ensure({
+      name: "support-bot",
+      slug: "support-bot",
+      model: "meta-llama/Llama-3.1-8B-Instruct",
+      backend: Backend.Vllm,
+      command: "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+    });
+    console.log(ref.projectSlug, ref.workloadSlug);
+    ```
+  </TabItem>
+</Tabs>
+
+---
+
+## Data plane
+
+The data plane is **OpenAI-compatible**. Every workload exposes a versioned base
+under its project/workload slugs:
+
+```text
+/endpoint/:projectSlug/:workloadSlug/v1/...
+```
+
+Authenticate with an **`ik_live_`** token. This is what `DataClient.endpoint(...)`
+targets.
+
+### Routes
+
+| Method | Path (relative to `…/:workloadSlug/v1`) | Maps to SDK method     |
+| ------ | --------------------------------------- | ---------------------- |
+| `POST` | `/chat/completions`                     | `generate_text(...)`   |
+| `POST` | `/embeddings`                           | `embed(...)`           |
+
+These are the OpenAI Chat Completions and Embeddings shapes. Other modalities
+(`reranker`, `classification`, `reward`) are async-only and not served here.
+
+### Chat completions
+
+```json title="POST /endpoint/acme/support-bot/v1/chat/completions"
+{
+  "model": "support-bot",
+  "messages": [
+    { "role": "user", "content": "Hola" }
+  ],
+  "temperature": 0.2,
+  "max_tokens": 300
+}
+```
+
+```json title="Response"
+{
+  "id": "chatcmpl-9f2c...",
+  "object": "chat.completion",
+  "created": 1750000000,
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "choices": [
+    {
+      "index": 0,
+      "message": { "role": "assistant", "content": "¡Hola! ¿En qué puedo ayudarte?" },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": { "prompt_tokens": 7, "completion_tokens": 11, "total_tokens": 18 }
+}
+```
+
+The SDK's `out.text` is `choices[0].message.content`; `out.model` is the response
+`model` field.
+
+#### Streaming
+
+Set `"stream": true` to receive Server-Sent Events. Each event is a
+`data:` line carrying a partial `chat.completion.chunk`, terminated by a literal
+`data: [DONE]`.
+
+```http title="POST .../v1/chat/completions  (stream: true)"
+data: {"id":"chatcmpl-9f2c...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"¡Hola"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-9f2c...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"!"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-9f2c...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+```
+
+### Embeddings
+
+```json title="POST /endpoint/acme/billing/v1/embeddings"
+{
+  "model": "billing",
+  "input": ["a", "b"]
+}
+```
+
+```json title="Response"
+{
+  "object": "list",
+  "model": "nomic-embed-text",
+  "data": [
+    { "object": "embedding", "index": 0, "embedding": [0.0123, -0.0456, "..."] },
+    { "object": "embedding", "index": 1, "embedding": [0.0789, -0.0011, "..."] }
+  ],
+  "usage": { "prompt_tokens": 2, "total_tokens": 2 }
+}
+```
+
+The SDK's `emb.embeddings` is the list of `data[*].embedding` vectors.
+
+### curl example
+
+```bash title="Chat completion against a workload"
+curl -X POST \
+  "$INFERENCEKEY_BASE_URL/endpoint/acme/support-bot/v1/chat/completions" \
+  -H "Authorization: Bearer $SUPPORT_IK_LIVE" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "support-bot",
+    "messages": [{ "role": "user", "content": "Hola" }],
+    "temperature": 0.2,
+    "max_tokens": 300
+  }'
+```
+
+And the same call through the SDK:
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python title="DataClient → POST /chat/completions"
+    from inferencekey import DataClient
+
+    data = DataClient.from_env(project="acme")
+    ep = data.endpoint("support-bot", api_key="ik_live_...")
+    out = ep.generate_text(prompt="Hola", temperature=0.2, max_tokens=300)
+    print(out.text, out.model)
+    ```
+  </TabItem>
+  <TabItem label="TypeScript">
+    ```ts title="DataClient → POST /chat/completions"
+    import { DataClient } from "@inferencekey/sdk";
+
+    const data = DataClient.fromEnv({ project: "acme" });
+    const ep = data.endpoint("support-bot", { apiKey: process.env.SUPPORT_IK_LIVE });
+    const out = await ep.generateText({ prompt: "Hola", temperature: 0.2, maxTokens: 300 });
+    console.log(out.text, out.model);
+    ```
+  </TabItem>
+</Tabs>
+
+---
+
+## Wrong-token errors
+
+Presenting the wrong token type — or the right type with insufficient scope —
+returns a `403` with a typed `code`. The SDK turns these into
+`PermissionDenied`. See [Common errors](/reference/common-errors/).
+
+| `code`                    | Meaning                                                             |
+| ------------------------- | ------------------------------------------------------------------- |
+| `wrong_credential_type`   | `ik_live_` on a control route, or `ik_sdk_` on a data route.        |
+| `project_scope_mismatch`  | Token is scoped to a different project than the path.               |
+| `scope_insufficient`      | Token lacks the scope required for the operation.                   |
+
+```json title="403 — wrong credential type"
+{
+  "error": {
+    "code": "wrong_credential_type",
+    "message": "This route requires an ik_sdk_ control-plane token."
+  }
+}
+```
+
+---
+
+## See also
+
+<CardGrid>
+  <LinkCard title="Tokens" href="/reference/tokens/" description="ik_sdk_ vs ik_live_, scopes, and precedence." />
+  <LinkCard title="OnDrift" href="/reference/ondrift/" description="How ensure() decides between POST, PATCH, and failing." />
+  <LinkCard title="Backends & policies" href="/reference/backends-and-policies/" description="Backend wire strings and execution policies." />
+  <LinkCard title="Common errors" href="/reference/common-errors/" description="Typed error codes and how the SDK maps them." />
+</CardGrid>
+
+<p>
+  New here? <a href="https://manager.inferencekey.com">Create an account or open the dashboard</a> to mint your first tokens.
+</p>

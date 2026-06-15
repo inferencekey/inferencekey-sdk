@@ -1,0 +1,204 @@
+---
+title: Your first inference call
+description: Use a per-workload ik_live_ key with the DataClient to run a chat completion and create embeddings against your workload's OpenAI-compatible endpoint.
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem, Card, CardGrid, Aside, Steps, LinkCard } from "@astrojs/starlight/components";
+
+Your workload exists on the platform (see [Your first ensure](/quickstart/first-ensure/)). Now call it.
+
+Inference happens on the **data plane**. You reach a workload through its OpenAI-compatible endpoint with the `DataClient`, authenticated by a **per-workload `ik_live_` key** — never your `ik_sdk_` control token.
+
+<Aside type="caution" title="Two tokens, two clients">
+  `ik_sdk_` (control) provisions workloads and **cannot** call inference. `ik_live_` (data) calls inference and **cannot** provision. The `DataClient` only ever takes an `ik_live_` key. See [Tokens](/quickstart/tokens/).
+</Aside>
+
+## What you need
+
+<Steps>
+
+1. A workload that already exists — you have its `workload_slug` (for example `support-bot`) from `ensure()`.
+
+2. An `ik_live_` key **scoped to that workload**. Generate one per workload in the [Manager dashboard](https://app.inferencekey.com); pass a different key for each workload your app calls.
+
+3. The SDK installed and your environment configured:
+
+   <Tabs syncKey="lang">
+     <TabItem label="Python">
+       ```bash
+       pip install inferencekey
+       export INFERENCEKEY_BASE_URL="https://api.inferencekey.com"
+       export INFERENCEKEY_PROJECT="acme"
+       export SUPPORT_IK_LIVE="ik_live_your_workload_key"
+       ```
+     </TabItem>
+     <TabItem label="TypeScript">
+       ```bash
+       npm install @inferencekey/sdk
+       export INFERENCEKEY_BASE_URL="https://api.inferencekey.com"
+       export INFERENCEKEY_PROJECT="acme"
+       export SUPPORT_IK_LIVE="ik_live_your_workload_key"
+       ```
+     </TabItem>
+   </Tabs>
+
+</Steps>
+
+## Generate text
+
+Build a `DataClient` from the environment, open an `endpoint` for the workload slug with its `ik_live_` key, then call `generate_text`.
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python title="first_call.py"
+    import os
+    from inferencekey import DataClient
+
+    data = DataClient.from_env(project="acme")
+
+    ep = data.endpoint("support-bot", api_key=os.environ["SUPPORT_IK_LIVE"])
+
+    out = ep.generate_text(
+        prompt="Hola, ¿cómo puedo cancelar mi pedido?",
+        temperature=0.2,
+        max_tokens=300,
+    )
+
+    print(out.text)   # the completion
+    print(out.model)  # the model that served it
+    ```
+  </TabItem>
+  <TabItem label="TypeScript">
+    ```typescript title="first-call.ts"
+    import { DataClient } from "@inferencekey/sdk";
+
+    const data = DataClient.fromEnv({ project: "acme" });
+
+    const ep = data.endpoint("support-bot", {
+      apiKey: process.env.SUPPORT_IK_LIVE,
+    });
+
+    const out = await ep.generateText({
+      prompt: "Hola, ¿cómo puedo cancelar mi pedido?",
+      temperature: 0.2,
+      maxTokens: 300,
+    });
+
+    console.log(out.text);  // the completion
+    console.log(out.model); // the model that served it
+    ```
+  </TabItem>
+</Tabs>
+
+The result carries the generated `text`, the `model` that served the request, and a `finish_reason`. `DataClient.from_env` reads `INFERENCEKEY_BASE_URL` and `INFERENCEKEY_PROJECT`; the explicit `project` argument wins over the environment.
+
+<Aside type="tip" title="One key per workload">
+  An app typically drives many workloads — a chat model, an embedding model, a reranker. Open a separate `endpoint(slug, ...)` for each and pass that workload's own `ik_live_` key. Least privilege: a leaked key exposes one workload, not the project.
+</Aside>
+
+## Create embeddings
+
+The same `DataClient` reaches an embedding workload. Open its endpoint with that workload's key and call `embed` with one string or a list of strings — you get one vector per input back on `embeddings`.
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+    ```python title="embeddings.py"
+    import os
+    from inferencekey import DataClient
+
+    data = DataClient.from_env(project="acme")
+
+    emb = data.endpoint(
+        "billing",
+        api_key=os.environ["BILLING_IK_LIVE"],
+    ).embed(input=["first document", "second document"])
+
+    print(len(emb.embeddings))     # 2 vectors
+    print(len(emb.embeddings[0]))  # dimensionality of each vector
+    print(emb.model)               # the embedding model
+    ```
+  </TabItem>
+  <TabItem label="TypeScript">
+    ```typescript title="embeddings.ts"
+    import { DataClient } from "@inferencekey/sdk";
+
+    const data = DataClient.fromEnv({ project: "acme" });
+
+    const emb = await data
+      .endpoint("billing", { apiKey: process.env.BILLING_IK_LIVE })
+      .embed({ input: ["first document", "second document"] });
+
+    console.log(emb.embeddings.length);    // 2 vectors
+    console.log(emb.embeddings[0].length); // dimensionality of each vector
+    console.log(emb.model);                // the embedding model
+    ```
+  </TabItem>
+</Tabs>
+
+<Aside type="note" title="Match the method to the workload">
+  `generate_text` targets text-generating workloads; `embed` targets embedding workloads. Each workload declares a `task_type` at `ensure()` time, so reach for the method that matches. See [Workloads by policy, worker & modality](/guides/workloads-by-policy-worker-modality/).
+</Aside>
+
+## Streaming
+
+`generate_text` returns a single completed result. The endpoint also speaks **server-sent events** — tokens stream as they're produced and the stream terminates with `data: [DONE]`. For the streaming wire contract and how to consume it, see the references and guides below.
+
+<CardGrid>
+  <LinkCard
+    title="Wire format"
+    href="/reference/wire-format/"
+    description="The OpenAI-compatible data-plane routes, SSE framing, and the [DONE] terminator."
+  />
+  <LinkCard
+    title="Use cases"
+    href="/guides/use-cases/"
+    description="End-to-end patterns for chat, embeddings, and streaming responses."
+  />
+</CardGrid>
+
+## When a call is rejected
+
+<CardGrid>
+  <Card title="403 wrong_credential_type" icon="warning">
+    You passed an `ik_sdk_` control token to the `DataClient`. Use the workload's `ik_live_` key instead.
+  </Card>
+  <Card title="403 project_scope_mismatch" icon="warning">
+    The key belongs to a different project than the `DataClient`. Check `INFERENCEKEY_PROJECT` and the key's scope.
+  </Card>
+  <Card title="403 scope_insufficient" icon="warning">
+    The key isn't scoped to this workload. Generate a key for this workload in the dashboard.
+  </Card>
+</CardGrid>
+
+The SDK raises typed errors — `AuthError`, `PermissionDenied`, `ValidationError`, `ApiError` — all subclasses of `InferenceKeyError`. See [Common errors](/reference/common-errors/).
+
+## Next steps
+
+<CardGrid>
+  <LinkCard
+    title="Authentication"
+    href="/guides/authentication/"
+    description="Token precedence, per-workload keys, and configuring the data plane."
+  />
+  <LinkCard
+    title="Full tutorial"
+    href="/quickstart/tutorial/"
+    description="Provision a workload and call it end to end."
+  />
+  <LinkCard
+    title="Common errors"
+    href="/reference/common-errors/"
+    description="Decode 403s and the typed exception hierarchy."
+  />
+  <LinkCard
+    title="Open the dashboard"
+    href="https://app.inferencekey.com"
+    description="Create an account, mint per-workload ik_live_ keys, and watch traffic."
+  />
+</CardGrid>
+
+---
+
+Built by the team behind [InferenceKey](https://inferencekey.com).

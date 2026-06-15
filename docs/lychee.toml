@@ -1,0 +1,21 @@
+# Link-check config used in CI over the built `dist/` (plan C23, F30).
+# Fails the PR on broken internal links; external links are checked leniently
+# (offline/CI flakiness should not block docs).
+
+# Only fail on real client errors for internal links.
+accept = [200, 206, 301, 302, 308]
+
+# Don't fail CI on transient external-host issues.
+max_retries = 2
+timeout = 20
+
+# Skip mailto/tel and the dashboard/landing hosts that may not resolve in CI.
+exclude = [
+  "^mailto:",
+  "^tel:",
+  "localhost",
+  "127\\.0\\.0\\.1",
+]
+
+# Internal anchors and relative links are what we really guard.
+include_verbatim = false

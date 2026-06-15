@@ -1,0 +1,380 @@
+---
+title: TypeScript / Node API
+description: API overview for @inferencekey/sdk — ManagementClient, DataClient, Endpoint, and the WorkloadSpec / EndpointRef / TextResult / EmbedResult interfaces.
+---
+
+import { Tabs, TabItem, Card, CardGrid, Aside, Steps, LinkCard } from "@astrojs/starlight/components";
+
+The `@inferencekey/sdk` package is a native napi addon over the InferenceKey
+Rust core. It ships two clients, each holding one kind of token (least
+privilege):
+
+<CardGrid>
+  <Card title="ManagementClient" icon="setting">
+    Control plane. Provisions and reconciles workloads with an `ik_sdk_` token.
+    Cannot call inference.
+  </Card>
+  <Card title="DataClient" icon="rocket">
+    Data plane. Mints an `Endpoint` per workload, each bound to its own
+    `ik_live_` key. Cannot provision.
+  </Card>
+</CardGrid>
+
+All network methods (`ensure`, `generateText`, `embed`) are `async` and return
+Promises.
+
+## Install
+
+```bash
+npm i @inferencekey/sdk
+```
+
+Requires Node 18 or later.
+
+```ts
+import {
+  ManagementClient,
+  DataClient,
+  Backend,
+  OnDrift,
+} from "@inferencekey/sdk";
+```
+
+## Configuration
+
+`fromEnv` reads configuration with precedence **explicit option > environment
+variable > default**.
+
+| Env var | Used by | Purpose |
+| --- | --- | --- |
+| `INFERENCEKEY_BASE_URL` | both | API base URL (defaults to `https://api.inferencekey.com`) |
+| `INFERENCEKEY_PROJECT` | both | Project slug |
+| `INFERENCEKEY_SDK_TOKEN` | `ManagementClient` | Control-plane token (`ik_sdk_`) |
+| `INFERENCEKEY_API_KEY` | `DataClient` | Default data-plane key (`ik_live_`) |
+
+<Aside type="caution" title="Two tokens, two clients">
+  An `ik_sdk_` token provisions but cannot call inference; an `ik_live_` token
+  calls inference but cannot provision. Mixing them up yields a `403`. See
+  [Tokens](/reference/tokens/).
+</Aside>
+
+## ManagementClient
+
+Control-plane client. Holds an `ik_sdk_` token, scoped to one project.
+
+### `ManagementClient.fromEnv(opts?)`
+
+```ts
+static fromEnv(opts?: {
+  baseUrl?: string;
+  project?: string;
+  sdkToken?: string;
+}): ManagementClient
+```
+
+Builds a client from explicit options falling back to the environment. Reads
+`INFERENCEKEY_SDK_TOKEN` for the token and `INFERENCEKEY_PROJECT` for the
+default project.
+
+```ts
+const mgmt = ManagementClient.fromEnv({ project: "acme" });
+```
+
+### `mgmt.ensure(spec, opts?)`
+
+```ts
+async ensure(
+  spec: WorkloadSpec,
+  opts?: { onDrift?: OnDrift; project?: string },
+): Promise<EndpointRef>
+```
+
+Idempotently declares a workload. If it does not exist it is created; if it
+exists, drift between your spec and the live state is handled per `onDrift`
+(default [`OnDrift.Reconcile`](/reference/ondrift/)). Idempotency is keyed by
+the explicit `slug`. The project is resolved from `opts.project`, then
+`spec.project`, then the client's configured project.
+
+```ts
+const ref = await mgmt.ensure({
+  name: "support-bot",
+  slug: "support-bot",
+  model: "meta-llama/Llama-3.1-8B-Instruct",
+  backend: Backend.Vllm,
+  command:
+    "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+});
+// ref.projectSlug, ref.workloadSlug
+```
+
+## DataClient
+
+Data-plane client. Resolves a project, then mints one `Endpoint` per workload.
+
+### `DataClient.fromEnv(opts?)`
+
+```ts
+static fromEnv(opts?: {
+  baseUrl?: string;
+  project?: string;
+  apiKey?: string;
+}): DataClient
+```
+
+Reads `INFERENCEKEY_PROJECT` for the project and `INFERENCEKEY_API_KEY` for a
+default `ik_live_` key (used by any `endpoint()` call that does not pass its
+own).
+
+```ts
+const data = DataClient.fromEnv({ project: "acme" });
+```
+
+### `data.endpoint(workloadSlug, opts?)`
+
+```ts
+endpoint(workloadSlug: string, opts?: { apiKey?: string }): Endpoint
+```
+
+Returns an `Endpoint` bound to one workload and one `ik_live_` key. Pass
+`apiKey` per workload (one app, many workloads, different keys); if omitted the
+client's default key is used. Synchronous — no network call until you invoke a
+method on the returned `Endpoint`.
+
+```ts
+const ep = data.endpoint(ref.workloadSlug, {
+  apiKey: process.env.SUPPORT_IK_LIVE,
+});
+```
+
+## Endpoint
+
+A single workload's OpenAI-compatible endpoint, bound to one `ik_live_` key.
+
+### `ep.generateText(params)`
+
+```ts
+async generateText(params: {
+  prompt?: string;
+  messages?: { role: string; content: string }[];
+  temperature?: number;
+  maxTokens?: number;
+}): Promise<TextResult>
+```
+
+Generates text. Pass either a single `prompt` or a `messages` array
+(`role`/`content`). `temperature` and `maxTokens` are optional.
+
+```ts
+const out = await ep.generateText({
+  prompt: "Hola",
+  temperature: 0.2,
+  maxTokens: 300,
+});
+console.log(out.text, out.model);
+```
+
+### `ep.embed(params)`
+
+```ts
+async embed(params: { input: string | string[] }): Promise<EmbedResult>
+```
+
+Returns embeddings for one string or an array of strings. Available on
+workloads whose `taskType` is `embedding`.
+
+```ts
+const emb = await data
+  .endpoint("billing", { apiKey: "ik_live_..." })
+  .embed({ input: ["a", "b"] });
+console.log(emb.embeddings); // number[][]
+```
+
+## Interfaces
+
+### `WorkloadSpec`
+
+The declarative intent handed to `ensure()`.
+
+```ts
+interface WorkloadSpec {
+  name: string;
+  slug: string;
+  model: string;
+  backend: Backend | string;
+  project?: string;
+  description?: string;
+  command?: string;
+  vllmVersion?: string;
+  taskType?: string;
+  config?: Record<string, unknown>;
+  executionPolicy?: string;
+  executionPolicyConfig?: Record<string, unknown>;
+  workerId?: string;
+  gpuResourceId?: string;
+}
+```
+
+| Field | Notes |
+| --- | --- |
+| `name`, `slug`, `model`, `backend` | Required. `slug` is the idempotency key. |
+| `command`, `vllmVersion` | vLLM / vLLM-Omni config. |
+| `taskType` | One of 12 modalities (default `text2text`). |
+| `executionPolicy` | `fixed` \| `scheduled` \| `autoscaling`. |
+| `workerId`, `gpuResourceId` | Optional placement hints. |
+
+<Aside type="note">
+  There is no `provider` or `minVramGb` field — placement on a worker/GPU is the
+  platform's job, not the spec's. See
+  [Backends &amp; policies](/reference/backends-and-policies/).
+</Aside>
+
+### `EndpointRef`
+
+Returned by `ensure()`; the address of a reconciled workload.
+
+```ts
+interface EndpointRef {
+  projectSlug: string;
+  workloadSlug: string;
+}
+```
+
+### `TextResult`
+
+Returned by `generateText()`.
+
+```ts
+interface TextResult {
+  text: string;
+  model: string;
+  finishReason?: string;
+  raw: unknown;
+}
+```
+
+### `EmbedResult`
+
+Returned by `embed()`.
+
+```ts
+interface EmbedResult {
+  embeddings: number[][];
+  model: string;
+  raw: unknown;
+}
+```
+
+Both result types expose `raw`, the untouched OpenAI-compatible response, for
+when you need fields the typed surface does not cover.
+
+## Constants
+
+### `Backend`
+
+```ts
+const Backend = {
+  Ollama: "ollama",
+  Vllm: "vllm",
+  VllmOmni: "vllm-omni",
+  Sglang: "sglang",
+} as const;
+```
+
+### `OnDrift`
+
+```ts
+const OnDrift = {
+  Reconcile: "reconcile",
+  Fail: "fail",
+  DryRun: "dry_run",
+  Warn: "warn",
+  Ignore: "ignore",
+} as const;
+```
+
+`Reconcile` is the default for `ensure()`. See
+[OnDrift](/reference/ondrift/) for what each mode does.
+
+## End to end
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+
+```ts title="app.ts"
+import { ManagementClient, DataClient, Backend } from "@inferencekey/sdk";
+
+// 1. Control plane — declare the workload (ik_sdk_ token).
+const mgmt = ManagementClient.fromEnv({ project: "acme" });
+const ref = await mgmt.ensure({
+  name: "support-bot",
+  slug: "support-bot",
+  model: "meta-llama/Llama-3.1-8B-Instruct",
+  backend: Backend.Vllm,
+  command:
+    "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+});
+
+// 2. Data plane — call inference (ik_live_ key, per workload).
+const data = DataClient.fromEnv({ project: "acme" });
+const ep = data.endpoint(ref.workloadSlug, {
+  apiKey: process.env.SUPPORT_IK_LIVE,
+});
+
+const out = await ep.generateText({
+  prompt: "Hola",
+  temperature: 0.2,
+  maxTokens: 300,
+});
+console.log(out.text);
+```
+
+  </TabItem>
+  <TabItem label="Python">
+
+```python title="app.py"
+from inferencekey import ManagementClient, DataClient, WorkloadSpec, Backend
+
+mgmt = ManagementClient.from_env(project="acme")
+ref = mgmt.ensure(WorkloadSpec(
+    name="support-bot", slug="support-bot",
+    model="meta-llama/Llama-3.1-8B-Instruct", backend=Backend.VLLM,
+    command="vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192"))
+
+data = DataClient.from_env(project="acme")
+ep = data.endpoint(ref.workload_slug, api_key="ik_live_...")
+out = ep.generate_text(prompt="Hola", temperature=0.2, max_tokens=300)
+print(out.text)
+```
+
+  </TabItem>
+</Tabs>
+
+## Errors
+
+Methods reject with subclasses of `InferenceKeyError`:
+`PermissionDenied`, `AuthError`, `ValidationError`, `ConfigurationError`,
+`ApiError`. Using the wrong token kind surfaces as a `403`
+(`wrong_credential_type`, `project_scope_mismatch`, `scope_insufficient`). See
+[Common errors](/reference/common-errors/).
+
+<CardGrid>
+  <LinkCard
+    title="Quickstart: first call"
+    href="/quickstart/first-call/"
+    description="Get from token to generated text in minutes."
+  />
+  <LinkCard
+    title="Python API"
+    href="/api/python/"
+    description="The same surface for the inferencekey Python package."
+  />
+</CardGrid>
+
+<Aside type="tip" title="Get your tokens">
+  Create a project and mint `ik_sdk_` / `ik_live_` tokens in the
+  [InferenceKey dashboard](https://app.inferencekey.com/).
+</Aside>
+
+---
+
+Learn more at [inferencekey.com](https://inferencekey.com/).

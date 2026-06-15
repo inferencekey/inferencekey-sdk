@@ -1,0 +1,196 @@
+---
+title: Tokens
+description: The two InferenceKey tokens — ik_sdk_ (control plane) and ik_live_ (data plane) — their scopes, lifecycle, and where each one goes in the SDK.
+---
+
+import { Tabs, TabItem, Card, CardGrid, Aside, Steps, LinkCard } from "@astrojs/starlight/components";
+
+InferenceKey uses **two kinds of tokens**, one per plane, so that the code that
+*provisions* workloads never holds the credential that can *call* them — and
+vice versa. This is least privilege by construction: a leaked data token cannot
+create or delete workloads, and a leaked control token cannot run inference or
+read prompts.
+
+<CardGrid>
+  <Card title="ik_sdk_ — control plane" icon="setting">
+    Provisions and reconciles workloads. Held by your **management client**,
+    scoped to **one project**. Cannot call inference.
+  </Card>
+  <Card title="ik_live_ — data plane" icon="rocket">
+    Calls inference. Passed **per workload** to the data client. One app can
+    use many `ik_live_` keys. Cannot provision.
+  </Card>
+</CardGrid>
+
+## At a glance
+
+| | `ik_live_` | `ik_sdk_` |
+| --- | --- | --- |
+| **Purpose** | Call inference (generate, embed, …) | Provision & reconcile workloads |
+| **Plane** | Data | Control |
+| **Scope** | Per workload | Per project |
+| **Stored in** | `INFERENCEKEY_API_KEY` (default) or passed per call | `INFERENCEKEY_SDK_TOKEN` |
+| **Can call inference?** | Yes | No |
+| **Can provision?** | No | Yes |
+| **SDK client** | `DataClient` | `ManagementClient` |
+| **SDK placement** | `data.endpoint(slug, api_key=…)` | `ManagementClient.from_env(...)` |
+| **Env var** | `INFERENCEKEY_API_KEY` | `INFERENCEKEY_SDK_TOKEN` |
+
+<Aside type="tip">
+A single application typically holds **one** `ik_sdk_` token (to declare its
+workloads) and **several** `ik_live_` tokens — one per workload it calls, so a
+compromised app component only exposes the workloads it actually uses.
+</Aside>
+
+## Where each token goes in the SDK
+
+The control token is read once, from the environment, when you build the
+`ManagementClient`. The data token is passed **per workload** when you resolve
+an endpoint — it is never baked into the management client.
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+
+```python title="provision.py"
+from inferencekey import ManagementClient, DataClient, WorkloadSpec, Backend
+
+# Control plane: ik_sdk_ comes from INFERENCEKEY_SDK_TOKEN.
+mgmt = ManagementClient.from_env(project="acme")
+ref = mgmt.ensure(WorkloadSpec(
+    name="support-bot", slug="support-bot",
+    model="meta-llama/Llama-3.1-8B-Instruct", backend=Backend.VLLM,
+    command="vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+))
+
+# Data plane: ik_live_ is passed per workload.
+data = DataClient.from_env(project="acme")
+ep = data.endpoint(ref.workload_slug, api_key="ik_live_...")
+out = ep.generate_text(prompt="Hola", temperature=0.2, max_tokens=300)
+print(out.text)
+```
+
+  </TabItem>
+  <TabItem label="TypeScript">
+
+```ts title="provision.ts"
+import { ManagementClient, DataClient, Backend } from "@inferencekey/sdk";
+
+// Control plane: ik_sdk_ comes from INFERENCEKEY_SDK_TOKEN.
+const mgmt = ManagementClient.fromEnv({ project: "acme" });
+const ref = await mgmt.ensure({
+  name: "support-bot", slug: "support-bot",
+  model: "meta-llama/Llama-3.1-8B-Instruct", backend: Backend.Vllm,
+  command: "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+});
+
+// Data plane: ik_live_ is passed per workload.
+const data = DataClient.fromEnv({ project: "acme" });
+const ep = data.endpoint(ref.workloadSlug, { apiKey: process.env.SUPPORT_IK_LIVE });
+const out = await ep.generateText({ prompt: "Hola", temperature: 0.2, maxTokens: 300 });
+console.log(out.text);
+```
+
+  </TabItem>
+</Tabs>
+
+### Environment variables
+
+Resolution order is **explicit argument > environment variable > config file**.
+
+```bash title=".env"
+export INFERENCEKEY_BASE_URL="https://api.inferencekey.com"
+export INFERENCEKEY_PROJECT="acme"
+export INFERENCEKEY_SDK_TOKEN="ik_sdk_..."   # control plane (ManagementClient)
+export INFERENCEKEY_API_KEY="ik_live_..."    # data plane default (DataClient)
+```
+
+`INFERENCEKEY_API_KEY` is the **default** `ik_live_` key. When an app calls
+several workloads with different keys, pass each one explicitly to
+`data.endpoint(slug, api_key=…)` and the explicit value wins over the env
+default.
+
+## Scopes for `ik_sdk_`
+
+The control token is **project-scoped**: it can act only inside the single
+project it was issued for, and only through the control routes. Its
+capabilities map to the workload lifecycle:
+
+- **Create workloads** — `POST /api/projects/:project_id/workloads`
+- **Update workloads** — `PATCH /api/workloads/:id`
+- **List / read workloads** — `GET` the workload list
+
+What an `ik_sdk_` token can **not** do:
+
+- Call inference (`/endpoint/...`) — that is the data plane's job.
+- Act outside its project — a token issued for `acme` cannot touch `beta`.
+
+<Aside type="caution" title="Wrong token, wrong plane">
+Using the wrong token for a route returns **403**. The error code tells you
+which rule you broke:
+
+- `wrong_credential_type` — an `ik_sdk_` token on a data route, or an
+  `ik_live_` token on a control route.
+- `project_scope_mismatch` — a control token used against a different project.
+- `scope_insufficient` — a valid token that lacks the capability for the route.
+
+These surface as `PermissionDenied` in the SDK. See
+[Common errors](/reference/common-errors/).
+</Aside>
+
+## Lifecycle
+
+<Steps>
+
+1. **Create in the Manager.** Both `ik_sdk_` and `ik_live_` tokens are minted in
+   the [Manager dashboard](https://manager.inferencekey.com). Control tokens are
+   issued for a project; data tokens are issued for a workload.
+
+2. **Copy it once.** The full secret is **shown only at creation time**. The
+   Manager stores a hash, not the raw token — if you lose it, you cannot read it
+   back, you rotate it.
+
+3. **Store it as a secret.** Put `ik_sdk_` in `INFERENCEKEY_SDK_TOKEN` and your
+   `ik_live_` keys in your secret manager / `INFERENCEKEY_API_KEY` (or pass them
+   per workload). Never commit a token to source control.
+
+4. **Rotate or revoke.** Generate a replacement and update the environment, then
+   revoke the old token in the Manager. Revoking takes effect immediately:
+   control calls start returning `403`, data calls start returning `AuthError`.
+
+</Steps>
+
+<Aside type="note">
+Token prefixes are stable and let you tell them apart at a glance: `ik_sdk_…`
+is always the control plane, `ik_live_…` is always the data plane. If a
+credential lands in the wrong client, the prefix is the first thing to check.
+</Aside>
+
+## Related
+
+<CardGrid>
+  <LinkCard
+    title="Authentication guide"
+    href="/guides/authentication/"
+    description="End-to-end setup: which token where, env precedence, and per-workload keys."
+  />
+  <LinkCard
+    title="Get your tokens"
+    href="/quickstart/tokens/"
+    description="The quickstart path: create a project, mint both tokens, set your env."
+  />
+  <LinkCard
+    title="Architecture"
+    href="/reference/architecture/"
+    description="Why control and data planes are split, and how the two clients map to them."
+  />
+  <LinkCard
+    title="Common errors"
+    href="/reference/common-errors/"
+    description="403 wrong_credential_type, project_scope_mismatch, scope_insufficient, and AuthError."
+  />
+</CardGrid>
+
+---
+
+Questions or stuck? Open the [Manager dashboard](https://manager.inferencekey.com)
+to create an account, or head back to [inferencekey.com](https://inferencekey.com).

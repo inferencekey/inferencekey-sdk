@@ -1,0 +1,142 @@
+---
+title: InferenceKey SDK
+description: Declare AI workloads in code, ensure they exist on the platform, and call the resulting OpenAI-compatible endpoints — first result in under 5 minutes.
+template: splash
+hero:
+  title: Workloads in code. Endpoints in minutes.
+  tagline: Declare an AI workload, call ensure(), and get back an OpenAI-compatible endpoint you can hit right away. One Rust core, native Python and TypeScript SDKs.
+  actions:
+    - text: Get started
+      link: /quickstart/tokens/
+      icon: right-arrow
+      variant: primary
+    - text: Open dashboard
+      link: https://cloud.inferencekey.com
+      icon: external
+      variant: minimal
+---
+
+import { Tabs, TabItem, Card, CardGrid, Aside, Steps, LinkCard } from "@astrojs/starlight/components";
+
+## First result in under 5 minutes
+
+You declare a workload with the **control plane** (`ManagementClient`, an `ik_sdk_` token) and call it with the **data plane** (`DataClient`, an `ik_live_` token). `ensure()` is idempotent on the slug, so you can run it on every deploy.
+
+<Steps>
+
+1. **Get two tokens.** A control token (`ik_sdk_`) to provision and a data token (`ik_live_`) to call inference. Create both in the [dashboard](https://cloud.inferencekey.com) — see [Tokens](/quickstart/tokens/).
+
+2. **Set your environment.**
+
+   ```bash title=".env"
+   export INFERENCEKEY_BASE_URL="https://api.inferencekey.com"
+   export INFERENCEKEY_PROJECT="acme"
+   export INFERENCEKEY_SDK_TOKEN="ik_sdk_..."   # control plane
+   export INFERENCEKEY_API_KEY="ik_live_..."    # data plane (default)
+   ```
+
+3. **Ensure the workload, then call it.**
+
+</Steps>
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+
+```python title="quickstart.py"
+from inferencekey import ManagementClient, DataClient, WorkloadSpec, Backend
+
+# Control plane: provision/reconcile the workload (ik_sdk_ token).
+mgmt = ManagementClient.from_env(project="acme")
+ref = mgmt.ensure(WorkloadSpec(
+    name="support-bot",
+    slug="support-bot",
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    backend=Backend.VLLM,
+    command="vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+))
+
+# Data plane: call the resulting OpenAI-compatible endpoint (ik_live_ token).
+data = DataClient.from_env(project="acme")
+ep = data.endpoint(ref.workload_slug, api_key="ik_live_...")
+out = ep.generate_text(prompt="Hola", temperature=0.2, max_tokens=300)
+
+print(out.text)   # generated text
+print(out.model)  # model that served the request
+```
+
+  </TabItem>
+  <TabItem label="TypeScript">
+
+```typescript title="quickstart.ts"
+import { ManagementClient, DataClient, Backend } from "@inferencekey/sdk";
+
+// Control plane: provision/reconcile the workload (ik_sdk_ token).
+const mgmt = ManagementClient.fromEnv({ project: "acme" });
+const ref = await mgmt.ensure({
+  name: "support-bot",
+  slug: "support-bot",
+  model: "meta-llama/Llama-3.1-8B-Instruct",
+  backend: Backend.Vllm,
+  command: "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
+});
+
+// Data plane: call the resulting OpenAI-compatible endpoint (ik_live_ token).
+const data = DataClient.fromEnv({ project: "acme" });
+const ep = data.endpoint(ref.workloadSlug, { apiKey: process.env.SUPPORT_IK_LIVE });
+const out = await ep.generateText({ prompt: "Hola", temperature: 0.2, maxTokens: 300 });
+
+console.log(out.text);  // generated text
+```
+
+  </TabItem>
+</Tabs>
+
+<Aside type="tip" title="Two tokens, least privilege">
+  The `ik_sdk_` control token provisions workloads but **cannot** call inference. The `ik_live_` data token calls inference but **cannot** provision. Pass a data key per workload — one app can drive many workloads, each with its own key.
+</Aside>
+
+## Explore the docs
+
+<CardGrid>
+  <LinkCard
+    title="Quickstart"
+    description="Get your tokens, run your first ensure(), and make your first call."
+    href="/quickstart/tokens/"
+  />
+  <LinkCard
+    title="Guides"
+    description="Authentication, workloads by policy / worker / modality, and end-to-end use cases."
+    href="/guides/authentication/"
+  />
+  <LinkCard
+    title="Reference"
+    description="Architecture, tokens, OnDrift, backends and policies, wire format, and common errors."
+    href="/reference/architecture/"
+  />
+  <LinkCard
+    title="API reference"
+    description="Full Python and TypeScript surface. Go and Java are coming soon (bind the C ABI)."
+    href="/api/"
+  />
+</CardGrid>
+
+<CardGrid stagger>
+  <Card title="Declare, don't click" icon="setting">
+    Describe a workload with a `WorkloadSpec`. `ensure()` reconciles the platform to match — idempotent on the explicit slug, with `OnDrift.RECONCILE` by default.
+  </Card>
+  <Card title="OpenAI-compatible endpoints" icon="rocket">
+    Every workload is reachable under `/endpoint/:projectSlug/:workloadSlug/v1/...` — chat/completions and embeddings, with SSE streaming when you ask for it.
+  </Card>
+  <Card title="One core, native bindings" icon="puzzle">
+    A single Rust core behind a C ABI powers the Python wheel (`inferencekey`) and the Node/TypeScript addon (`@inferencekey/sdk`). Go and Java are coming soon.
+  </Card>
+  <Card title="Twelve modalities" icon="open-book">
+    Text, embeddings, images, audio, reranking, classification, reward and more — pick a backend (vLLM, SGLang, Ollama) and a policy (fixed, scheduled, autoscaling).
+  </Card>
+</CardGrid>
+
+---
+
+<p>
+  New to the platform? <a href="https://cloud.inferencekey.com">Create an account or open the dashboard</a> · Learn more at <a href="https://inferencekey.com">inferencekey.com</a>
+</p>

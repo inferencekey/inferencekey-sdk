@@ -1,0 +1,24 @@
+{
+  "name": "inferencekey-docs",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Documentation site for the InferenceKey SDK (Astro Starlight, static, i18n EN/ES/FR).",
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "docs:build": "astro build",
+    "preview": "astro preview",
+    "linkcheck": "lychee --config lychee.toml dist"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "astro": "^4.16.0",
+    "@astrojs/starlight": "^0.28.0",
+    "sharp": "^0.33.0"
+  },
+  "overrides": {
+    "@astrojs/sitemap": "3.2.1"
+  }
+}

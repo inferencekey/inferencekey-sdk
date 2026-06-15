@@ -25,6 +25,11 @@ build/
 *.pyd
 wheels/
 
+# Docs site (Astro Starlight)
+docs/.astro/
+docs/dist/
+docs/src/env.d.ts
+
 # Editor / OS
 .DS_Store
 .idea/
