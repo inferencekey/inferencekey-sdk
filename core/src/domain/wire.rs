@@ -150,6 +150,7 @@ pub fn to_update_request(spec: &WorkloadSpec, diffs: &[FieldDiff]) -> UpdateWork
 /// Compute drift for the fields the spec declares. `task_type` is never
 /// compared because it is not patchable. Ordering is stable (declaration order).
 pub fn diff_workload(spec: &WorkloadSpec, current: &WorkloadResponse) -> Vec<FieldDiff> {
+    let policy_kind_changed = diff_execution_policy(&current.execution_policy, &spec.execution_policy);
     [
         diff_string("name", &current.name, &spec.name),
         diff_enum("backend", current.backend.as_str(), spec.backend.as_str()),
@@ -158,7 +159,12 @@ pub fn diff_workload(spec: &WorkloadSpec, current: &WorkloadResponse) -> Vec<Fie
         diff_config(&current.config, build_config(spec)),
         diff_opt_string("worker_id", &current.worker_id, &spec.worker_id),
         diff_opt_string("gpu_resource_id", &current.gpu_resource_id, &spec.gpu_resource_id),
-        diff_execution_policy(&current.execution_policy, &spec.execution_policy),
+        policy_kind_changed.clone(),
+        diff_execution_policy_config(
+            &current.execution_policy_config,
+            &spec.execution_policy_config,
+            policy_kind_changed.is_some(),
+        ),
     ]
     .into_iter()
     .flatten()
@@ -233,6 +239,26 @@ fn diff_execution_policy(
     }
 }
 
+/// Diff `execution_policy_config` (an opaque JSON blob), but only when the spec
+/// declares one. Emitted when the desired config differs from the live config,
+/// OR when the `execution_policy` kind itself changed: the Manager re-validates
+/// the policy against whatever config it has on file, so switching e.g.
+/// `fixed → autoscaling` MUST carry the new config in the same PATCH — otherwise
+/// the server validates the new kind against the stale (often empty) config and
+/// rejects it (e.g. "max_hourly_cost_usd must be greater than zero").
+fn diff_execution_policy_config(
+    current: &Option<Value>,
+    desired: &Option<Value>,
+    policy_kind_changed: bool,
+) -> Option<FieldDiff> {
+    let want = desired.as_ref()?;
+    let have = current.clone().unwrap_or(Value::Null);
+    match have == *want && !policy_kind_changed {
+        true => None,
+        false => Some(named_diff("execution_policy_config", have, want.clone())),
+    }
+}
+
 // --- pure update assembly -----------------------------------------------------
 
 /// Set the one [`UpdateWorkloadRequest`] field named by `diff`, pulling the
@@ -251,6 +277,9 @@ fn apply_diff_to_update(
         "worker_id" => req.worker_id = spec.worker_id.clone(),
         "gpu_resource_id" => req.gpu_resource_id = spec.gpu_resource_id.clone(),
         "execution_policy" => req.execution_policy = spec.execution_policy,
+        "execution_policy_config" => {
+            req.execution_policy_config = spec.execution_policy_config.clone()
+        }
         _ => {}
     }
     req
@@ -532,6 +561,57 @@ mod tests {
                 expected_fields: &["execution_policy"],
             },
             Case {
+                // Switching the policy kind must carry the new config in the same
+                // PATCH; otherwise the Manager validates `autoscaling` against the
+                // stale config and rejects it. Regression test for the
+                // "max_hourly_cost_usd must be greater than zero" failure on a
+                // re-run where the live workload was `fixed` with an empty config.
+                name: "policy kind change carries its config",
+                mutate_spec: |s| WorkloadSpec {
+                    execution_policy: Some(ExecutionPolicy::Autoscaling),
+                    execution_policy_config: Some(json!({ "max_hourly_cost_usd": 5.0 })),
+                    ..s
+                },
+                mutate_resp: |r| WorkloadResponse {
+                    execution_policy: Some(ExecutionPolicy::Fixed),
+                    execution_policy_config: Some(json!({})),
+                    ..r
+                },
+                expected_fields: &["execution_policy", "execution_policy_config"],
+            },
+            Case {
+                // Same policy kind, but the declared config drifts from the live
+                // one — the config alone must be patched.
+                name: "execution policy config drifts",
+                mutate_spec: |s| WorkloadSpec {
+                    execution_policy: Some(ExecutionPolicy::Autoscaling),
+                    execution_policy_config: Some(json!({ "max_hourly_cost_usd": 9.0 })),
+                    ..s
+                },
+                mutate_resp: |r| WorkloadResponse {
+                    execution_policy: Some(ExecutionPolicy::Autoscaling),
+                    execution_policy_config: Some(json!({ "max_hourly_cost_usd": 5.0 })),
+                    ..r
+                },
+                expected_fields: &["execution_policy_config"],
+            },
+            Case {
+                // Spec declares a config equal to the live one and the kind is
+                // unchanged — no drift, no needless PATCH.
+                name: "execution policy config in sync",
+                mutate_spec: |s| WorkloadSpec {
+                    execution_policy: Some(ExecutionPolicy::Autoscaling),
+                    execution_policy_config: Some(json!({ "max_hourly_cost_usd": 5.0 })),
+                    ..s
+                },
+                mutate_resp: |r| WorkloadResponse {
+                    execution_policy: Some(ExecutionPolicy::Autoscaling),
+                    execution_policy_config: Some(json!({ "max_hourly_cost_usd": 5.0 })),
+                    ..r
+                },
+                expected_fields: &[],
+            },
+            Case {
                 name: "multiple fields, stable order",
                 mutate_spec: |s| WorkloadSpec {
                     name: "renamed".to_string(),
@@ -593,6 +673,39 @@ mod tests {
         assert_eq!(obj.get("model_name"), Some(&json!("new-model")));
         assert!(!obj.contains_key("name"));
         assert!(!obj.contains_key("task_type"));
+    }
+
+    #[test]
+    fn update_request_carries_policy_config_when_kind_switches() {
+        // Regression: re-running ensure() against a live workload that is
+        // `fixed` with an empty config must PATCH both the new kind and its
+        // config, so the Manager never validates `autoscaling` against `{}`.
+        let spec = WorkloadSpec {
+            execution_policy: Some(ExecutionPolicy::Autoscaling),
+            execution_policy_config: Some(json!({
+                "min_workers": 1,
+                "max_workers": 1,
+                "max_hourly_cost_usd": 5.0,
+            })),
+            ..base_spec()
+        };
+        let live = WorkloadResponse {
+            execution_policy: Some(ExecutionPolicy::Fixed),
+            execution_policy_config: Some(json!({})),
+            ..base_response()
+        };
+        let diffs = diff_workload(&spec, &live);
+        let value = serde_json::to_value(to_update_request(&spec, &diffs)).expect("serialize");
+        let obj = value.as_object().expect("object");
+        assert_eq!(obj.get("execution_policy"), Some(&json!("autoscaling")));
+        assert_eq!(
+            obj.get("execution_policy_config"),
+            Some(&json!({
+                "min_workers": 1,
+                "max_workers": 1,
+                "max_hourly_cost_usd": 5.0,
+            }))
+        );
     }
 
     #[test]
