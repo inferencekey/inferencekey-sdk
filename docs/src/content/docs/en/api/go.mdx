@@ -31,6 +31,10 @@ calling the resulting OpenAI-compatible endpoints. The same environment
 variables apply (`INFERENCEKEY_BASE_URL`, `INFERENCEKEY_PROJECT`,
 `INFERENCEKEY_API_KEY`, `INFERENCEKEY_SDK_TOKEN`).
 
+Feature parity is the goal but reached over time: newer Python/TypeScript
+conveniences such as streaming (`generate_text_stream`) and readiness
+(`wait_until_ready`) may not be in the Go client on day one.
+
 ## In the meantime
 
 The control and data planes are plain HTTP, so any Go program can talk to the
