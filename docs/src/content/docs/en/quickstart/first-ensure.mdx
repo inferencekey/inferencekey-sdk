@@ -188,6 +188,17 @@ It carries the resolved identifiers:
 You pass that `workload_slug` straight into the data plane to call inference,
 no need to hard-code the slug a second time:
 
+<Aside type="note" title="Cold start? Wait for it to be ready">
+  A freshly-provisioned workload is **cold** — the platform has to schedule a
+  worker, provision a GPU, and boot the serving runtime, which can take minutes.
+  `mgmt.wait_until_ready(slug)` / `mgmt.waitUntilReady(slug)` blocks until it is
+  serving, streaming live progress (scheduling → provisioning → bootstrapping →
+  ready) over your `ik_sdk_` token. Call it between `ensure()` and your first
+  inference request. See the API reference
+  ([Python](/en/api/python/#wait_until_ready) ·
+  [TypeScript](/en/api/typescript/#mgmtwaituntilreadyworkloadslug-opts)).
+</Aside>
+
 <Tabs syncKey="lang">
   <TabItem label="Python">
     ```python title="provision.py (continued)"

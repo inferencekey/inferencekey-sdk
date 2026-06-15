@@ -107,6 +107,41 @@ const ref = await mgmt.ensure({
 // ref.projectSlug, ref.workloadSlug
 ```
 
+### `mgmt.waitUntilReady(workloadSlug, opts?)`
+
+```ts
+async waitUntilReady(
+  workloadSlug: string,
+  opts?: {
+    project?: string;
+    timeoutMs?: number;                          // default 600_000
+    onProgress?: (event: ReadinessEvent) => void;
+    silent?: boolean;
+  },
+): Promise<void>
+```
+
+Waits until `workloadSlug` is serving, reporting progress as the platform
+schedules a worker, provisions a cloud GPU, and boots the runtime. Resolves when
+the platform reports the `ready` phase; rejects on an `error` phase or after
+`timeoutMs`.
+
+This lives on the **`ManagementClient`** (control plane): progress is streamed
+over the `ik_sdk_` token, so no `ik_live_` data key is needed. By default it
+prints a live progress view to the terminal (a phase bar on a TTY, plain lines
+in CI); pass your own `onProgress` to handle each [`ReadinessEvent`](#readinessevent)
+yourself, or `{ silent: true }` to suppress output. Call it right after
+`ensure()` provisions a cold worker.
+
+```ts
+const ref = await mgmt.ensure(spec);
+await mgmt.waitUntilReady(ref.workloadSlug, { timeoutMs: 600_000 });
+// or handle progress yourself:
+await mgmt.waitUntilReady(ref.workloadSlug, {
+  onProgress: (e) => console.log(e.phase, e.message),
+});
+```
+
 ## DataClient
 
 Data-plane client. Resolves a project, then mints one `Endpoint` per workload.
@@ -191,30 +226,6 @@ here, not mid-iteration); chunks are pulled lazily as you iterate.
 
 ```ts
 for await (const chunk of ep.generateTextStream({ prompt: "Hola" })) {
-  process.stdout.write(chunk.text);
-}
-```
-
-### `ep.waitUntilReady(opts?)`
-
-```ts
-async waitUntilReady(opts?: {
-  timeoutMs?: number;     // default 300_000
-  intervalMs?: number;    // default 2_000
-  maxIntervalMs?: number; // default 15_000
-}): Promise<void>
-```
-
-Resolves once the workload's endpoint is serving. The control plane has no
-readiness flag, so this sends a tiny chat probe and retries with exponential
-backoff while the worker is still starting (transport / 5xx). A `401`/`403`/`404`
-(bad key, wrong token type, unknown workload) rejects immediately rather than
-spinning. Rejects with a timeout error if `timeoutMs` elapses first. Use it right
-after `ensure()` provisions a cold worker, before the first call.
-
-```ts
-await ep.waitUntilReady({ timeoutMs: 600_000 });
-for await (const chunk of ep.generateTextStream({ prompt: "..." })) {
   process.stdout.write(chunk.text);
 }
 ```
@@ -309,6 +320,22 @@ interface TextChunk {
   text: string;
   finishReason?: string;
   raw: unknown;
+}
+```
+
+### `ReadinessEvent`
+
+Passed to the `onProgress` callback of `mgmt.waitUntilReady()` — one per progress
+update while a workload comes up.
+
+```ts
+type ReadinessPhase = "scheduling" | "provisioning" | "bootstrapping" | "ready" | "error";
+
+interface ReadinessEvent {
+  phase: ReadinessPhase; // "ready" means serving; "error" is terminal
+  message: string;       // short, printable description
+  elapsedMs: number;     // milliseconds since the wait started
+  step?: string;         // allow-listed bootstrap step (e.g. "model_load")
 }
 ```
 
