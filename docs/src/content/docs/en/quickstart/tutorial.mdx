@@ -19,7 +19,7 @@ InferenceKey separates **control** from **data**. You provision workloads with a
 
 You need:
 
-- An InferenceKey account and a project. <LinkCard title="Create an account / open the dashboard" href="https://manager.inferencekey.com" description="Sign up or open the Manager dashboard to create your project and tokens." />
+- An InferenceKey account and a project. <LinkCard title="Create an account / open the dashboard" href="https://cloud.inferencekey.com" description="Sign up or open the dashboard to create your project and tokens." />
 - Python 3.9+ **or** Node.js 18+.
 
 <Steps>
@@ -51,7 +51,7 @@ You need:
 
 2. ### Get your tokens
 
-   Open the [Manager dashboard](https://manager.inferencekey.com) and create two tokens **for the same project**:
+   Open the [dashboard](https://cloud.inferencekey.com) and create two tokens **for the same project**:
 
    - **Control token** — starts with `ik_sdk_`. Scoped to one project. Used to provision and reconcile workloads. It **cannot** call inference.
    - **Data token** — starts with `ik_live_`. Used to call inference. You pass it **per workload**, so one app can hold several `ik_live_` keys with different scopes.
@@ -62,7 +62,7 @@ You need:
 
 3. ### Set your environment
 
-   The SDK reads configuration from environment variables. Precedence is **explicit argument > environment variable > config file**, so anything you pass in code wins.
+   The SDK reads configuration from environment variables. Precedence is **explicit argument > environment variable**, so anything you pass in code wins.
 
    ```bash title=".env (or export in your shell)"
    export INFERENCEKEY_BASE_URL="https://api.inferencekey.com"
@@ -234,4 +234,4 @@ The same `DataClient` does embeddings. For example, in Python: `data.endpoint("b
 
 ---
 
-Built something with this? [Open the Manager dashboard](https://manager.inferencekey.com) to watch your workload, or head back to [inferencekey.com](https://inferencekey.com).
+New to InferenceKey? [Create an account or open the dashboard](https://cloud.inferencekey.com) · Learn more at [inferencekey.com](https://inferencekey.com).
