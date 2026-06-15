@@ -40,16 +40,29 @@ impl Backend {
 }
 
 /// Workload modality (`task_type`). Server default is `text2text`.
+///
+/// The wire strings are `text2text`, `text2image`, … (no underscore before the
+/// digit), so the serde renames are spelled out per-variant rather than derived
+/// from a `rename_all` rule — `snake_case` would wrongly emit `text2_text`, and
+/// the resulting body would be rejected by the server and fail to deserialize a
+/// `WorkloadResponse` read back. Keep these in lockstep with [`TaskType::as_str`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum TaskType {
+    #[serde(rename = "text2text")]
     Text2Text,
+    #[serde(rename = "embedding")]
     Embedding,
+    #[serde(rename = "text2image")]
     Text2Image,
+    #[serde(rename = "text2audio")]
     Text2Audio,
+    #[serde(rename = "audio2text")]
     Audio2Text,
+    #[serde(rename = "reranker")]
     Reranker,
+    #[serde(rename = "classification")]
     Classification,
+    #[serde(rename = "reward")]
     Reward,
 }
 
@@ -127,5 +140,28 @@ mod tests {
     fn backend_serializes_as_kebab_wire_string() {
         let json = serde_json::to_string(&Backend::VllmOmni).expect("serialize");
         assert_eq!(json, "\"vllm-omni\"");
+    }
+
+    #[test]
+    fn task_type_serde_matches_as_str_wire_string() {
+        // serde (de)serialization must round-trip through the exact wire string
+        // `as_str()` reports — otherwise a `WorkloadResponse` from the server
+        // (e.g. `"text2text"`) fails to deserialize. Guards the snake_case trap.
+        let variants = [
+            TaskType::Text2Text,
+            TaskType::Embedding,
+            TaskType::Text2Image,
+            TaskType::Text2Audio,
+            TaskType::Audio2Text,
+            TaskType::Reranker,
+            TaskType::Classification,
+            TaskType::Reward,
+        ];
+        for variant in variants {
+            let json = serde_json::to_string(&variant).expect("serialize");
+            assert_eq!(json, format!("\"{}\"", variant.as_str()));
+            let parsed: TaskType = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(parsed, variant);
+        }
     }
 }

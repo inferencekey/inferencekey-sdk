@@ -8,7 +8,7 @@
  */
 
 // The native addon. napi-rs emits `index.js` (loader) + `index.d.ts` at build.
-import { Client as NativeClient } from "./index.js";
+import { Client as NativeClient, ChatStream as NativeChatStream } from "./index.js";
 
 // `as const` objects (not TS `enum`) so the file is plain type-strippable TS and
 // carries no runtime enum machinery — same wire strings either way.
@@ -59,6 +59,15 @@ export interface TextResult {
   raw: unknown;
 }
 
+/** One streamed chunk of a chat completion (a `chat.completion.chunk`). */
+export interface TextChunk {
+  /** The delta for this frame — concatenate chunks to rebuild the full reply. */
+  text: string;
+  /** Set only on the terminal chunk. */
+  finishReason?: string;
+  raw: unknown;
+}
+
 export interface EmbedResult {
   embeddings: number[][];
   model: string;
@@ -71,6 +80,30 @@ function env(name: string): string | undefined {
   const v = process.env[name];
   return v && v.length > 0 ? v : undefined;
 }
+
+/** Pause for `ms` milliseconds (used by readiness backoff). */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * A readiness probe error that will never resolve by waiting: a bad/insufficient
+ * credential, wrong token type, or unknown workload. The native layer renders
+ * these as CoreError strings with stable prefixes, so we match on those.
+ */
+function isFatalReadinessError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return (
+    message.startsWith("authentication failed") ||
+    message.startsWith("permission denied") ||
+    message.startsWith("not found") ||
+    message.startsWith("validation error")
+  );
+}
+
+// `NativeChatStream` is the type returned by the native `generateTextStream`;
+// referenced here so the wrapper's `generateTextStream` is typed end-to-end.
+export type { NativeChatStream };
 
 /** Map a WorkloadSpec to the snake_case wire shape the core expects. */
 function specToWire(spec: WorkloadSpec): Record<string, unknown> {
@@ -126,7 +159,11 @@ export class ManagementClient {
       JSON.stringify(specToWire(spec)),
       opts.onDrift ?? OnDrift.Reconcile,
     );
-    return JSON.parse(raw) as EndpointRef;
+    // The core returns the EndpointRef as snake_case JSON (`project_slug` /
+    // `workload_slug`); map it to the camelCase public shape rather than a bare
+    // `as` cast, which would silently leave the fields `undefined`.
+    const ref = JSON.parse(raw) as { project_slug: string; workload_slug: string };
+    return { projectSlug: ref.project_slug, workloadSlug: ref.workload_slug };
   }
 }
 
@@ -180,7 +217,80 @@ export class Endpoint {
       this.apiKey,
       JSON.stringify(wire),
     );
-    return JSON.parse(raw) as TextResult;
+    // Core JSON is snake_case (`finish_reason`); map to the camelCase surface.
+    const data = JSON.parse(raw) as { text: string; model: string; finish_reason?: string; raw: unknown };
+    return { text: data.text, model: data.model, finishReason: data.finish_reason, raw: data.raw };
+  }
+
+  /**
+   * Open a streaming chat completion, yielding one {@link TextChunk} per SSE
+   * frame as tokens are produced. The connection opens eagerly (so auth /
+   * validation errors throw here, not mid-iteration); chunks are then pulled
+   * lazily as you iterate:
+   *
+   * ```ts
+   * for await (const chunk of ep.generateTextStream({ prompt: "Hola" })) {
+   *   process.stdout.write(chunk.text);
+   * }
+   * ```
+   */
+  async *generateTextStream(params: {
+    prompt?: string;
+    messages?: { role: string; content: string }[];
+    temperature?: number;
+    maxTokens?: number;
+  }): AsyncGenerator<TextChunk, void, unknown> {
+    const wire = {
+      prompt: params.prompt,
+      messages: params.messages,
+      temperature: params.temperature,
+      max_tokens: params.maxTokens,
+    };
+    const stream = await this.native.generateTextStream(
+      this.projectSlug,
+      this.workloadSlug,
+      this.apiKey,
+      JSON.stringify(wire),
+    );
+    for (;;) {
+      const raw = await stream.next();
+      if (raw === null) return;
+      const data = JSON.parse(raw) as { text: string; finish_reason?: string; raw: unknown };
+      yield { text: data.text, finishReason: data.finish_reason, raw: data.raw };
+    }
+  }
+
+  /**
+   * Resolve once the workload's endpoint is serving, by probing it.
+   *
+   * The control plane has no readiness flag, so this sends a tiny chat probe
+   * and treats a transport/5xx failure as "still starting" — retrying with
+   * exponential backoff up to `maxIntervalMs` — while a 401/403/404 (bad key,
+   * wrong token type, unknown workload) is a real error that rejects
+   * immediately. Rejects with a timeout error if `timeoutMs` elapses first.
+   * Call this after `ensure()` provisions a cold worker, before streaming.
+   */
+  async waitUntilReady(opts: { timeoutMs?: number; intervalMs?: number; maxIntervalMs?: number } = {}): Promise<void> {
+    const timeoutMs = opts.timeoutMs ?? 300_000;
+    const maxIntervalMs = opts.maxIntervalMs ?? 15_000;
+    const deadline = Date.now() + timeoutMs;
+    let delay = opts.intervalMs ?? 2_000;
+    for (;;) {
+      try {
+        await this.generateText({ prompt: "ping", maxTokens: 1 });
+        return; // a successful completion means the worker is up.
+      } catch (err) {
+        // A wrong/insufficient credential or unknown workload never becomes
+        // ready — surface it instead of spinning. Everything else (transport
+        // error, 5xx) means the worker is likely still booting, so retry.
+        if (isFatalReadinessError(err)) throw err;
+        if (Date.now() >= deadline) {
+          throw new Error(`workload "${this.workloadSlug}" not ready after ${Math.round(timeoutMs / 1000)}s`);
+        }
+        await sleep(Math.min(delay, Math.max(0, deadline - Date.now())));
+        delay = Math.min(delay * 2, maxIntervalMs);
+      }
+    }
   }
 
   async embed(params: { input: string | string[] }): Promise<EmbedResult> {

@@ -37,7 +37,7 @@ from .errors import (
     ValidationError,
 )
 from .clients import DataClient, Endpoint, ManagementClient
-from .types import EmbedResult, EndpointRef, TextResult, WorkloadSpec
+from .types import EmbedResult, EndpointRef, TextChunk, TextResult, WorkloadSpec
 
 __all__ = [
     "Backend",
@@ -47,6 +47,7 @@ __all__ = [
     "WorkloadSpec",
     "EndpointRef",
     "TextResult",
+    "TextChunk",
     "EmbedResult",
     "ManagementClient",
     "DataClient",
