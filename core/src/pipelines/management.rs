@@ -307,6 +307,31 @@ pub async fn ensure(
     }
 }
 
+/// Delete the workload named by `slug` from `project_id`, returning whether it
+/// existed. Idempotent: a slug that isn't there resolves to `Ok(false)` rather
+/// than an error, so cleanup-on-exit is safe to call unconditionally.
+///
+/// On the platform side this also tears down any cloud GPUs the autoscaler had
+/// provisioned for the workload (private workers are only unassigned), so a
+/// caller doesn't leak billable capacity. Authenticated with the `ik_sdk_`
+/// control token, scoped to `project_id`.
+pub async fn delete(
+    http: &dyn HttpPort,
+    base_url: &str,
+    sdk_token: &str,
+    project_id: &str,
+    slug: &str,
+) -> CoreResult<bool> {
+    let ctx = Ctx { http, base_url, sdk_token, project_id };
+    match find_by_slug(&ctx, slug).await? {
+        None => Ok(false),
+        Some(live) => {
+            delete_workload(&ctx, &live.id).await?;
+            Ok(true)
+        }
+    }
+}
+
 /// Slug absent on the platform: create it, or plan the create under `DryRun`.
 async fn ensure_absent(ctx: &Ctx<'_>, spec: &WorkloadSpec, on_drift: OnDrift) -> CoreResult<EndpointRef> {
     match on_drift {
@@ -386,6 +411,15 @@ async fn update_workload(
     let request = HttpRequest::with_body(HttpMethod::Patch, url, ctx.sdk_token, body);
     let value = ctx.http.request_json(request).await?;
     decode_workload(value)
+}
+
+/// `DELETE /api/workloads/:id`. The server responds `204 No Content` (decoded
+/// as `Value::Null`), which we discard.
+async fn delete_workload(ctx: &Ctx<'_>, workload_id: &str) -> CoreResult<()> {
+    let url = join_url(ctx.base_url, &format!("/api/workloads/{workload_id}"));
+    let request = HttpRequest::empty(HttpMethod::Delete, url, ctx.sdk_token);
+    ctx.http.request_json(request).await?;
+    Ok(())
 }
 
 /* -------------------------------- parsing ------------------------------- */
@@ -783,5 +817,78 @@ mod tests {
         let first = stream.next().await.unwrap().unwrap();
         assert_eq!(first.phase, "scheduling");
         drop(stream); // no hang, no panic
+    }
+
+    // ── delete ────────────────────────────────────────────────────────────
+
+    /// Fake transport for the unary path: answers the workload-list GET with a
+    /// fixed roster and records every (method, url) so a test can assert which
+    /// requests `delete` issued.
+    struct DeleteHttp {
+        list_body: Value,
+        calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl DeleteHttp {
+        fn new(list_body: Value) -> Arc<Self> {
+            Arc::new(Self { list_body, calls: Mutex::new(Vec::new()) })
+        }
+        fn calls(&self) -> Vec<(String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl HttpPort for DeleteHttp {
+        fn request_json<'a>(&'a self, req: HttpRequest) -> BoxFuture<'a, Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((req.method.as_str().to_string(), req.url.clone()));
+            let body = if matches!(req.method, HttpMethod::Get) {
+                self.list_body.clone()
+            } else {
+                // DELETE → 204 No Content, decoded as Null by the adapter.
+                Value::Null
+            };
+            Box::pin(async move { Ok(body) })
+        }
+        fn stream_sse<'a>(&'a self, _req: HttpRequest) -> BoxFuture<'a, JsonStream> {
+            Box::pin(async { Err(CoreError::NotImplemented("stream_sse".into())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_resolves_slug_then_issues_delete_by_id() {
+        let http = DeleteHttp::new(json!({ "workloads": [
+            workload_json("keep", TaskType::Text2Text, Backend::Vllm),
+            workload_json("doomed", TaskType::Text2Text, Backend::Vllm),
+        ]}));
+        let existed = delete(http.as_ref(), "https://api.test", "ik_sdk_x", "proj", "doomed")
+            .await
+            .expect("delete ok");
+        assert!(existed, "slug present → returns true");
+        let calls = http.calls();
+        // One GET to resolve the slug, then a DELETE to the matched id.
+        assert_eq!(calls[0].0, "GET");
+        assert_eq!(calls[1].0, "DELETE");
+        assert!(
+            calls[1].1.ends_with("/api/workloads/wl-doomed"),
+            "deletes the resolved id, got {}",
+            calls[1].1
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_is_idempotent_for_absent_slug() {
+        let http = DeleteHttp::new(json!({ "workloads": [
+            workload_json("keep", TaskType::Text2Text, Backend::Vllm),
+        ]}));
+        let existed = delete(http.as_ref(), "https://api.test", "ik_sdk_x", "proj", "ghost")
+            .await
+            .expect("delete ok");
+        assert!(!existed, "absent slug → returns false, not an error");
+        let calls = http.calls();
+        assert_eq!(calls.len(), 1, "only the list GET, no DELETE");
+        assert_eq!(calls[0].0, "GET");
     }
 }

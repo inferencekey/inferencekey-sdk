@@ -18,8 +18,8 @@ use tokio::sync::Mutex;
 
 use inferencekey_core::ports::http::HttpPort;
 use inferencekey_core::{
-    embed, ensure, generate_text, generate_text_stream, readiness_events, CoreError, EmbedParams,
-    GenerateTextParams, OnDrift, ReadinessEvent, ReqwestHttp, TextChunk,
+    delete as core_delete, embed, ensure, generate_text, generate_text_stream, readiness_events,
+    CoreError, EmbedParams, GenerateTextParams, OnDrift, ReadinessEvent, ReqwestHttp, TextChunk,
 };
 use inferencekey_core::WorkloadSpec;
 
@@ -66,6 +66,23 @@ impl Client {
         .await
         .map_err(map_core_error)?;
         to_json(result)
+    }
+
+    /// Delete a workload by slug (control plane). Resolves to `true` if it
+    /// existed, `false` if it was already absent (idempotent). Cloud GPUs the
+    /// autoscaler provisioned are torn down server-side.
+    #[napi]
+    pub async fn delete(
+        &self,
+        sdk_token: String,
+        project_id: String,
+        workload_slug: String,
+    ) -> Result<bool> {
+        let http = self.http.clone();
+        let base_url = self.base_url.clone();
+        core_delete(port(&http), &base_url, &sdk_token, &project_id, &workload_slug)
+            .await
+            .map_err(map_core_error)
     }
 
     /// Open the readiness progress stream for a workload (control plane).
