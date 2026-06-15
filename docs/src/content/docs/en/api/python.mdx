@@ -22,7 +22,7 @@ from inferencekey import (
 ```
 
 <Aside type="note" title="Two tokens, two clients">
-The control plane (`ik_sdk_`) provisions workloads and is held by `ManagementClient`. The data plane (`ik_live_`) calls inference and is passed **per workload** to `DataClient.endpoint(...)`. A control token cannot call inference; a data token cannot provision. See [Tokens](/reference/tokens/).
+The control plane (`ik_sdk_`) provisions workloads and is held by `ManagementClient`. The data plane (`ik_live_`) calls inference and is passed **per workload** to `DataClient.endpoint(...)`. A control token cannot call inference; a data token cannot provision. See [Tokens](/en/reference/tokens/).
 </Aside>
 
 ## ManagementClient
@@ -67,7 +67,7 @@ def ensure(
 ) -> EndpointRef
 ```
 
-Idempotently provision or reconcile `spec`, returning an [`EndpointRef`](#endpointref). Idempotency is keyed off the explicit `spec.slug`. The project is resolved from `project=` > `spec.project` > the client's project; if none is set, raises [`ConfigurationError`](#configurationerror). `on_drift` governs what happens when the live workload differs from the spec — see [OnDrift](#ondrift) and the [drift reference](/reference/ondrift/).
+Idempotently provision or reconcile `spec`, returning an [`EndpointRef`](#endpointref). Idempotency is keyed off the explicit `spec.slug`. The project is resolved from `project=` > `spec.project` > the client's project; if none is set, raises [`ConfigurationError`](#configurationerror). `on_drift` governs what happens when the live workload differs from the spec — see [OnDrift](#ondrift) and the [drift reference](/en/reference/ondrift/).
 
 ```python
 ref = mgmt.ensure(WorkloadSpec(
@@ -306,7 +306,7 @@ class EmbedResult:
 
 ## Enums
 
-Each enum's `value` is the exact platform wire string, so you may pass either the enum member or its string. See the [backends and policies reference](/reference/backends-and-policies/) for semantics.
+Each enum's `value` is the exact platform wire string, so you may pass either the enum member or its string. See the [backends and policies reference](/en/reference/backends-and-policies/) for semantics.
 
 ### Backend
 
@@ -338,7 +338,7 @@ class TaskType(str, Enum):
 
 ### OnDrift
 
-The drift-handling strategy for [`ensure`](#ensure); defaults to `RECONCILE`. See [OnDrift](/reference/ondrift/).
+The drift-handling strategy for [`ensure`](#ensure); defaults to `RECONCILE`. See [OnDrift](/en/reference/ondrift/).
 
 ```python
 class OnDrift(str, Enum):
@@ -362,7 +362,7 @@ class ExecutionPolicy(str, Enum):
 
 ## Exceptions
 
-Every SDK error derives from `InferenceKeyError`, so you can catch the base class to handle all of them. See [Common errors](/reference/common-errors/).
+Every SDK error derives from `InferenceKeyError`, so you can catch the base class to handle all of them. See [Common errors](/en/reference/common-errors/).
 
 ```
 InferenceKeyError
@@ -426,9 +426,9 @@ except InferenceKeyError as e:
 </Steps>
 
 <CardGrid>
-  <LinkCard title="TypeScript API reference" href="/api/typescript/" description="The same surface for @inferencekey/sdk." />
-  <LinkCard title="Tokens" href="/reference/tokens/" description="Control vs data plane, scopes, and precedence." />
-  <LinkCard title="OnDrift" href="/reference/ondrift/" description="What ensure() does when the live workload diverges." />
+  <LinkCard title="TypeScript API reference" href="/en/api/typescript/" description="The same surface for @inferencekey/sdk." />
+  <LinkCard title="Tokens" href="/en/reference/tokens/" description="Control vs data plane, scopes, and precedence." />
+  <LinkCard title="OnDrift" href="/en/reference/ondrift/" description="What ensure() does when the live workload diverges." />
   <LinkCard title="Open the dashboard" href="https://cloud.inferencekey.com" description="Create an account and mint your first tokens." />
 </CardGrid>
 

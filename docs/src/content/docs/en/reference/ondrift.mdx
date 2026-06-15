@@ -5,8 +5,8 @@ description: How ensure() decides what to do when a workload already exists — 
 
 import { Tabs, TabItem, Card, CardGrid, Aside, Steps, LinkCard } from "@astrojs/starlight/components";
 
-`OnDrift` controls what [`ensure()`](/quickstart/first-ensure/) does when it finds a
-workload that already exists but no longer matches the [`WorkloadSpec`](/reference/wire-format/)
+`OnDrift` controls what [`ensure()`](/en/quickstart/first-ensure/) does when it finds a
+workload that already exists but no longer matches the [`WorkloadSpec`](/en/reference/wire-format/)
 you declared in code. It is the one knob that turns `ensure()` from a blunt
 "create or overwrite" into a predictable, reviewable reconcile step.
 
@@ -188,7 +188,7 @@ you can gate every reconcile behind a review.
 
 <Aside type="tip">
 `FAIL` raises a `ValidationError`, a subclass of `InferenceKeyError`. See
-[Common errors](/reference/common-errors/) for the full hierarchy
+[Common errors](/en/reference/common-errors/) for the full hierarchy
 (`PermissionDenied`, `AuthError`, `ValidationError`, `ConfigurationError`,
 `ApiError`).
 </Aside>
@@ -196,10 +196,10 @@ you can gate every reconcile behind a review.
 ## See also
 
 <CardGrid>
-  <LinkCard title="Your first ensure()" href="/quickstart/first-ensure/" description="Declare a WorkloadSpec and reconcile it onto the platform." />
-  <LinkCard title="WorkloadSpec & wire format" href="/reference/wire-format/" description="Every field ensure() compares, and the control-plane routes it calls." />
-  <LinkCard title="Common errors" href="/reference/common-errors/" description="What FAIL raises and how the error types relate." />
-  <LinkCard title="Backends & policies" href="/reference/backends-and-policies/" description="The backends, task types, and execution policies a spec can declare." />
+  <LinkCard title="Your first ensure()" href="/en/quickstart/first-ensure/" description="Declare a WorkloadSpec and reconcile it onto the platform." />
+  <LinkCard title="WorkloadSpec & wire format" href="/en/reference/wire-format/" description="Every field ensure() compares, and the control-plane routes it calls." />
+  <LinkCard title="Common errors" href="/en/reference/common-errors/" description="What FAIL raises and how the error types relate." />
+  <LinkCard title="Backends & policies" href="/en/reference/backends-and-policies/" description="The backends, task types, and execution policies a spec can declare." />
 </CardGrid>
 
 ---

@@ -19,7 +19,7 @@ This guide is organized **by modality**. Within each, you get a ready-to-run `Wo
 </CardGrid>
 
 <Aside type="tip" title="Set these once">
-Examples assume `INFERENCEKEY_SDK_TOKEN` (control plane) and `INFERENCEKEY_PROJECT=acme` are exported. The `ik_live_` data keys are passed per workload. See [Tokens](/quickstart/tokens/) and [Authentication](/guides/authentication/).
+Examples assume `INFERENCEKEY_SDK_TOKEN` (control plane) and `INFERENCEKEY_PROJECT=acme` are exported. The `ik_live_` data keys are passed per workload. See [Tokens](/en/quickstart/tokens/) and [Authentication](/en/guides/authentication/).
 </Aside>
 
 ## The three axes
@@ -33,7 +33,7 @@ Examples assume `INFERENCEKEY_SDK_TOKEN` (control plane) and `INFERENCEKEY_PROJE
 - **`autoscaling`** — replica count tracks load between a floor and a ceiling. Good for spiky chat or image traffic.
 
 <Aside type="note">
-The policy *name* (`fixed` / `scheduled` / `autoscaling`) is the stable contract; `execution_policy_config` is validated by the Manager. For **autoscaling on cloud GPUs** the config carries `min_workers` / `max_workers` (not `min_replicas`/`max_replicas`), a required `max_hourly_cost_usd` (> 0), and a `workers.cloud_pool` with a non-empty `gpu_pool` (catalog display names) and an optional `allowed_cuda_versions` pin. The flat `gpu_pool` at the root is a legacy form that **cannot** carry `allowed_cuda_versions` — prefer the `workers.cloud_pool` shape shown below. See [Backends & policies](/reference/backends-and-policies/).
+The policy *name* (`fixed` / `scheduled` / `autoscaling`) is the stable contract; `execution_policy_config` is validated by the Manager. For **autoscaling on cloud GPUs** the config carries `min_workers` / `max_workers` (not `min_replicas`/`max_replicas`), a required `max_hourly_cost_usd` (> 0), and a `workers.cloud_pool` with a non-empty `gpu_pool` (catalog display names) and an optional `allowed_cuda_versions` pin. The flat `gpu_pool` at the root is a legacy form that **cannot** carry `allowed_cuda_versions` — prefer the `workers.cloud_pool` shape shown below. See [Backends & policies](/en/reference/backends-and-policies/).
 </Aside>
 
 ### Worker — *where it runs*
@@ -964,14 +964,14 @@ Do not try to call a `reranker`, `classification`, or `reward` workload with `ge
 1. **Modality** picks `task_type` + `backend` + `command`. Text modalities (`text2text`, `embedding`) ride on `vllm`/`sglang`/`ollama`; image/audio (`text2image`, `text2audio`, `audio2text`) ride on `vllm-omni`.
 2. **Worker** is one field: omit `worker_id` for cloud, set it for a private worker. Independent of everything else.
 3. **Policy** picks `execution_policy`: `fixed` for steady interactive load, `autoscaling` for spiky traffic, `scheduled` for batch/windowed runs. Tune it via `execution_policy_config`.
-4. `ensure()` is idempotent by `slug`, so re-running with a changed spec reconciles in place (default `OnDrift.RECONCILE`). See [OnDrift](/reference/ondrift/).
+4. `ensure()` is idempotent by `slug`, so re-running with a changed spec reconciles in place (default `OnDrift.RECONCILE`). See [OnDrift](/en/reference/ondrift/).
 </Steps>
 
 <CardGrid>
-  <LinkCard title="Backends & policies" href="/reference/backends-and-policies/" description="Every backend wire string and the policy contract in detail." />
-  <LinkCard title="Wire format" href="/reference/wire-format/" description="The exact control and data-plane routes behind ensure() and the endpoints." />
-  <LinkCard title="OnDrift" href="/reference/ondrift/" description="How re-running ensure() reconciles a changed spec." />
-  <LinkCard title="Common errors" href="/reference/common-errors/" description="403 wrong_credential_type, scope_insufficient, and friends." />
+  <LinkCard title="Backends & policies" href="/en/reference/backends-and-policies/" description="Every backend wire string and the policy contract in detail." />
+  <LinkCard title="Wire format" href="/en/reference/wire-format/" description="The exact control and data-plane routes behind ensure() and the endpoints." />
+  <LinkCard title="OnDrift" href="/en/reference/ondrift/" description="How re-running ensure() reconciles a changed spec." />
+  <LinkCard title="Common errors" href="/en/reference/common-errors/" description="403 wrong_credential_type, scope_insufficient, and friends." />
 </CardGrid>
 
 ---

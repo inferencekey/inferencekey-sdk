@@ -20,7 +20,7 @@ Every interaction with the platform belongs to exactly one of two planes. They u
   </Card>
 </CardGrid>
 
-This separation is enforced by the tokens themselves, not just by convention. A control token presented to the data plane (or vice versa) is rejected — see [Tokens](/reference/tokens/) and [Common errors](/reference/common-errors/).
+This separation is enforced by the tokens themselves, not just by convention. A control token presented to the data plane (or vice versa) is rejected — see [Tokens](/en/reference/tokens/) and [Common errors](/en/reference/common-errors/).
 
 ## Two tokens
 
@@ -45,7 +45,7 @@ The control plane terminates at the **Manager**, the platform's brain. The Manag
 - **Manager** — accepts control requests under `/api`, stores the desired workload state, and reconciles it onto workers. Placement is the platform's job: your `WorkloadSpec` has **no `provider` and no `min_vram_gb`** — you describe *what* you want, not *which box* it lands on.
 - **Workers** — run the model server for a workload (vLLM, SGLang, Ollama, …) and expose the OpenAI-compatible surface that the data plane reaches under `/endpoint`.
 
-When you call `ensure()`, the Manager creates or updates the workload and returns a reference. Idempotency is keyed on the **explicit `slug`** you provide, so re-running the same `ensure()` converges instead of duplicating. Drift between your spec and the live workload is handled by the `on_drift` policy, which defaults to `OnDrift.RECONCILE` — see [OnDrift](/reference/ondrift/).
+When you call `ensure()`, the Manager creates or updates the workload and returns a reference. Idempotency is keyed on the **explicit `slug`** you provide, so re-running the same `ensure()` converges instead of duplicating. Drift between your spec and the live workload is handled by the `on_drift` policy, which defaults to `OnDrift.RECONCILE` — see [OnDrift](/en/reference/ondrift/).
 
 ```python title="control plane: declare a workload"
 from inferencekey import ManagementClient, WorkloadSpec, Backend
@@ -105,7 +105,7 @@ out = ep.generate_text(prompt="Hola", temperature=0.2, max_tokens=300)
 print(out.text, out.model)
 ```
 
-The data plane is **OpenAI-compatible**: text generation maps to `chat/completions`, embeddings to `embeddings`. When you request streaming the response is Server-Sent Events terminated by `data: [DONE]`. See [Wire format](/reference/wire-format/) for the exact shapes.
+The data plane is **OpenAI-compatible**: text generation maps to `chat/completions`, embeddings to `embeddings`. When you request streaming the response is Server-Sent Events terminated by `data: [DONE]`. See [Wire format](/en/reference/wire-format/) for the exact shapes.
 
 ## One Rust core, many bindings
 
@@ -190,15 +190,15 @@ console.log(out.text);
 The split also defines responsibility. You declare *intent*; the platform handles *placement and lifecycle*.
 
 - **You declare** the `WorkloadSpec`: `name`, `slug`, `model`, `backend`, and optionally `command`, `vllm_version`, `task_type`, `execution_policy` (`fixed` | `scheduled` | `autoscaling`), and friends. There is **no `provider`** and **no `min_vram_gb`**.
-- **The platform decides** which worker hosts the workload, when it scales, and how reconciliation runs. Backends are `ollama`, `vllm`, `vllm-omni`, and `sglang`; `task_type` defaults to `text2text` and covers 12 modalities (some, like `reranker` / `classification` / `reward`, are async-only). Details in [Backends and policies](/reference/backends-and-policies/).
+- **The platform decides** which worker hosts the workload, when it scales, and how reconciliation runs. Backends are `ollama`, `vllm`, `vllm-omni`, and `sglang`; `task_type` defaults to `text2text` and covers 12 modalities (some, like `reranker` / `classification` / `reward`, are async-only). Details in [Backends and policies](/en/reference/backends-and-policies/).
 
 ## Where to go next
 
 <CardGrid>
-  <LinkCard title="Tokens" href="/reference/tokens/" description="The two token types, scopes, and how each plane enforces them." />
-  <LinkCard title="OnDrift" href="/reference/ondrift/" description="How ensure() reconciles your spec against the live workload." />
-  <LinkCard title="Wire format" href="/reference/wire-format/" description="Control routes and the OpenAI-compatible data surface, including SSE streaming." />
-  <LinkCard title="Common errors" href="/reference/common-errors/" description="403 wrong_credential_type, project_scope_mismatch, scope_insufficient, and the rest." />
+  <LinkCard title="Tokens" href="/en/reference/tokens/" description="The two token types, scopes, and how each plane enforces them." />
+  <LinkCard title="OnDrift" href="/en/reference/ondrift/" description="How ensure() reconciles your spec against the live workload." />
+  <LinkCard title="Wire format" href="/en/reference/wire-format/" description="Control routes and the OpenAI-compatible data surface, including SSE streaming." />
+  <LinkCard title="Common errors" href="/en/reference/common-errors/" description="403 wrong_credential_type, project_scope_mismatch, scope_insufficient, and the rest." />
 </CardGrid>
 
 ---

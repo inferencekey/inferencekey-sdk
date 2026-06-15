@@ -7,7 +7,7 @@ import { Tabs, TabItem, Card, CardGrid, Aside, Steps, LinkCard } from "@astrojs/
 
 InferenceKey uses **two kinds of token**, one per plane, so that the credentials your application ships with can only do what that application actually needs. This guide covers the token formats, what each can and cannot do, the scopes on the control token, how a token is resolved from your environment, how tokens are redacted in logs and errors, and the typed errors you get when a token lands on the wrong client.
 
-If you just want to get a key and make a call, start with [Tokens](/quickstart/tokens/). For the API surface, see the [Python](/api/python/) and [TypeScript](/api/typescript/) references.
+If you just want to get a key and make a call, start with [Tokens](/en/quickstart/tokens/). For the API surface, see the [Python](/en/api/python/) and [TypeScript](/en/api/typescript/) references.
 
 ## Two tokens, two planes
 
@@ -295,10 +295,10 @@ The single most common 403 is `wrong_credential_type` from swapping the two toke
 ## Where to next
 
 <CardGrid>
-  <LinkCard title="Tokens (quickstart)" href="/quickstart/tokens/" description="Get a key and make your first call." />
-  <LinkCard title="Tokens (reference)" href="/reference/tokens/" description="The full token model and wire details." />
-  <LinkCard title="Common errors" href="/reference/common-errors/" description="Every typed error and how to recover." />
-  <LinkCard title="OnDrift" href="/reference/ondrift/" description="What ensure() does when reality diverges from your spec." />
+  <LinkCard title="Tokens (quickstart)" href="/en/quickstart/tokens/" description="Get a key and make your first call." />
+  <LinkCard title="Tokens (reference)" href="/en/reference/tokens/" description="The full token model and wire details." />
+  <LinkCard title="Common errors" href="/en/reference/common-errors/" description="Every typed error and how to recover." />
+  <LinkCard title="OnDrift" href="/en/reference/ondrift/" description="What ensure() does when reality diverges from your spec." />
 </CardGrid>
 
 ---

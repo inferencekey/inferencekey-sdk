@@ -6,8 +6,8 @@ description: Go support for the InferenceKey SDK is coming soon, via the C ABI (
 import { Aside, LinkCard } from "@astrojs/starlight/components";
 
 The Go SDK is **coming soon**. It will bind the same Rust core as the Python and
-TypeScript SDKs through the stable [C ABI](/reference/architecture/) (cgo), so
-behaviour — `ensure()` idempotency, [`OnDrift`](/reference/ondrift/), the
+TypeScript SDKs through the stable [C ABI](/en/reference/architecture/) (cgo), so
+behaviour — `ensure()` idempotency, [`OnDrift`](/en/reference/ondrift/), the
 two-token split, error types — matches the shipped languages exactly.
 
 <Aside type="note">
@@ -41,17 +41,17 @@ The control and data planes are plain HTTP, so any Go program can talk to the
 platform directly today: the control routes under
 `/api/projects/:project_id/workloads` and the OpenAI-compatible data plane under
 `/endpoint/:projectSlug/:workloadSlug/v1/...`. See the
-[wire format](/reference/wire-format/) for the exact contract.
+[wire format](/en/reference/wire-format/) for the exact contract.
 
 <LinkCard
   title="Python SDK"
-  href="/api/python/"
+  href="/en/api/python/"
   description="Shipping today — the full ManagementClient / DataClient API."
 />
 
 <LinkCard
   title="TypeScript SDK"
-  href="/api/typescript/"
+  href="/en/api/typescript/"
   description="Shipping today — the same API for Node and the browser-free runtime."
 />
 

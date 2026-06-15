@@ -7,12 +7,12 @@ sidebar:
 
 import { Tabs, TabItem, Card, CardGrid, Aside, Steps, LinkCard } from "@astrojs/starlight/components";
 
-Your workload exists on the platform (see [Your first ensure](/quickstart/first-ensure/)). Now call it.
+Your workload exists on the platform (see [Your first ensure](/en/quickstart/first-ensure/)). Now call it.
 
 Inference happens on the **data plane**. You reach a workload through its OpenAI-compatible endpoint with the `DataClient`, authenticated by a **per-workload `ik_live_` key** — never your `ik_sdk_` control token.
 
 <Aside type="caution" title="Two tokens, two clients">
-  `ik_sdk_` (control) provisions workloads and **cannot** call inference. `ik_live_` (data) calls inference and **cannot** provision. The `DataClient` only ever takes an `ik_live_` key. See [Tokens](/quickstart/tokens/).
+  `ik_sdk_` (control) provisions workloads and **cannot** call inference. `ik_live_` (data) calls inference and **cannot** provision. The `DataClient` only ever takes an `ik_live_` key. See [Tokens](/en/quickstart/tokens/).
 </Aside>
 
 ## What you need
@@ -138,7 +138,7 @@ The same `DataClient` reaches an embedding workload. Open its endpoint with that
 </Tabs>
 
 <Aside type="note" title="Match the method to the workload">
-  `generate_text` targets text-generating workloads; `embed` targets embedding workloads. Each workload declares a `task_type` at `ensure()` time, so reach for the method that matches. See [Workloads by policy, worker & modality](/guides/workloads-by-policy-worker-modality/).
+  `generate_text` targets text-generating workloads; `embed` targets embedding workloads. Each workload declares a `task_type` at `ensure()` time, so reach for the method that matches. See [Workloads by policy, worker & modality](/en/guides/workloads-by-policy-worker-modality/).
 </Aside>
 
 ## Streaming
@@ -170,12 +170,12 @@ Under the hood the endpoint speaks **server-sent events**, terminated by `data: 
 <CardGrid>
   <LinkCard
     title="Wire format"
-    href="/reference/wire-format/"
+    href="/en/reference/wire-format/"
     description="The OpenAI-compatible data-plane routes, SSE framing, and the [DONE] terminator."
   />
   <LinkCard
     title="Use cases"
-    href="/guides/use-cases/"
+    href="/en/guides/use-cases/"
     description="End-to-end patterns for chat, embeddings, and streaming responses."
   />
 </CardGrid>
@@ -194,24 +194,24 @@ Under the hood the endpoint speaks **server-sent events**, terminated by `data: 
   </Card>
 </CardGrid>
 
-The SDK raises typed errors — `AuthError`, `PermissionDenied`, `ValidationError`, `ApiError` — all subclasses of `InferenceKeyError`. See [Common errors](/reference/common-errors/).
+The SDK raises typed errors — `AuthError`, `PermissionDenied`, `ValidationError`, `ApiError` — all subclasses of `InferenceKeyError`. See [Common errors](/en/reference/common-errors/).
 
 ## Next steps
 
 <CardGrid>
   <LinkCard
     title="Authentication"
-    href="/guides/authentication/"
+    href="/en/guides/authentication/"
     description="Token precedence, per-workload keys, and configuring the data plane."
   />
   <LinkCard
     title="Full tutorial"
-    href="/quickstart/tutorial/"
+    href="/en/quickstart/tutorial/"
     description="Provision a workload and call it end to end."
   />
   <LinkCard
     title="Common errors"
-    href="/reference/common-errors/"
+    href="/en/reference/common-errors/"
     description="Decode 403s and the typed exception hierarchy."
   />
   <LinkCard

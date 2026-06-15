@@ -10,7 +10,7 @@ The InferenceKey SDK is one Rust core (`inferencekey-core`) exposed through a C 
 - **Control plane** — a `ManagementClient` authenticated with an `ik_sdk_` token. Scoped to one project. Provisions and reconciles workloads. It **cannot** call inference.
 - **Data plane** — a `DataClient` that hands you an endpoint per workload, each authenticated with an `ik_live_` token. It **cannot** provision.
 
-See [Tokens](/reference/tokens/) for the least-privilege model and [Architecture](/reference/architecture/) for how the core, ABI, and bindings fit together.
+See [Tokens](/en/reference/tokens/) for the least-privilege model and [Architecture](/en/reference/architecture/) for how the core, ABI, and bindings fit together.
 
 ## Pick your language
 
@@ -19,22 +19,22 @@ Python and TypeScript ship today. Go and Java bind the same C ABI and are on the
 <CardGrid>
   <LinkCard
     title="Python"
-    href="/api/python/"
+    href="/en/api/python/"
     description="pyo3 wheel. pip install inferencekey. ManagementClient, DataClient, WorkloadSpec, Backend, OnDrift."
   />
   <LinkCard
     title="TypeScript / Node"
-    href="/api/typescript/"
+    href="/en/api/typescript/"
     description="napi addon. npm i @inferencekey/sdk. Fully typed, async/Promise-based API."
   />
   <LinkCard
     title="Go"
-    href="/api/go/"
+    href="/en/api/go/"
     description="Coming soon — native bindings over the C ABI."
   />
   <LinkCard
     title="Java"
-    href="/api/java/"
+    href="/en/api/java/"
     description="Coming soon — native bindings over the C ABI."
   />
 </CardGrid>
@@ -109,23 +109,23 @@ console.log(emb.embeddings);
 - **`ManagementClient`** — control-plane client. `from_env` / `fromEnv` reads `INFERENCEKEY_SDK_TOKEN`. The key method is `ensure(spec)`, which is idempotent by the explicit `slug` and returns a workload reference (`project_slug` / `projectSlug`, `workload_slug` / `workloadSlug`).
 - **`DataClient`** — data-plane client. `from_env` / `fromEnv` reads `INFERENCEKEY_API_KEY` as the default `ik_live_` key. Call `endpoint(slug, { apiKey })` to get a per-workload endpoint, then `generate_text` / `generateText` or `embed`.
 - **`WorkloadSpec`** — the desired state you declare: `name`, `slug`, `model`, `backend`, plus optional `project`, `description`, `command`, `vllm_version`, `task_type`, `config`, `execution_policy`, `execution_policy_config`, `worker_id`, `gpu_resource_id`. Placement is the platform's job — there is no `provider` and no `min_vram_gb`.
-- **`Backend`** — `Ollama`, `Vllm`, `VllmOmni`, `Sglang`. See [Backends and policies](/reference/backends-and-policies/).
-- **`OnDrift`** — `Reconcile` (default), `Fail`, `DryRun`, `Warn`, `Ignore`. See [OnDrift](/reference/ondrift/).
-- **Errors** — `PermissionDenied`, `AuthError`, `ValidationError`, `ConfigurationError`, `ApiError`, all subclasses of `InferenceKeyError`. See [Common errors](/reference/common-errors/).
+- **`Backend`** — `Ollama`, `Vllm`, `VllmOmni`, `Sglang`. See [Backends and policies](/en/reference/backends-and-policies/).
+- **`OnDrift`** — `Reconcile` (default), `Fail`, `DryRun`, `Warn`, `Ignore`. See [OnDrift](/en/reference/ondrift/).
+- **Errors** — `PermissionDenied`, `AuthError`, `ValidationError`, `ConfigurationError`, `ApiError`, all subclasses of `InferenceKeyError`. See [Common errors](/en/reference/common-errors/).
 
 <Aside type="tip" title="Configuration precedence">
-  Every client resolves settings in the order **explicit argument → environment variable**. The relevant env vars are `INFERENCEKEY_BASE_URL`, `INFERENCEKEY_PROJECT`, `INFERENCEKEY_API_KEY` (default `ik_live_`), and `INFERENCEKEY_SDK_TOKEN`. See [Authentication](/guides/authentication/).
+  Every client resolves settings in the order **explicit argument → environment variable**. The relevant env vars are `INFERENCEKEY_BASE_URL`, `INFERENCEKEY_PROJECT`, `INFERENCEKEY_API_KEY` (default `ik_live_`), and `INFERENCEKEY_SDK_TOKEN`. See [Authentication](/en/guides/authentication/).
 </Aside>
 
 ## New to the SDK?
 
 <Steps>
 
-1. Get your tokens and learn the two-token model — [Tokens quickstart](/quickstart/tokens/).
+1. Get your tokens and learn the two-token model — [Tokens quickstart](/en/quickstart/tokens/).
 
-2. Declare your first workload with `ensure()` — [First ensure](/quickstart/first-ensure/).
+2. Declare your first workload with `ensure()` — [First ensure](/en/quickstart/first-ensure/).
 
-3. Call the endpoint it created — [First call](/quickstart/first-call/).
+3. Call the endpoint it created — [First call](/en/quickstart/first-call/).
 
 </Steps>
 
