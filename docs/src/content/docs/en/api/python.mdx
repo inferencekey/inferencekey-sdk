@@ -5,7 +5,7 @@ description: The complete public surface of the inferencekey Python package — 
 
 import { Tabs, TabItem, Card, CardGrid, Aside, Steps, LinkCard } from "@astrojs/starlight/components";
 
-The `inferencekey` package is the typed, ergonomic Python surface over the Rust core. Declare a workload with [`WorkloadSpec`](#workloadspec), provision it idempotently with [`ManagementClient.ensure`](#ensure), then call the resulting OpenAI-compatible [`Endpoint`](#endpoint).
+The `inferencekey` package is the typed, ergonomic Python surface over the Rust core. Declare a workload with [`WorkloadSpec`](#workloadspec), provision it idempotently with [`ManagementClient.ensure`](#ensure), call the resulting OpenAI-compatible [`Endpoint`](#endpoint), and [`delete`](#delete) it when you're done.
 
 ```bash title="Install"
 pip install inferencekey
@@ -102,6 +102,30 @@ mgmt.wait_until_ready(ref.workload_slug, timeout=600)
 # or handle progress yourself:
 mgmt.wait_until_ready(ref.workload_slug, on_progress=lambda e: print(e.phase, e.message))
 ```
+
+### delete
+
+```python
+def delete(
+    self,
+    workload_slug: str,
+    *,
+    project: str | None = None,
+) -> bool
+```
+
+Delete the workload named by `workload_slug` from the project. Returns `True` if it existed and was removed, `False` if it was already gone. It is **idempotent** — deleting something that isn't there is not an error — so it's safe to call on shutdown without checking first. `project` falls back to the client's project (or `INFERENCEKEY_PROJECT`) when omitted, exactly like [`ensure`](#ensure). Lives on the **`ManagementClient`** (control plane): it uses the `ik_sdk_` token's *delete workloads* capability and is scoped to that token's project. A token for another project, or one lacking the capability, raises [`PermissionDenied`](#permissiondenied).
+
+<Aside type="caution" title="Destructive — and it stops the bill">
+Deleting a workload is **irreversible**. For an `autoscaling` or `scheduled` workload, delete also **tears down the cloud GPU** the platform provisioned for it — that is how you stop paying for it. For a `fixed` workload, or any **private** worker you registered, delete only **unassigns** it: your own machine is never destroyed, just detached from the workload.
+</Aside>
+
+```python
+existed = mgmt.delete(ref.workload_slug)
+print("deleted" if existed else "already gone")
+```
+
+See [Clean up on exit](#clean-up-on-exit) for the recommended shutdown pattern.
 
 ## DataClient
 
@@ -420,6 +444,20 @@ except InferenceKeyError as e:
     print(f"Provisioning failed: {e}")
 ```
 
+## Clean up on exit
+
+Delete the workload when your program ends so a run doesn't leave it — and any cloud GPU the platform provisioned for it — running and billing. Put the [`delete`](#delete) in a `finally` so it runs on a clean exit, an error, **and** a `KeyboardInterrupt` (Ctrl+C):
+
+```python
+mgmt = ManagementClient.from_env(project="acme")
+ref = mgmt.ensure(spec)
+try:
+    mgmt.wait_until_ready(ref.workload_slug, timeout=600)
+    # … use the endpoint …
+finally:
+    mgmt.delete(ref.workload_slug)  # idempotent; safe to always call
+```
+
 ## End-to-end
 
 <Steps>
@@ -446,6 +484,12 @@ except InferenceKeyError as e:
    ep = data.endpoint(ref.workload_slug, api_key="ik_live_...")
    out = ep.generate_text(prompt="Hola", temperature=0.2, max_tokens=300)
    print(out.text)
+   ```
+
+3. Delete it when you're done, so nothing keeps running.
+
+   ```python
+   mgmt.delete(ref.workload_slug)
    ```
 
 </Steps>
