@@ -18,9 +18,15 @@ export default defineConfig({
       title: "InferenceKey SDK",
       description:
         "Declare AI workloads in code, ensure they exist on the platform, and call the resulting OpenAI-compatible endpoints.",
-      // Brand: the iK monogram as the top-bar logo + favicon, the brand theme
-      // CSS, and the brand web fonts. Assets come from docs/brand/logos.
-      logo: { src: "./src/assets/brand/symbol-ik.svg", alt: "InferenceKey" },
+      // Brand: the InferenceKey wordmark as the top-bar logo (replacing the
+      // "InferenceKey SDK" text), per-theme so it reads on dark and light.
+      // The iK monogram stays as the favicon. Assets come from docs/brand/logos.
+      logo: {
+        dark: "./src/assets/brand/wordmark-dark.svg",
+        light: "./src/assets/brand/wordmark-light.svg",
+        alt: "InferenceKey",
+        replacesTitle: true,
+      },
       favicon: "/favicon.svg",
       customCss: ["./src/styles/brand.css"],
       head: [
