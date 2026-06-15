@@ -217,6 +217,10 @@ You need:
   </Card>
 </CardGrid>
 
+<Aside type="tip" title="Delete it when you're done">
+Closing the loop: `mgmt.delete("support-bot")` removes the workload — and, for an `autoscaling`/`scheduled` one, tears down the cloud GPU the platform provisioned, so you stop paying for it. It's idempotent, so put it in a `finally` (or a shutdown handler) to clean up on exit. See [`delete`](/en/api/python/#delete) ([TypeScript](/en/api/typescript/#mgmtdeleteworkloadslug-opts)).
+</Aside>
+
 ## Next steps
 
 <CardGrid>

@@ -20,8 +20,8 @@ privilege):
   </Card>
 </CardGrid>
 
-All network methods (`ensure`, `generateText`, `embed`) are `async` and return
-Promises.
+All network methods (`ensure`, `delete`, `generateText`, `embed`) are `async`
+and return Promises.
 
 ## Install
 
@@ -141,6 +141,40 @@ await mgmt.waitUntilReady(ref.workloadSlug, {
   onProgress: (e) => console.log(e.phase, e.message),
 });
 ```
+
+### `mgmt.delete(workloadSlug, opts?)`
+
+```ts
+async delete(
+  workloadSlug: string,
+  opts?: { project?: string },
+): Promise<boolean>
+```
+
+Deletes the workload named by `workloadSlug`. Resolves to `true` if it existed
+and was removed, `false` if it was already gone. It is **idempotent** — deleting
+something that isn't there is not an error — so it's safe to call on shutdown
+without checking first. `project` falls back to the client's project (or
+`INFERENCEKEY_PROJECT`) when omitted, exactly like
+[`ensure`](#mgmtensurespec-opts). Lives on the **`ManagementClient`** (control
+plane): it uses the `ik_sdk_` token's *delete workloads* capability and is scoped
+to that token's project. A token for another project, or one lacking the
+capability, rejects with `PermissionDenied`.
+
+<Aside type="caution" title="Destructive — and it stops the bill">
+Deleting a workload is **irreversible**. For an `autoscaling` or `scheduled`
+workload, delete also **tears down the cloud GPU** the platform provisioned for
+it — that is how you stop paying for it. For a `fixed` workload, or any
+**private** worker you registered, delete only **unassigns** it: your own machine
+is never destroyed, just detached from the workload.
+</Aside>
+
+```ts
+const existed = await mgmt.delete(ref.workloadSlug);
+console.log(existed ? "deleted" : "already gone");
+```
+
+See [Clean up on exit](#clean-up-on-exit) for the recommended shutdown pattern.
 
 ## DataClient
 
@@ -382,6 +416,29 @@ const OnDrift = {
 `Reconcile` is the default for `ensure()`. See
 [OnDrift](/en/reference/ondrift/) for what each mode does.
 
+## Clean up on exit
+
+Delete the workload when your program ends so a run doesn't leave it — and any
+cloud GPU the platform provisioned for it — running and billing. Run the
+[`delete`](#mgmtdeleteworkloadslug-opts) on every exit path, since which one you
+hit depends on how the program stops:
+
+```ts
+const cleanup = async () => { await mgmt.delete(ref.workloadSlug); };
+
+// Signals: a kill, or Ctrl+C when not sitting at a readline prompt.
+process.on("SIGINT", () => cleanup().then(() => process.exit(0)));
+process.on("SIGTERM", () => cleanup().then(() => process.exit(0)));
+
+try {
+  await mgmt.waitUntilReady(ref.workloadSlug, { timeoutMs: 600_000 });
+  // … use the endpoint …
+} finally {
+  await cleanup(); // clean end or an error — delete is idempotent, so a
+                   // double call from a signal + finally is harmless.
+}
+```
+
 ## End to end
 
 <Tabs syncKey="lang">
@@ -413,6 +470,9 @@ const out = await ep.generateText({
   maxTokens: 300,
 });
 console.log(out.text);
+
+// 3. Delete it when you're done, so nothing keeps running.
+await mgmt.delete(ref.workloadSlug);
 ```
 
   </TabItem>
@@ -431,6 +491,9 @@ data = DataClient.from_env(project="acme")
 ep = data.endpoint(ref.workload_slug, api_key="ik_live_...")
 out = ep.generate_text(prompt="Hola", temperature=0.2, max_tokens=300)
 print(out.text)
+
+# Delete it when you're done, so nothing keeps running.
+mgmt.delete(ref.workload_slug)
 ```
 
   </TabItem>
