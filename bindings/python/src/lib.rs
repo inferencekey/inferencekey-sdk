@@ -10,21 +10,27 @@
 // macro-generated false positive, not our code — silence it crate-wide.
 #![allow(clippy::useless_conversion)]
 
-use pyo3::exceptions::{PyPermissionError, PyRuntimeError, PyValueError};
+use std::sync::Arc;
+
+use futures_util::stream::{BoxStream, StreamExt};
+use pyo3::exceptions::{PyPermissionError, PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 
 use inferencekey_core::ports::http::HttpPort;
 use inferencekey_core::{
-    embed, ensure, generate_text, CoreError, EmbedParams, GenerateTextParams, OnDrift, ReqwestHttp,
-    WorkloadSpec,
+    embed, ensure, generate_text, generate_text_stream, CoreError, CoreResult, EmbedParams,
+    GenerateTextParams, OnDrift, ReqwestHttp, TextChunk, WorkloadSpec,
 };
 
 /// The native client: a base URL, the HTTP transport, and a blocking runtime.
+///
+/// The runtime is shared (via `Arc`) with any [`ChatStream`] this client opens,
+/// since each `__next__` drives the same reactor to pull one chunk.
 #[pyclass]
 struct Client {
     base_url: String,
-    http: ReqwestHttp,
-    runtime: tokio::runtime::Runtime,
+    http: Arc<ReqwestHttp>,
+    runtime: Arc<tokio::runtime::Runtime>,
 }
 
 #[pymethods]
@@ -38,8 +44,8 @@ impl Client {
             .map_err(|e| PyRuntimeError::new_err(format!("failed to start runtime: {e}")))?;
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_owned(),
-            http: ReqwestHttp::new(),
-            runtime,
+            http: Arc::new(ReqwestHttp::new()),
+            runtime: Arc::new(runtime),
         })
     }
 
@@ -93,6 +99,40 @@ impl Client {
         result.map_err(map_core_error).and_then(to_json)
     }
 
+    /// Open a streaming chat completion. `params_json` is a JSON
+    /// `GenerateTextParams`; returns a [`ChatStream`] iterator whose `__next__`
+    /// yields one `TextChunk` JSON string per SSE frame.
+    ///
+    /// The SSE connection is opened here (so auth/4xx errors raise immediately),
+    /// then chunks are pulled lazily as the iterator is advanced.
+    fn generate_text_stream(
+        &self,
+        py: Python<'_>,
+        project_slug: &str,
+        workload_slug: &str,
+        api_key: &str,
+        params_json: &str,
+    ) -> PyResult<ChatStream> {
+        let params: GenerateTextParams = parse_json(params_json)?;
+        let stream = py.allow_threads(|| {
+            self.block_on(generate_text_stream(
+                self.port(),
+                &self.base_url,
+                project_slug,
+                workload_slug,
+                api_key,
+                params,
+            ))
+        });
+        let stream = stream.map_err(map_core_error)?;
+        Ok(ChatStream {
+            runtime: self.runtime.clone(),
+            // Keep the transport alive for as long as the stream is consumed.
+            _http: self.http.clone(),
+            inner: Some(stream),
+        })
+    }
+
     /// Run an embeddings request. `params_json` is a JSON `EmbedParams`;
     /// returns an `EmbedResult` as JSON.
     fn embed(
@@ -120,11 +160,52 @@ impl Client {
 
 impl Client {
     fn port(&self) -> &dyn HttpPort {
-        &self.http
+        self.http.as_ref()
     }
 
     fn block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
         self.runtime.block_on(fut)
+    }
+}
+
+/// A live streaming chat completion exposed to Python as an iterator.
+///
+/// Implements the iterator protocol: `__iter__` returns self and each
+/// `__next__` drives the shared runtime to pull one chunk, releasing the GIL
+/// across the blocking await. Exhaustion raises `StopIteration`; the typed
+/// Python wrapper turns each chunk-JSON string into a `TextChunk`.
+#[pyclass]
+struct ChatStream {
+    runtime: Arc<tokio::runtime::Runtime>,
+    // Held only to keep the transport alive while the stream is consumed.
+    _http: Arc<ReqwestHttp>,
+    // `None` once the stream is exhausted, so further `__next__` calls are a
+    // clean `StopIteration` rather than re-polling a finished stream.
+    inner: Option<BoxStream<'static, CoreResult<TextChunk>>>,
+}
+
+#[pymethods]
+impl ChatStream {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Advance the stream by one chunk. Returns the chunk as a JSON string, or
+    /// raises `StopIteration` at end of stream.
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<String> {
+        let runtime = self.runtime.clone();
+        let Some(stream) = self.inner.as_mut() else {
+            return Err(PyStopIteration::new_err(()));
+        };
+        let next = py.allow_threads(|| runtime.block_on(stream.next()));
+        match next {
+            Some(Ok(chunk)) => to_json(chunk),
+            Some(Err(e)) => Err(map_core_error(e)),
+            None => {
+                self.inner = None;
+                Err(PyStopIteration::new_err(()))
+            }
+        }
     }
 }
 
@@ -167,5 +248,6 @@ fn map_core_error(err: CoreError) -> PyErr {
 #[pymodule]
 fn _inferencekey(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Client>()?;
+    m.add_class::<ChatStream>()?;
     Ok(())
 }

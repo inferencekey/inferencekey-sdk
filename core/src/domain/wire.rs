@@ -36,6 +36,14 @@ pub struct CreateWorkloadRequest {
     pub worker_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_resource_id: Option<String>,
+    // The execution policy declared on the spec must ride the create body too —
+    // otherwise a workload is born with the server's default policy and only
+    // reconciles to the declared one on a later PATCH. Both are omitted when the
+    // spec leaves them unset, falling back to the server default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_policy: Option<ExecutionPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_policy_config: Option<Value>,
 }
 
 /// Control-plane update body: `PATCH /api/workloads/:id`. Every field is
@@ -125,6 +133,8 @@ pub fn to_create_request(spec: &WorkloadSpec) -> CreateWorkloadRequest {
         config: build_config(spec),
         worker_id: spec.worker_id.clone(),
         gpu_resource_id: spec.gpu_resource_id.clone(),
+        execution_policy: spec.execution_policy,
+        execution_policy_config: spec.execution_policy_config.clone(),
     }
 }
 
@@ -358,6 +368,8 @@ mod tests {
                     config: Some(json!({ "command": "vllm serve meta-llama/Llama-3.1-8B-Instruct" })),
                     worker_id: None,
                     gpu_resource_id: None,
+                    execution_policy: None,
+                    execution_policy_config: None,
                 },
             },
             Case {
@@ -368,6 +380,8 @@ mod tests {
                     command: None,
                     worker_id: Some("w1".to_string()),
                     gpu_resource_id: Some("g1".to_string()),
+                    execution_policy: Some(ExecutionPolicy::Autoscaling),
+                    execution_policy_config: Some(json!({ "min_replicas": 1, "max_replicas": 1 })),
                     ..s
                 },
                 expected: CreateWorkloadRequest {
@@ -379,6 +393,8 @@ mod tests {
                     config: None,
                     worker_id: Some("w1".to_string()),
                     gpu_resource_id: Some("g1".to_string()),
+                    execution_policy: Some(ExecutionPolicy::Autoscaling),
+                    execution_policy_config: Some(json!({ "min_replicas": 1, "max_replicas": 1 })),
                 },
             },
         ];
@@ -400,6 +416,27 @@ mod tests {
         // task_type rides the existing TaskType serde, whatever it renders to.
         let expected_task = serde_json::to_value(TaskType::Text2Text).expect("task_type");
         assert_eq!(obj.get("task_type"), Some(&expected_task));
+        // An undeclared policy is omitted, so the server applies its default.
+        assert!(!obj.contains_key("execution_policy"));
+        assert!(!obj.contains_key("execution_policy_config"));
+    }
+
+    #[test]
+    fn create_request_carries_declared_execution_policy() {
+        // A declared policy must ride the create body, not just a later PATCH —
+        // otherwise the workload is born with the wrong scheduling.
+        let spec = WorkloadSpec {
+            execution_policy: Some(ExecutionPolicy::Autoscaling),
+            execution_policy_config: Some(json!({ "min_replicas": 1, "max_replicas": 1 })),
+            ..base_spec()
+        };
+        let value = serde_json::to_value(to_create_request(&spec)).expect("serialize");
+        let obj = value.as_object().expect("object");
+        assert_eq!(obj.get("execution_policy"), Some(&json!("autoscaling")));
+        assert_eq!(
+            obj.get("execution_policy_config"),
+            Some(&json!({ "min_replicas": 1, "max_replicas": 1 }))
+        );
     }
 
     #[test]

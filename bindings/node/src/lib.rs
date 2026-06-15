@@ -11,14 +11,17 @@
 
 use std::sync::Arc;
 
+use futures_util::stream::{BoxStream, StreamExt};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use tokio::sync::Mutex;
 
 use inferencekey_core::ports::http::HttpPort;
 use inferencekey_core::{
-    embed, ensure, generate_text, CoreError, EmbedParams, GenerateTextParams, OnDrift, ReqwestHttp,
-    WorkloadSpec,
+    embed, ensure, generate_text, generate_text_stream, CoreError, EmbedParams, GenerateTextParams,
+    OnDrift, ReqwestHttp, TextChunk,
 };
+use inferencekey_core::WorkloadSpec;
 
 /// The native client handed to JavaScript.
 #[napi]
@@ -91,6 +94,39 @@ impl Client {
         to_json(result)
     }
 
+    /// Open a streaming chat completion. `params_json` is a JSON
+    /// `GenerateTextParams`; resolves to a [`ChatStream`] handle whose `next()`
+    /// yields one chunk-JSON string per SSE frame and `null` at end of stream.
+    ///
+    /// The SSE connection is established here (so auth/4xx errors surface up
+    /// front, before iteration); each chunk is then pulled lazily by `next()`.
+    #[napi]
+    pub async fn generate_text_stream(
+        &self,
+        project_slug: String,
+        workload_slug: String,
+        api_key: String,
+        params_json: String,
+    ) -> Result<ChatStream> {
+        let params: GenerateTextParams = parse_json(&params_json)?;
+        let http = self.http.clone();
+        let base_url = self.base_url.clone();
+        let stream = generate_text_stream(
+            port(&http),
+            &base_url,
+            &project_slug,
+            &workload_slug,
+            &api_key,
+            params,
+        )
+        .await
+        .map_err(map_core_error)?;
+        // Keep the transport alive for the stream's lifetime: the core's
+        // BoxStream borrows nothing (it is `'static`), but the underlying
+        // reqwest connection lives inside it, so the Arc must outlive iteration.
+        Ok(ChatStream::new(http, stream))
+    }
+
     /// Run an embeddings request. `params_json` is a JSON `EmbedParams`;
     /// resolves to an `EmbedResult` as JSON.
     #[napi]
@@ -115,6 +151,46 @@ impl Client {
         .await
         .map_err(map_core_error)?;
         to_json(result)
+    }
+}
+
+/// A live streaming chat completion handed to JavaScript.
+///
+/// Holds the core's chunk stream behind a `Mutex` (napi may call `next()` from
+/// any worker thread) and a clone of the transport `Arc` so the underlying
+/// connection outlives iteration. Each `next()` pulls one chunk; the TS wrapper
+/// adapts this into an `AsyncIterable` for `for await`.
+#[napi]
+pub struct ChatStream {
+    // Held only to keep the transport alive while the stream is consumed.
+    _http: Arc<ReqwestHttp>,
+    inner: Mutex<BoxStream<'static, inferencekey_core::CoreResult<TextChunk>>>,
+}
+
+impl ChatStream {
+    fn new(
+        http: Arc<ReqwestHttp>,
+        inner: BoxStream<'static, inferencekey_core::CoreResult<TextChunk>>,
+    ) -> Self {
+        Self {
+            _http: http,
+            inner: Mutex::new(inner),
+        }
+    }
+}
+
+#[napi]
+impl ChatStream {
+    /// Pull the next chunk as a `TextChunk` JSON string, or `null` when the
+    /// stream is exhausted. A transport/parse error rejects the promise.
+    #[napi]
+    pub async fn next(&self) -> Result<Option<String>> {
+        let mut stream = self.inner.lock().await;
+        match stream.next().await {
+            None => Ok(None),
+            Some(Ok(chunk)) => to_json(chunk).map(Some),
+            Some(Err(e)) => Err(map_core_error(e)),
+        }
     }
 }
 

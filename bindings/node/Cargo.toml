@@ -19,7 +19,8 @@ crate-type = ["cdylib"]
 inferencekey-core = { path = "../../core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+futures-util = { workspace = true }
 napi = { version = "2", default-features = false, features = ["napi6", "async"] }
 napi-derive = "2"
 

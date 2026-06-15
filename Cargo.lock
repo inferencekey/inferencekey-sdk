@@ -444,6 +444,7 @@ dependencies = [
 name = "inferencekey-node"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "inferencekey-core",
  "napi",
  "napi-build",
@@ -457,6 +458,7 @@ dependencies = [
 name = "inferencekey-python"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "inferencekey-core",
  "pyo3",
  "serde",

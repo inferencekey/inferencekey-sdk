@@ -14,12 +14,20 @@ from __future__ import annotations
 
 import json
 import os
-from typing import List, Optional, Union
+import time
+from typing import Iterator, List, Optional, Union
 
 from . import _inferencekey  # native extension
 from .enums import OnDrift
-from .errors import ApiError, AuthError, ConfigurationError, PermissionDenied, ValidationError
-from .types import EmbedResult, EndpointRef, TextResult, WorkloadSpec
+from .errors import (
+    ApiError,
+    AuthError,
+    ConfigurationError,
+    InferenceKeyError,
+    PermissionDenied,
+    ValidationError,
+)
+from .types import EmbedResult, EndpointRef, TextChunk, TextResult, WorkloadSpec
 
 _DEFAULT_BASE_URL = "https://api.inferencekey.com"
 
@@ -178,6 +186,102 @@ class Endpoint:
             finish_reason=data.get("finish_reason"),
             raw=data.get("raw", {}),
         )
+
+    def generate_text_stream(
+        self,
+        *,
+        prompt: Optional[str] = None,
+        messages: Optional[list] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> Iterator[TextChunk]:
+        """Run a streaming chat completion, yielding one :class:`TextChunk` per
+        SSE frame as tokens are produced.
+
+        The connection is opened eagerly (so auth/validation errors raise here,
+        not mid-iteration); each chunk is then pulled lazily as you iterate::
+
+            for chunk in ep.generate_text_stream(prompt="Hola"):
+                print(chunk.text, end="", flush=True)
+        """
+        params = _drop_none(
+            {
+                "prompt": prompt,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+        )
+        native_iter = _call(
+            self._native.generate_text_stream,
+            self._project_slug,
+            self.workload_slug,
+            self._api_key,
+            json.dumps(params),
+        )
+        return self._iter_chunks(native_iter)
+
+    @staticmethod
+    def _iter_chunks(native_iter) -> Iterator[TextChunk]:
+        """Adapt the native chunk-JSON iterator into typed ``TextChunk``s,
+        remapping any native error raised mid-stream to an SDK exception."""
+        while True:
+            try:
+                raw = next(native_iter)
+            except StopIteration:
+                return
+            except PermissionError as e:
+                raise PermissionDenied(str(e)) from None
+            except ValueError as e:
+                raise _value_error(str(e)) from None
+            except RuntimeError as e:
+                raise ApiError(str(e)) from None
+            data = json.loads(raw)
+            yield TextChunk(
+                text=data["text"],
+                finish_reason=data.get("finish_reason"),
+                raw=data.get("raw", {}),
+            )
+
+    def wait_until_ready(
+        self,
+        *,
+        timeout: float = 300.0,
+        interval: float = 2.0,
+        max_interval: float = 15.0,
+    ) -> None:
+        """Block until the workload's endpoint is serving, by probing it.
+
+        The control plane has no readiness flag, so this sends a tiny chat probe
+        and treats a transport/5xx failure as "still starting" — retrying with
+        exponential backoff up to ``max_interval`` — while a 401/403/404 (bad
+        key, wrong token type, unknown workload) is a real error that raises
+        immediately. Raises :class:`TimeoutError` if ``timeout`` elapses first.
+
+        Call this after ``ensure()`` provisions a cold worker, before streaming::
+
+            ep.wait_until_ready(timeout=600)
+            for chunk in ep.generate_text_stream(prompt="..."):
+                ...
+        """
+        deadline = time.monotonic() + timeout
+        delay = interval
+        while True:
+            try:
+                self.generate_text(prompt="ping", max_tokens=1)
+                return  # a successful completion means the worker is up.
+            except (PermissionDenied, AuthError, ValidationError) as e:
+                # Fatal: a wrong/instufficient credential or unknown workload
+                # will never become ready — surface it, do not spin.
+                raise e
+            except (ApiError, InferenceKeyError):
+                # Transport error or 5xx: the worker is likely still booting.
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f'workload "{self.workload_slug}" not ready after {timeout:.0f}s'
+                    ) from None
+                time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+                delay = min(delay * 2, max_interval)
 
     def embed(self, *, input: Union[str, List[str]]) -> EmbedResult:
         """Create embeddings for one or more inputs."""

@@ -74,6 +74,19 @@ class TextResult:
 
 
 @dataclass(frozen=True)
+class TextChunk:
+    """One streamed chunk of a chat completion (a ``chat.completion.chunk``).
+
+    ``text`` is the delta for this frame — concatenate chunks to rebuild the
+    full reply. ``finish_reason`` is set only on the terminal chunk.
+    """
+
+    text: str
+    finish_reason: Optional[str] = None
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class EmbedResult:
     """An embeddings result, one vector per input."""
 
