@@ -1,0 +1,27 @@
+[package]
+name = "inferencekey-node"
+description = "Node/TypeScript binding for the InferenceKey SDK (napi-rs over inferencekey-core)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+# napi-build emits the `cargo::` directive syntax (Rust >= 1.77); the bindings
+# are built with current toolchains in CI, so they carry a higher MSRV than the
+# conservative core/capi crates.
+rust-version = "1.77"
+
+[lib]
+name = "inferencekey_node"
+crate-type = ["cdylib"]
+
+[dependencies]
+inferencekey-core = { path = "../../core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+napi = { version = "2", default-features = false, features = ["napi6", "async"] }
+napi-derive = "2"
+
+[build-dependencies]
+napi-build = "2"

@@ -16,6 +16,7 @@
 //!   opaque [`serde_json::Value`] into typed results via `.get()` + `ok_or_else`.
 
 use futures_util::stream::{BoxStream, StreamExt};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::errors::{CoreError, CoreResult};
@@ -26,7 +27,7 @@ use crate::ports::http::{HttpMethod, HttpPort, HttpRequest};
 // ---------------------------------------------------------------------------
 
 /// A single chat turn. `role` is one of `system` / `user` / `assistant`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
@@ -36,16 +37,20 @@ pub struct ChatMessage {
 ///
 /// Exactly one of `prompt` or `messages` must be supplied (see
 /// [`resolve_messages`]); a bare `prompt` is lifted into a single `user` turn.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GenerateTextParams {
+    #[serde(default)]
     pub prompt: Option<String>,
+    #[serde(default)]
     pub messages: Option<Vec<ChatMessage>>,
+    #[serde(default)]
     pub temperature: Option<f64>,
+    #[serde(default)]
     pub max_tokens: Option<u32>,
 }
 
 /// A completed (non-streamed) chat result.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TextResult {
     pub text: String,
     pub model: String,
@@ -55,7 +60,7 @@ pub struct TextResult {
 }
 
 /// One streamed chunk (`chat.completion.chunk`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TextChunk {
     pub text: String,
     pub finish_reason: Option<String>,
@@ -64,13 +69,13 @@ pub struct TextChunk {
 }
 
 /// Inputs for [`embed`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbedParams {
     pub input: Vec<String>,
 }
 
 /// An embeddings result, one vector per input in request order.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmbedResult {
     pub embeddings: Vec<Vec<f64>>,
     pub model: String,

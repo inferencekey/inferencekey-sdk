@@ -1,0 +1,35 @@
+{
+  "name": "@inferencekey/sdk",
+  "version": "0.1.0",
+  "description": "Official InferenceKey SDK — declare AI workloads in code, ensure they exist, and call the resulting OpenAI-compatible endpoints. Native addon over the Rust core.",
+  "license": "Apache-2.0",
+  "author": "InferenceKey <dev@inferencekey.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/inferencekey/inferencekey-sdk.git",
+    "directory": "bindings/node"
+  },
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node"
+  ],
+  "napi": {
+    "name": "inferencekey",
+    "triples": {
+      "defaults": true
+    }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0"
+  }
+}
