@@ -78,6 +78,31 @@ ref = mgmt.ensure(WorkloadSpec(
 print(ref.project_slug, ref.workload_slug)
 ```
 
+### wait_until_ready
+
+```python
+def wait_until_ready(
+    self,
+    workload_slug: str,
+    *,
+    project: str | None = None,
+    timeout: float = 600.0,
+    on_progress: Callable[[ReadinessEvent], None] | None = None,
+    silent: bool = False,
+) -> None
+```
+
+Wait until `workload_slug` is serving, reporting progress as the platform schedules a worker, provisions a cloud GPU, and boots the runtime. Returns when the platform reports the `ready` phase; raises [`ApiError`](#apierror) on an `error` phase or `TimeoutError` after `timeout` seconds.
+
+This lives on the **`ManagementClient`** (control plane): progress is streamed over the `ik_sdk_` token, so no `ik_live_` data key is needed. By default it prints a live progress view to the terminal (a phase bar on a TTY, plain lines in CI); pass your own `on_progress` to handle each [`ReadinessEvent`](#readinessevent) yourself, or `silent=True` to suppress output. Call it right after `ensure()` provisions a cold worker.
+
+```python
+ref = mgmt.ensure(spec)
+mgmt.wait_until_ready(ref.workload_slug, timeout=600)
+# or handle progress yourself:
+mgmt.wait_until_ready(ref.workload_slug, on_progress=lambda e: print(e.phase, e.message))
+```
+
 ## DataClient
 
 Data-plane client. Derive an [`Endpoint`](#endpoint) per workload, each bound to its own `ik_live_` key — so one app can drive several workloads with different keys.
@@ -161,26 +186,6 @@ Run a **streaming** chat completion. Same parameters as [`generate_text`](#gener
 
 ```python
 for chunk in ep.generate_text_stream(prompt="Hola"):
-    print(chunk.text, end="", flush=True)
-```
-
-### wait_until_ready
-
-```python
-def wait_until_ready(
-    self,
-    *,
-    timeout: float = 300.0,
-    interval: float = 2.0,
-    max_interval: float = 15.0,
-) -> None
-```
-
-Block until the workload's endpoint is serving. The control plane has no readiness flag, so this sends a tiny chat probe and retries with exponential backoff (up to `max_interval`) while the worker is still starting (transport / 5xx). A `401`/`403`/`404` (bad key, wrong token type, unknown workload) raises immediately rather than spinning. Raises `TimeoutError` if `timeout` elapses first. Useful right after `ensure()` provisions a cold worker, before the first call.
-
-```python
-ep.wait_until_ready(timeout=600)
-for chunk in ep.generate_text_stream(prompt="..."):
     print(chunk.text, end="", flush=True)
 ```
 
@@ -285,6 +290,26 @@ class TextChunk:
 | `text` | `str` | The delta for this chunk. Concatenate across chunks to rebuild the full reply. |
 | `finish_reason` | `str \| None` | Set only on the terminal chunk (e.g. `stop`, `length`). |
 | `raw` | `dict` | The underlying chunk JSON, untouched. |
+
+## ReadinessEvent
+
+Frozen dataclass passed to the `on_progress` callback of [`wait_until_ready`](#wait_until_ready) — one per progress update while a workload comes up.
+
+```python
+@dataclass(frozen=True)
+class ReadinessEvent:
+    phase: str
+    message: str
+    elapsed_ms: int = 0
+    step: str | None = None
+```
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `phase` | `str` | `scheduling` / `provisioning` / `bootstrapping` / `ready` / `error`. `ready` means serving; `error` is terminal. |
+| `message` | `str` | Short, printable description of what the platform is doing. |
+| `elapsed_ms` | `int` | Milliseconds since the wait started. |
+| `step` | `str \| None` | Allow-listed bootstrap step (e.g. `model_load`), when applicable. |
 
 ## EmbedResult
 

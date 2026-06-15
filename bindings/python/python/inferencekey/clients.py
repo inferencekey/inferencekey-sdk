@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 from typing import Callable, Iterator, List, Optional, Union
 
@@ -138,7 +139,10 @@ class ManagementClient:
             raise ConfigurationError(
                 "No project configured. Set INFERENCEKEY_PROJECT or pass project=."
             )
-        render = on_progress or (_noop_progress if silent else _make_progress_renderer())
+        # The built-in view animates a clock between events via a background
+        # ticker; a caller's on_progress and the silent path get events only.
+        renderer = None if (on_progress or silent) else _make_progress_renderer()
+        on_event = on_progress or _noop_progress
 
         native_iter = _call(
             self._native.readiness_events,
@@ -146,36 +150,62 @@ class ManagementClient:
             project_id,
             workload_slug,
         )
-        deadline = time.monotonic() + timeout
-        while True:
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f'workload "{workload_slug}" not ready after {timeout:.0f}s'
+        # Advance the on-screen seconds counter ~1×/s between server events so a
+        # long cold start doesn't look frozen while the main thread blocks on
+        # next(). Keyed off a local clock (the server only restamps elapsed per
+        # event). A daemon thread so it never keeps the process alive.
+        started = time.monotonic()
+        ticker_stop = threading.Event()
+
+        def _run_ticker() -> None:
+            while not ticker_stop.wait(1.0):
+                renderer.tick(round((time.monotonic() - started) * 1000))
+
+        ticker: Optional[threading.Thread] = None
+        if renderer is not None:
+            ticker = threading.Thread(target=_run_ticker, name="ik-readiness-ticker", daemon=True)
+            ticker.start()
+
+        try:
+            deadline = started + timeout
+            while True:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f'workload "{workload_slug}" not ready after {timeout:.0f}s'
+                    )
+                try:
+                    raw = next(native_iter)
+                except StopIteration:
+                    return  # stream ended without an explicit ready
+                except PermissionError as e:
+                    raise PermissionDenied(str(e)) from None
+                except ValueError as e:
+                    raise _value_error(str(e)) from None
+                except RuntimeError as e:
+                    raise ApiError(str(e)) from None
+                data = json.loads(raw)
+                event = ReadinessEvent(
+                    phase=data["phase"],
+                    message=data["message"],
+                    elapsed_ms=data.get("elapsed_ms", 0),
+                    step=data.get("step"),
                 )
-            try:
-                raw = next(native_iter)
-            except StopIteration:
-                return  # stream ended without an explicit ready
-            except PermissionError as e:
-                raise PermissionDenied(str(e)) from None
-            except ValueError as e:
-                raise _value_error(str(e)) from None
-            except RuntimeError as e:
-                raise ApiError(str(e)) from None
-            data = json.loads(raw)
-            event = ReadinessEvent(
-                phase=data["phase"],
-                message=data["message"],
-                elapsed_ms=data.get("elapsed_ms", 0),
-                step=data.get("step"),
-            )
-            render(event)
-            if event.phase == "ready":
-                return
-            if event.phase == "error":
-                raise ApiError(
-                    f'workload "{workload_slug}" failed to become ready: {event.message}'
-                )
+                # The built-in renderer shares the ticker's local clock so the
+                # counter never jumps; a caller's on_progress gets the event verbatim.
+                if renderer is not None:
+                    renderer.render(event, round((time.monotonic() - started) * 1000))
+                else:
+                    on_event(event)
+                if event.phase == "ready":
+                    return
+                if event.phase == "error":
+                    raise ApiError(
+                        f'workload "{workload_slug}" failed to become ready: {event.message}'
+                    )
+        finally:
+            ticker_stop.set()
+            if ticker is not None:
+                ticker.join(timeout=2.0)
 
 
 class DataClient:
@@ -339,20 +369,27 @@ def _noop_progress(_event: ReadinessEvent) -> None:
     pass
 
 
-def _make_progress_renderer() -> Callable[[ReadinessEvent], None]:
-    """Default terminal progress renderer for :meth:`ManagementClient.wait_until_ready`.
+class _ProgressRenderer:
+    """Default terminal progress view for :meth:`ManagementClient.wait_until_ready`.
 
-    On a TTY it redraws a single line of phase dots with the current message and
-    elapsed time; off a TTY (CI / piped) it prints one plain line per event.
+    ``render`` paints on each readiness event; ``tick`` repaints the same line
+    with a freshly elapsed clock between events so the seconds counter keeps
+    moving during long waits (cold starts can go minutes between server events).
+    On a TTY it redraws a single line of phase dots; off a TTY (CI / piped) it
+    prints one plain line per event and ``tick`` is a no-op (no clock to animate).
     """
-    is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
 
-    def render(event: ReadinessEvent) -> None:
-        secs = round(event.elapsed_ms / 1000)
-        if not is_tty:
-            step = f" [{event.step}]" if event.step else ""
-            print(f"[{secs}s] {event.phase}{step}: {event.message}")
-            return
+    def __init__(self) -> None:
+        self._is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        # The most recent event, retained so ``tick`` can repaint the same
+        # phase/message with an updated clock. Guards stdout against the main
+        # thread (``render``) and the ticker thread (``tick``) interleaving.
+        self._last: Optional[ReadinessEvent] = None
+        self._done = False
+        self._lock = threading.Lock()
+
+    def _paint(self, event: ReadinessEvent, elapsed_ms: int) -> None:
+        secs = round(elapsed_ms / 1000)
         if event.phase == "error":
             reached = len(_READINESS_PHASES) - 1
         else:
@@ -372,4 +409,30 @@ def _make_progress_renderer() -> Callable[[ReadinessEvent], None]:
             sys.stdout.write("\n")
         sys.stdout.flush()
 
-    return render
+    def render(self, event: ReadinessEvent, elapsed_ms: Optional[int] = None) -> None:
+        """Paint on a new event. ``elapsed_ms``, when given, overrides the
+        server's ``event.elapsed_ms`` for the on-screen clock (TTY only) so it
+        stays monotonic with ``tick``'s local clock."""
+        if not self._is_tty:
+            secs = round(event.elapsed_ms / 1000)
+            step = f" [{event.step}]" if event.step else ""
+            print(f"[{secs}s] {event.phase}{step}: {event.message}")
+            return
+        with self._lock:
+            self._last = event
+            self._paint(event, event.elapsed_ms if elapsed_ms is None else elapsed_ms)
+            if event.phase in ("ready", "error"):
+                self._done = True
+
+    def tick(self, elapsed_ms: int) -> None:
+        """Repaint the last phase/message with an updated clock (TTY only)."""
+        if not self._is_tty:
+            return
+        with self._lock:
+            if self._done or self._last is None:
+                return
+            self._paint(self._last, elapsed_ms)
+
+
+def _make_progress_renderer() -> _ProgressRenderer:
+    return _ProgressRenderer()
