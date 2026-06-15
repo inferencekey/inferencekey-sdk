@@ -1,0 +1,27 @@
+# Rust core + capi
+/target/
+**/target/
+Cargo.lock.bak
+*.rs.bk
+
+# Node / TypeScript bindings
+node_modules/
+dist/
+*.tsbuildinfo
+.npmrc
+*.node
+
+# Python bindings (pyo3 / maturin)
+__pycache__/
+*.egg-info/
+.venv/
+build/
+*.so
+*.pyd
+wheels/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.log
