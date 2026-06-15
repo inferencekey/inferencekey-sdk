@@ -9,9 +9,11 @@
     "url": "https://github.com/inferencekey/inferencekey-sdk.git",
     "directory": "bindings/node"
   },
-  "main": "index.js",
-  "types": "index.d.ts",
+  "main": "lib.js",
+  "types": "lib.d.ts",
   "files": [
+    "lib.js",
+    "lib.d.ts",
     "index.js",
     "index.d.ts",
     "*.node"
@@ -26,10 +28,13 @@
     "node": ">=18"
   },
   "scripts": {
-    "build": "napi build --platform --release",
-    "build:debug": "napi build --platform"
+    "build": "napi build --platform --release && tsc",
+    "build:debug": "napi build --platform && tsc",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^2.18.0"
+    "@napi-rs/cli": "^2.18.4",
+    "@types/node": "^20.19.43",
+    "typescript": "^6.0.3"
   }
 }
