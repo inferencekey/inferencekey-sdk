@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 160" width="720" height="160" role="img" aria-label="InferenceKey">
+  <!-- Wordmark para fondos claros: INFERENCE en tinta oscura + KEY en cyan.
+       Fondo transparente para incrustarlo sobre documentos blancos. -->
+  <text x="360" y="98" text-anchor="middle"
+        font-family="'Space Grotesk', 'Inter', system-ui, sans-serif"
+        font-size="60" font-weight="700" letter-spacing="8">
+    <tspan fill="#07090b">INFERENCE</tspan><tspan fill="#0fa89e">KEY</tspan>
+  </text>
+</svg>
