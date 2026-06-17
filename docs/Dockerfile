@@ -17,5 +17,7 @@ FROM nginx:1.27-alpine
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/dist /usr/share/nginx/html
 EXPOSE 80
-HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://localhost/ >/dev/null 2>&1 || exit 1
+# No container HEALTHCHECK: this is a static nginx file server and the reverse
+# proxy already health-checks it. A failing in-container probe was recycling
+# the Swarm task in a loop (graceful SIGQUIT → exit 0 → "Complete" → reschedule).
 CMD ["nginx", "-g", "daemon off;"]
