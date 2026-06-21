@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640" role="img" aria-label="InferenceKey SDK — Workloads in code. Endpoints in minutes.">
+  <!-- Banner de marca para el README del SDK. Paleta y tipografía de docs/brand:
+       cyan #1fd4c8 sobre near-black #07090b, Space Grotesk display. Versionado
+       como JPG (assets/banner.jpg) generado desde este SVG con rsvg-convert+sips. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#07090b"/>
+      <stop offset="1" stop-color="#0c1013"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.42" r="0.55">
+      <stop offset="0" stop-color="#1fd4c8" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#1fd4c8" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <rect width="1280" height="640" fill="url(#glow)"/>
+
+  <!-- Rejilla sutil tipo "infra" -->
+  <g stroke="#1fd4c8" stroke-opacity="0.06" stroke-width="1">
+    <path d="M0 160 H1280 M0 320 H1280 M0 480 H1280"/>
+    <path d="M256 0 V640 M512 0 V640 M768 0 V640 M1024 0 V640"/>
+  </g>
+
+  <!-- Monograma iK -->
+  <g transform="translate(496,150)">
+    <rect width="120" height="120" rx="28" fill="#07090b" stroke="#1fd4c8" stroke-opacity="0.35" stroke-width="2"/>
+    <text x="60" y="90" font-family="'JetBrains Mono', ui-monospace, monospace"
+          font-size="74" font-weight="700" fill="#1fd4c8" text-anchor="middle">iK</text>
+  </g>
+  <text x="640" y="300" text-anchor="middle"
+        font-family="'Space Grotesk', 'Inter', system-ui, sans-serif"
+        font-size="20" font-weight="600" letter-spacing="14" fill="#5b6b6a">SOFTWARE&#160;&#160;DEVELOPMENT&#160;&#160;KIT</text>
+
+  <!-- Wordmark INFERENCEKEY -->
+  <text x="640" y="380" text-anchor="middle"
+        font-family="'Space Grotesk', 'Inter', system-ui, sans-serif"
+        font-size="88" font-weight="700" letter-spacing="6">
+    <tspan fill="#ffffff">INFERENCE</tspan><tspan fill="#1fd4c8">KEY</tspan>
+  </text>
+
+  <!-- Tagline canónico (= hero de docs) -->
+  <text x="640" y="450" text-anchor="middle"
+        font-family="'Inter', system-ui, sans-serif"
+        font-size="30" font-weight="500" fill="#c7d0cf">Workloads in code. Endpoints in minutes.</text>
+
+  <!-- Chips de capacidad -->
+  <g font-family="'JetBrains Mono', ui-monospace, monospace" font-size="20" font-weight="500">
+    <g transform="translate(360,508)">
+      <rect width="150" height="44" rx="22" fill="#1fd4c8" fill-opacity="0.08" stroke="#1fd4c8" stroke-opacity="0.3"/>
+      <text x="75" y="29" text-anchor="middle" fill="#9af0e9">ensure()</text>
+    </g>
+    <g transform="translate(528,508)">
+      <rect width="224" height="44" rx="22" fill="#1fd4c8" fill-opacity="0.08" stroke="#1fd4c8" stroke-opacity="0.3"/>
+      <text x="112" y="29" text-anchor="middle" fill="#9af0e9">OpenAI-compatible</text>
+    </g>
+    <g transform="translate(770,508)">
+      <rect width="150" height="44" rx="22" fill="#1fd4c8" fill-opacity="0.08" stroke="#1fd4c8" stroke-opacity="0.3"/>
+      <text x="75" y="29" text-anchor="middle" fill="#9af0e9">Rust core</text>
+    </g>
+  </g>
+</svg>
