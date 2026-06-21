@@ -1,0 +1,20 @@
+# Secrets — every example reads tokens/ids from the environment or a local
+# .env; never commit a real one. `.env.example` (placeholders only) is tracked.
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Node / TypeScript
+node_modules/
+package-lock.json
+dist/
+*.tsbuildinfo
+
+# Editor / OS
+.DS_Store
+*.log
