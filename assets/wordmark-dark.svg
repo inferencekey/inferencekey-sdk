@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 160" width="720" height="160" role="img" aria-label="InferenceKey">
+  <!-- Wordmark sobre fondo oscuro: INFERENCE en blanco + KEY en cyan.
+       Replica el header de la landing y del manager (Space Grotesk, tracking 0.14em). -->
+  <rect width="720" height="160" fill="#07090b"/>
+  <text x="360" y="98" text-anchor="middle"
+        font-family="'Space Grotesk', 'Inter', system-ui, sans-serif"
+        font-size="60" font-weight="700" letter-spacing="8">
+    <tspan fill="#ffffff">INFERENCE</tspan><tspan fill="#1fd4c8">KEY</tspan>
+  </text>
+</svg>
