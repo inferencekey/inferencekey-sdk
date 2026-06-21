@@ -190,7 +190,7 @@ console.log(out.text);
 The split also defines responsibility. You declare *intent*; the platform handles *placement and lifecycle*.
 
 - **You declare** the `WorkloadSpec`: `name`, `slug`, `model`, `backend`, and optionally `command`, `vllm_version`, `task_type`, `execution_policy` (`fixed` | `scheduled` | `autoscaling`), and friends. There is **no `provider`** and **no `min_vram_gb`**.
-- **The platform decides** which worker hosts the workload, when it scales, and how reconciliation runs. Backends are `ollama`, `vllm`, `vllm-omni`, and `sglang`; `task_type` defaults to `text2text` and covers 12 modalities (some, like `reranker` / `classification` / `reward`, are async-only). Details in [Backends and policies](/en/reference/backends-and-policies/).
+- **The platform decides** which worker hosts the workload, when it scales, and how reconciliation runs. Backends are `ollama`, `vllm`, `vllm-omni`, `sglang`, and `llamacpp`; `task_type` defaults to `text2text` and covers 12 modalities (some, like `reranker` / `classification` / `reward`, are async-only). Details in [Backends and policies](/en/reference/backends-and-policies/).
 
 ## Where to go next
 

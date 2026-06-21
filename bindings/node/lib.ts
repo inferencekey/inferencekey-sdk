@@ -31,6 +31,7 @@ export const Backend = {
   Vllm: "vllm",
   VllmOmni: "vllm-omni",
   Sglang: "sglang",
+  Llamacpp: "llamacpp",
 } as const;
 export type Backend = (typeof Backend)[keyof typeof Backend];
 

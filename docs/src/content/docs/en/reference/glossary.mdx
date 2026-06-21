@@ -106,9 +106,10 @@ OpenAI route).
 <dt id="backend">Backend</dt>
 <dd>
 The serving engine that runs the model: <code>Backend.Ollama</code>, <code>Vllm</code>,
-<code>VllmOmni</code>, or <code>Sglang</code> (wire: <code>ollama</code> / <code>vllm</code>
-/ <code>vllm-omni</code> / <code>sglang</code>). The vLLM backends take a
-<code>command</code> and an optional <code>vllm_version</code>.
+<code>VllmOmni</code>, <code>Sglang</code>, or <code>Llamacpp</code> (wire: <code>ollama</code> / <code>vllm</code>
+/ <code>vllm-omni</code> / <code>sglang</code> / <code>llamacpp</code>). The vLLM backends take a
+<code>command</code> and an optional <code>vllm_version</code>; <code>llamacpp</code> takes a verbatim
+<code>llama-server</code> command pointed at a GGUF model.
 </dd>
 
 <dt id="worker">Worker (cloud / private)</dt>

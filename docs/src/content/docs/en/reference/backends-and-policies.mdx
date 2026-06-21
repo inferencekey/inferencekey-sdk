@@ -1,6 +1,6 @@
 ---
 title: Backends & policies
-description: Reference for InferenceKey backends (ollama, vllm, vllm-omni, sglang), the 12 task-type modalities, and the fixed/scheduled/autoscaling execution policies.
+description: Reference for InferenceKey backends (ollama, vllm, vllm-omni, sglang, llamacpp), the 12 task-type modalities, and the fixed/scheduled/autoscaling execution policies.
 ---
 
 import { Tabs, TabItem, Aside, LinkCard, CardGrid } from "@astrojs/starlight/components";
@@ -23,6 +23,7 @@ The `backend` field selects the serving engine. In code you pass the `Backend` e
 | `Backend.VLLM` / `Backend.Vllm` | `vllm` | High-throughput production text generation. You control the launch command. |
 | `Backend.VLLM_OMNI` / `Backend.VllmOmni` | `vllm-omni` | vLLM for multimodal / omni models. Same command-driven config as `vllm`. |
 | `Backend.SGLANG` / `Backend.Sglang` | `sglang` | Structured / programmatic generation workloads on the SGLang runtime. |
+| `Backend.LLAMACPP` / `Backend.Llamacpp` | `llamacpp` | Prebuilt `llama-server` for **GGUF** models (OpenAI-compatible). Strong on AMD/ROCm and Apple Silicon; `text2text` only. |
 
 <Aside type="note">
 Python uses the `UPPER_SNAKE` members (`Backend.VLLM`); TypeScript uses the `PascalCase` members (`Backend.Vllm`). They map to the same wire strings shown above.
@@ -68,7 +69,7 @@ const ref = await mgmt.ensure({
 </Tabs>
 
 <Aside type="tip">
-`command` and `vllm_version` only apply to `vllm` / `vllm-omni`. For `ollama` and `sglang`, leave `command` unset and let the backend launch the `model` you declared.
+`vllm_version` only applies to `vllm` / `vllm-omni`. The `command` is run verbatim by `vllm`, `vllm-omni`, and `llamacpp` — for `llamacpp` it must launch `llama-server` against a **GGUF** model (e.g. `llama-server -hf <repo> --hf-file <file.gguf> -ngl 99 -c 4096`). For `ollama` and `sglang`, leave `command` unset and let the backend launch the `model` you declared.
 </Aside>
 
 ## Task types (modalities)

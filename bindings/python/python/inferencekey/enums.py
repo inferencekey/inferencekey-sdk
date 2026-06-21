@@ -17,6 +17,7 @@ class Backend(_Str):
     VLLM = "vllm"
     VLLM_OMNI = "vllm-omni"
     SGLANG = "sglang"
+    LLAMACPP = "llamacpp"
 
 
 class TaskType(_Str):
