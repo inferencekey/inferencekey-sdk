@@ -1,0 +1,2 @@
+# local, unpublished build — see README: `maturin develop` from ../../bindings/python
+# inferencekey>=0.1.0   # uncomment once published to PyPI
