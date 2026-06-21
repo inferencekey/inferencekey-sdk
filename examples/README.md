@@ -40,6 +40,7 @@ the model runs:
 | _(planned)_ `chat-streaming-cloud` | Py / TS | Cloud | platform-chosen | `sglang` | `autoscaling` | Token-by-token streaming chat with a local history REPL. |
 | _(planned)_ `chat-streaming-private-nvidia` | Py | Private | NVIDIA | `vllm` | `fixed` | Pin a chat workload to your NVIDIA worker + a specific GPU resource. |
 | _(planned)_ `chat-streaming-private-amd-gfx120x` | Py | Private | AMD R9700 (gfx120x) | `vllm` | `fixed` | Same, on an AMD ROCm RDNA4 worker — note the ROCm-specific serve flags. |
+| _(planned)_ `gguf-llamacpp-private-amd` | Py | Private | AMD R9700 (gfx120x) | `llamacpp` | `fixed` | Serve a **GGUF** model with `llama-server` on an AMD ROCm worker. The `command` points at a GGUF repo/file (`-hf <repo> --hf-file <file.gguf>`); no venv, no safetensors. |
 
 There is a fuller, two-language streaming demo today at
 [`docs/sdk-demo`](../../../docs/sdk-demo) in the parent repo; the examples here

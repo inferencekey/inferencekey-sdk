@@ -75,7 +75,7 @@ Everything below shows the cloud form by default and calls out the one-line priv
 
 | Modality | `task_type` | Typical backend | How you call it |
 | --- | --- | --- | --- |
-| Chat / completion | `text2text` | `vllm`, `sglang`, `ollama` | `generate_text()` |
+| Chat / completion | `text2text` | `vllm`, `sglang`, `ollama`, `llamacpp` | `generate_text()` |
 | Embeddings | `embedding` | `vllm`, `ollama` | `embed()` |
 | Image generation | `text2image` | `vllm-omni` | OpenAI `images/generations` route |
 | Text-to-speech (TTS) | `text2audio` | `vllm-omni` | OpenAI `audio/speech` route |
@@ -93,7 +93,7 @@ The SDK ships typed data-plane helpers for the two text modalities: `generate_te
 
 ## Chat / completion — `text2text`
 
-The default modality. `vllm` is the workhorse for served HF models; `sglang` for high-throughput serving; `ollama` for GGUF/local-style models.
+The default modality. `vllm` is the workhorse for served HF models; `sglang` for high-throughput serving; `ollama` and `llamacpp` for GGUF models (`llamacpp` runs `llama-server` directly, strong on AMD/ROCm and Apple Silicon).
 
 ### Provision (fixed, cloud)
 
@@ -961,7 +961,7 @@ Do not try to call a `reranker`, `classification`, or `reward` workload with `ge
 ## Picking your combination
 
 <Steps>
-1. **Modality** picks `task_type` + `backend` + `command`. Text modalities (`text2text`, `embedding`) ride on `vllm`/`sglang`/`ollama`; image/audio (`text2image`, `text2audio`, `audio2text`) ride on `vllm-omni`.
+1. **Modality** picks `task_type` + `backend` + `command`. Text generation (`text2text`) rides on `vllm`/`sglang`/`ollama`/`llamacpp`; embeddings on `vllm`/`ollama`; image/audio (`text2image`, `text2audio`, `audio2text`) ride on `vllm-omni`.
 2. **Worker** is one field: omit `worker_id` for cloud, set it for a private worker. Independent of everything else.
 3. **Policy** picks `execution_policy`: `fixed` for steady interactive load, `autoscaling` for spiky traffic, `scheduled` for batch/windowed runs. Tune it via `execution_policy_config`.
 4. `ensure()` is idempotent by `slug`, so re-running with a changed spec reconciles in place (default `OnDrift.RECONCILE`). See [OnDrift](/en/reference/ondrift/).

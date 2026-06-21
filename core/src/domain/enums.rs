@@ -14,6 +14,10 @@ pub enum Backend {
     #[serde(rename = "vllm-omni")]
     VllmOmni,
     Sglang,
+    /// llama.cpp: prebuilt `llama-server` (GGUF, OpenAI-compatible). The worker
+    /// resolves the install path per node hardware (ROCm/Metal tarball, or apt
+    /// CUDA on NVIDIA). `text2text` only today.
+    Llamacpp,
 }
 
 impl Backend {
@@ -24,6 +28,7 @@ impl Backend {
             Backend::Vllm => "vllm",
             Backend::VllmOmni => "vllm-omni",
             Backend::Sglang => "sglang",
+            Backend::Llamacpp => "llamacpp",
         }
     }
 
@@ -34,6 +39,7 @@ impl Backend {
             "vllm" => Some(Backend::Vllm),
             "vllm-omni" => Some(Backend::VllmOmni),
             "sglang" => Some(Backend::Sglang),
+            "llamacpp" => Some(Backend::Llamacpp),
             _ => None,
         }
     }
@@ -125,9 +131,16 @@ mod tests {
 
     #[test]
     fn backend_round_trips_through_wire_string() {
-        for b in [Backend::Ollama, Backend::Vllm, Backend::VllmOmni, Backend::Sglang] {
+        for b in [
+            Backend::Ollama,
+            Backend::Vllm,
+            Backend::VllmOmni,
+            Backend::Sglang,
+            Backend::Llamacpp,
+        ] {
             assert_eq!(Backend::from_str_opt(b.as_str()), Some(b));
         }
+        assert_eq!(Backend::from_str_opt("llamacpp"), Some(Backend::Llamacpp));
         assert_eq!(Backend::from_str_opt("nope"), None);
     }
 

@@ -109,7 +109,7 @@ console.log(emb.embeddings);
 - **`ManagementClient`** — control-plane client. `from_env` / `fromEnv` reads `INFERENCEKEY_SDK_TOKEN`. The key method is `ensure(spec)`, which is idempotent by the explicit `slug` and returns a workload reference (`project_slug` / `projectSlug`, `workload_slug` / `workloadSlug`).
 - **`DataClient`** — data-plane client. `from_env` / `fromEnv` reads `INFERENCEKEY_API_KEY` as the default `ik_live_` key. Call `endpoint(slug, { apiKey })` to get a per-workload endpoint, then `generate_text` / `generateText` or `embed`.
 - **`WorkloadSpec`** — the desired state you declare: `name`, `slug`, `model`, `backend`, plus optional `project`, `description`, `command`, `vllm_version`, `task_type`, `config`, `execution_policy`, `execution_policy_config`, `worker_id`, `gpu_resource_id`. Placement is the platform's job — there is no `provider` and no `min_vram_gb`.
-- **`Backend`** — `Ollama`, `Vllm`, `VllmOmni`, `Sglang`. See [Backends and policies](/en/reference/backends-and-policies/).
+- **`Backend`** — `Ollama`, `Vllm`, `VllmOmni`, `Sglang`, `Llamacpp`. See [Backends and policies](/en/reference/backends-and-policies/).
 - **`OnDrift`** — `Reconcile` (default), `Fail`, `DryRun`, `Warn`, `Ignore`. See [OnDrift](/en/reference/ondrift/).
 - **Errors** — `PermissionDenied`, `AuthError`, `ValidationError`, `ConfigurationError`, `ApiError`, all subclasses of `InferenceKeyError`. See [Common errors](/en/reference/common-errors/).
 
