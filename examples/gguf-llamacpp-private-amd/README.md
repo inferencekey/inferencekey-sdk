@@ -16,8 +16,9 @@ safetensors.
 - The tokens/ids this example needs — see
   [tokens & placement](../README.md#tokens). Specifically:
   `INFERENCEKEY_SDK_TOKEN`, `INFERENCEKEY_API_KEY`, `INFERENCEKEY_PROJECT`,
-  and the **private-worker** ids `IK_WORKER_ID` (`wrk_…`) +
-  `IK_GPU_RESOURCE_ID` (`gpu_…`).
+  and the **private-worker** id `IK_WORKER_ID` (the worker's UUID — Manager UI →
+  Workers → copy the id). `gpu_resource_id` is optional and omitted here (it
+  only targets a specific GPU on a multi-GPU worker; the R9700 has one).
 - Python >= 3.9.
 - A **registered AMD ROCm worker** with an **R9700 (gfx120x)** GPU, running the
   ROCm gfx120x base image. See the worker's
@@ -55,9 +56,10 @@ down on success, error, and Ctrl-C. If a run is killed before `finally` executes
 delete it manually: re-run the example, or call `mgmt.delete("gemma4-26b-llamacpp-amd")`.
 
 ## Troubleshooting
-- **`KeyError: 'IK_WORKER_ID'` / `'IK_GPU_RESOURCE_ID'`** — you didn't set the
-  private-worker ids. Copy `.env.example` to `.env` and fill them from
-  Workers / GPU Resources.
+- **`KeyError: 'IK_WORKER_ID'`** — you didn't set the worker id. Copy
+  `.env.example` to `.env` and fill it from Manager UI → Workers (copy the id).
+- **`worker_id must belong to the same project`** — the worker isn't assigned to
+  `INFERENCEKEY_PROJECT`. Assign it to that project in the Manager first.
 - **Readiness times out** — Gemma 4's first warmup on llama.cpp is slow (the
   worker can sit "loading" for many minutes with the GPU at ~100%). The example
   already uses a 1800 s timeout; if your network is slow pulling the image,
