@@ -47,9 +47,9 @@ def main() -> int:
     # Control plane (ik_sdk_): reads INFERENCEKEY_SDK_TOKEN / _PROJECT / _BASE_URL.
     mgmt = ManagementClient.from_env()
 
-    # Private worker ids come from the environment — never hard-code them.
-    worker_id = os.environ["IK_WORKER_ID"]            # wrk_...
-    gpu_resource_id = os.environ["IK_GPU_RESOURCE_ID"]  # gpu_...
+    # The worker id comes from the environment — never hard-code it. It's the
+    # UUID of your registered worker (Manager UI → Workers → copy the id).
+    worker_id = os.environ["IK_WORKER_ID"]
 
     spec = WorkloadSpec(
         name="Gemma 4 26B (llama.cpp / GGUF) on R9700",
@@ -59,8 +59,9 @@ def main() -> int:
         command=COMMAND,
         task_type="text2text",
         # Pin to your AMD ROCm box. The vendor/arch (RDNA4) lives on the worker.
+        # gpu_resource_id is optional — only needed to target a specific GPU on a
+        # multi-GPU worker; the R9700 has one GPU, so we omit it.
         worker_id=worker_id,
-        gpu_resource_id=gpu_resource_id,
         # Private + fixed: one always-on replica. It stays reserved (and billing)
         # until delete() runs — see "Cost & cleanup" in the README.
         execution_policy=ExecutionPolicy.FIXED,
