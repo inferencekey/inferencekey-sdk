@@ -25,6 +25,12 @@ use crate::domain::spec::WorkloadSpec;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateWorkloadRequest {
     pub name: String,
+    // The declared slug is the workload's identity. Sending it makes the slug
+    // the server persists match `spec.slug`, so a re-`ensure()` finds the same
+    // workload instead of creating a `-1` duplicate. The server slugifies and
+    // disambiguates it; absent (legacy server) it is ignored harmlessly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub task_type: TaskType,
@@ -124,6 +130,7 @@ pub fn build_config(spec: &WorkloadSpec) -> Option<Value> {
 pub fn to_create_request(spec: &WorkloadSpec) -> CreateWorkloadRequest {
     CreateWorkloadRequest {
         name: spec.name.clone(),
+        slug: Some(spec.slug.clone()),
         description: spec.description.clone(),
         // task_type is required on the wire; default to text2text when unset
         // (matches the Manager's server-side default).
@@ -390,6 +397,7 @@ mod tests {
                 mutate: |s| s,
                 expected: CreateWorkloadRequest {
                     name: "support-bot".to_string(),
+                    slug: Some("support-bot".to_string()),
                     description: None,
                     task_type: TaskType::Text2Text,
                     backend: Backend::Vllm,
@@ -415,6 +423,7 @@ mod tests {
                 },
                 expected: CreateWorkloadRequest {
                     name: "support-bot".to_string(),
+                    slug: Some("support-bot".to_string()),
                     description: Some("desc".to_string()),
                     task_type: TaskType::Embedding,
                     backend: Backend::Ollama,
@@ -431,6 +440,17 @@ mod tests {
             let spec = (case.mutate)(base_spec());
             assert_eq!(to_create_request(&spec), case.expected);
         }
+    }
+
+    #[test]
+    fn create_request_sends_declared_slug() {
+        // The slug must ride the create body so the server persists the caller's
+        // declared identity — that is what makes a re-`ensure()` idempotent
+        // instead of minting a `-1` duplicate.
+        let spec = base_spec();
+        let value = serde_json::to_value(to_create_request(&spec)).expect("serialize");
+        let obj = value.as_object().expect("object");
+        assert_eq!(obj.get("slug"), Some(&json!("support-bot")));
     }
 
     #[test]

@@ -22,7 +22,7 @@ use serde_json::Value;
 
 use crate::domain::enums::OnDrift;
 use crate::domain::redact::redact;
-use crate::domain::spec::WorkloadSpec;
+use crate::domain::spec::{canonical_slug, WorkloadSpec};
 use crate::domain::wire::{
     diff_workload, summarize_diffs, to_create_request, to_update_request, FieldDiff,
     WorkloadResponse,
@@ -301,10 +301,24 @@ pub async fn ensure(
     on_drift: OnDrift,
 ) -> CoreResult<EndpointRef> {
     let ctx = Ctx { http, base_url, sdk_token, project_id };
+    // Canonicalise the slug to the form the server will persist, then thread the
+    // normalised spec through the whole pipeline. This keeps the slug we search
+    // by (`find_by_slug`) equal to the slug we send (`to_create_request`) and to
+    // the one the server stores — so a re-`ensure()` always matches, instead of
+    // creating a `-1` duplicate when the caller declared a non-canonical slug.
+    let spec = &normalize_slug(spec);
     match find_by_slug(&ctx, &spec.slug).await? {
         None => ensure_absent(&ctx, spec, on_drift).await,
         Some(live) => ensure_present(&ctx, spec, &live, on_drift).await,
     }
+}
+
+/// Return a copy of `spec` whose `slug` is canonicalised. Cheap clone; the spec
+/// is small and this runs once per `ensure()` call.
+fn normalize_slug(spec: &WorkloadSpec) -> WorkloadSpec {
+    let mut normalized = spec.clone();
+    normalized.slug = canonical_slug(&spec.slug);
+    normalized
 }
 
 /// Delete the workload named by `slug` from `project_id`, returning whether it
@@ -570,6 +584,29 @@ mod tests {
         );
         assert!(find_slug(&workloads, "missing").is_none());
         assert!(find_slug(&[], "anything").is_none());
+    }
+
+    #[test]
+    fn normalize_slug_canonicalizes_before_use() {
+        // A non-canonical declared slug is normalized to the form the server
+        // persists, so `find_by_slug` and the create body agree on identity.
+        let spec = WorkloadSpec {
+            name: "Support Bot".to_string(),
+            slug: "Gemma 4 26B (llama.cpp) on R9700".to_string(),
+            model: "m".to_string(),
+            backend: Backend::Llamacpp,
+            project: None,
+            description: None,
+            command: None,
+            vllm_version: None,
+            task_type: None,
+            config: None,
+            execution_policy: None,
+            execution_policy_config: None,
+            worker_id: None,
+            gpu_resource_id: None,
+        };
+        assert_eq!(normalize_slug(&spec).slug, "gemma-4-26b-llama-cpp-on-r9700");
     }
 
     #[test]

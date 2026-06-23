@@ -47,6 +47,24 @@ pub struct WorkloadSpec {
     pub gpu_resource_id: Option<String>,
 }
 
+/// Canonicalise a slug the **same way the control plane does** before it is
+/// persisted: every non-alphanumeric run collapses to a single `-`, the whole
+/// thing is lowercased, and leading/trailing dashes are trimmed. Keeping this in
+/// lockstep with the server's `slugify` is what makes `ensure()` idempotent —
+/// the slug we search by and send equals the slug the server stores.
+///
+/// (Mirror of `crates/manager/src/repo/workloads.rs::slugify`.)
+pub fn canonical_slug(slug: &str) -> String {
+    slug.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .to_lowercase()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 /// A named string field of a spec, paired for required-field and secret checks.
 struct NamedField<'a> {
     label: &'a str,
@@ -184,6 +202,24 @@ mod tests {
     #[test]
     fn validate_accepts_a_minimal_spec() {
         assert!(validate_spec(&base_spec()).is_ok());
+    }
+
+    #[test]
+    fn canonical_slug_matches_server_slugify() {
+        // Must stay in lockstep with the server's `slugify`: lowercase, every
+        // non-alphanumeric run → one dash, no leading/trailing dashes.
+        let cases = [
+            ("support-bot", "support-bot"),
+            ("Gemma 4 26B (llama.cpp / GGUF) on R9700", "gemma-4-26b-llama-cpp-gguf-on-r9700"),
+            ("  Mixed_Case--Slug  ", "mixed-case-slug"),
+            ("already-canonical", "already-canonical"),
+            ("UPPER", "upper"),
+            ("a__b..c", "a-b-c"),
+            ("---", ""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(canonical_slug(input), expected, "slug for {input:?}");
+        }
     }
 
     #[test]
