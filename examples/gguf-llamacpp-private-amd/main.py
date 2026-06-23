@@ -35,10 +35,11 @@ GGUF_FILE = "gemma-4-26B_q4_0-it.gguf"
 
 # llama-server launch command, run verbatim by the `llamacpp` backend:
 #   -ngl 99  -> offload all layers to the GPU
-#   -c 8192  -> context window (this q4 fits up to 256K on the R9700; kept
-#               modest here so the example is quick — raise as you like)
+#   -c 0     -> context window = the model's maximum (llama.cpp reads the
+#               trained context length from the GGUF metadata; this q4 fits
+#               up to 256K on the R9700's 32 GB)
 # The worker injects the listen port; do not hard-code --port.
-COMMAND = f"llama-server -hf {MODEL} --hf-file {GGUF_FILE} -ngl 99 -c 8192"
+COMMAND = f"llama-server -hf {MODEL} --hf-file {GGUF_FILE} -ngl 99 -c 0"
 
 SLUG = "gemma4-26b-llamacpp-amd"
 
