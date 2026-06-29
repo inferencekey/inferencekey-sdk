@@ -46,6 +46,17 @@ There is a fuller, two-language streaming demo today at
 [`docs/sdk-demo`](../../../docs/sdk-demo) in the parent repo; the examples here
 are the canonical, per-scenario successors to it.
 
+### Custom backends (bring your own PyTorch)
+
+The catalogue above is about the **placement** flow (`ensure()` → ready → call
+the endpoint). A different axis is writing your **own** inference backend in
+PyTorch and serving it with the SDK's `CustomBackend` contract:
+
+| Example | Lang | What it shows |
+| --- | --- | --- |
+| [`custom-backend-echo`](./custom-backend-echo) | Py | The smallest `CustomBackend`: load a trivial `nn.Module` **once** in `setup()`, process jobs in `process()`, served over the SDK's loopback HTTP runtime (`python -m inferencekey.backend.serve`). No weights downloaded. |
+| [`custom-backend-text-sentiment`](./custom-backend-text-sentiment) | Py | The **text** representative: a tiny in-memory sentiment classifier (`nn.Embedding` + `nn.Linear`) over a fixed vocabulary. Real text jobs (`input.text`/`prompt` → `output.label`), `GET /meta` metadata, and the `serve_backend` code helper. No weights downloaded. |
+
 ## Hello world
 
 The canonical entry point is **`hello-world-cloud`**: the fewest moving parts —

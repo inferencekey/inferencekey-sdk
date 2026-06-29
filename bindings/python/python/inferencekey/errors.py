@@ -31,3 +31,17 @@ class ConfigurationError(InferenceKeyError):
 
 class ApiError(InferenceKeyError):
     """Any other non-2xx response or transport failure."""
+
+
+class BackendError(InferenceKeyError):
+    """Base class for custom-backend (T01) contract/runtime failures."""
+
+
+class BackendSetupError(BackendError):
+    """``CustomBackend.setup()`` failed — the backend never became ready and the
+    runtime exits with a non-zero status."""
+
+
+class BackendEntrypointError(BackendError):
+    """The ``module:Class`` entrypoint could not be imported or is not a
+    :class:`~inferencekey.backend.CustomBackend` subclass."""

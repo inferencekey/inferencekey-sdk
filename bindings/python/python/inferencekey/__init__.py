@@ -27,17 +27,39 @@ Quickstart::
     print(out.text)
 """
 
+from typing import TYPE_CHECKING, Any
+
 from .enums import Backend, ExecutionPolicy, OnDrift, TaskType
 from .errors import (
     ApiError,
     AuthError,
+    BackendEntrypointError,
+    BackendError,
+    BackendSetupError,
     ConfigurationError,
     InferenceKeyError,
     PermissionDenied,
     ValidationError,
 )
-from .clients import DataClient, Endpoint, ManagementClient
 from .types import EmbedResult, EndpointRef, ReadinessEvent, TextChunk, TextResult, WorkloadSpec
+
+if TYPE_CHECKING:  # for type checkers / IDEs only — no native ext at import time
+    from .clients import DataClient, Endpoint, ManagementClient
+
+# The clients live in ``inferencekey.clients`` and require the native
+# ``_inferencekey`` extension. They are loaded lazily (PEP 562) so the
+# pure-Python surface — notably ``inferencekey.backend`` (T01) — imports without
+# a built native extension.
+_LAZY_CLIENTS = {"DataClient", "Endpoint", "ManagementClient"}
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_CLIENTS:
+        from . import clients
+
+        return getattr(clients, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "Backend",
@@ -59,6 +81,9 @@ __all__ = [
     "ValidationError",
     "ConfigurationError",
     "ApiError",
+    "BackendError",
+    "BackendSetupError",
+    "BackendEntrypointError",
 ]
 
 __version__ = "0.1.0"
