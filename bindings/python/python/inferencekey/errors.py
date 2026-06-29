@@ -45,3 +45,10 @@ class BackendSetupError(BackendError):
 class BackendEntrypointError(BackendError):
     """The ``module:Class`` entrypoint could not be imported or is not a
     :class:`~inferencekey.backend.CustomBackend` subclass."""
+
+
+class PackagingError(BackendError):
+    """Packaging a custom backend into a distributable artifact failed —
+    a missing/invalid source, a malformed ``module:Class`` entrypoint, an
+    unknown ``task_type``, or an unsafe member while reading an archive. No
+    artifact is produced when this is raised."""

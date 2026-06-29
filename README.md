@@ -212,6 +212,65 @@ a folder you copy, set a few env vars, and run. Every example follows the same
 shape: **`ensure()` → wait until ready → call the endpoint.**
 
 - [`gguf-llamacpp-private-amd`](./examples/gguf-llamacpp-private-amd/) — serve a GGUF model with `llamacpp` on a private AMD/ROCm worker.
+- [`custom-backend-echo`](./examples/custom-backend-echo/) — a minimal PyTorch `CustomBackend` (identity `nn.Linear`).
+- [`custom-backend-text-sentiment`](./examples/custom-backend-text-sentiment/) — a `classification` `CustomBackend`.
+
+## Packaging a custom backend
+
+A custom backend (a subclass of `inferencekey.backend.CustomBackend`) ships as a
+distributable `.tar.gz` artifact: the backend **code**, its `requirements.txt`,
+and a root `manifest.json` with the static metadata (`name`, `version`,
+`task_type`, `entrypoint`, `sdk_protocol`, optional `description`). The manifest
+is read *statically* — without importing the backend or `torch` — so the Manager
+can register it and the worker can download it.
+
+The packaging surface is pure stdlib (`tarfile`, `hashlib`, `json`, `pathlib`):
+it imports neither `torch` nor your backend. From code:
+
+```python
+from inferencekey.backend import package_backend, read_manifest_from_archive
+
+pkg = package_backend(
+    src="examples/custom-backend-echo/backend.py",
+    entrypoint="backend:EchoLinearBackend",
+    requirements="examples/custom-backend-echo/requirements.txt",
+    name="echo", version="0.1.0", task_type="text2text",
+    out_dir="dist",
+)
+print(pkg.path, pkg.sha256, pkg.size_bytes)         # .tar.gz, sha256, size
+print(read_manifest_from_archive(pkg.path))         # manifest, no torch import
+```
+
+`package_backend` returns a `BackendPackage{path, sha256, size_bytes, manifest}`.
+`requirements` is optional; omit it and the artifact bundles an empty
+`requirements.txt` so the layout stays stable. `read_manifest_from_archive(path)`
+extracts only `manifest.json`, guarding against path-traversal members. Invalid
+input (a non-`module:Class` entrypoint, an unknown `task_type`, a missing `src`)
+raises `inferencekey.errors.PackagingError` and writes no artifact.
+
+The same is available as a CLI. Reproducible commands for both examples
+(run from the SDK repo root with the package importable):
+
+```bash
+export PYTHONPATH="$PWD/bindings/python/python"
+
+# echo example -> dist/echo-0.1.0.tar.gz
+python -m inferencekey.backend.package \
+    --src examples/custom-backend-echo/backend.py \
+    --entrypoint backend:EchoLinearBackend \
+    --requirements examples/custom-backend-echo/requirements.txt \
+    --name echo --version 0.1.0 --task-type text2text --out dist
+
+# text-sentiment example -> dist/text-sentiment-0.1.0.tar.gz
+python -m inferencekey.backend.package \
+    --src examples/custom-backend-text-sentiment/backend.py \
+    --entrypoint backend:SentimentBackend \
+    --requirements examples/custom-backend-text-sentiment/requirements.txt \
+    --name text-sentiment --version 0.1.0 --task-type classification --out dist
+```
+
+The CLI prints the artifact path and its sha256 (one per line); verify with
+`tar tzf dist/echo-0.1.0.tar.gz` and `sha256sum dist/echo-0.1.0.tar.gz`.
 
 ## Architecture — one core, many bindings
 
