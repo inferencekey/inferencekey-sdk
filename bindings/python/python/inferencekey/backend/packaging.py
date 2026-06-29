@@ -128,6 +128,7 @@ def package_backend(
     name: str,
     version: str,
     out_dir: str,
+    slug: Optional[str] = None,
     task_type: Optional[str] = None,
     requirements: Optional[str] = None,
     description: Optional[str] = None,
@@ -137,8 +138,10 @@ def package_backend(
     The artifact contains, in deterministic (sorted) order, the backend code
     from ``src`` (a ``.py`` file or a directory), a ``requirements.txt`` (the
     file at ``requirements`` if given, otherwise an empty one so the layout is
-    stable), and a root ``manifest.json`` carrying ``name``, ``version``,
-    ``task_type``, ``entrypoint``, ``sdk_protocol`` and optional ``description``.
+    stable), and a root ``manifest.json`` carrying ``name``, ``slug``,
+    ``version``, ``task_type``, ``entrypoint``, ``sdk_protocol`` and optional
+    ``description``. ``slug`` is the publish identifier the Manager registers the
+    backend under; it defaults to ``name`` when omitted.
 
     The metadata is taken verbatim from the arguments: this never imports the
     backend or ``torch``. Validation happens *before* any file is written, so a
@@ -173,6 +176,7 @@ def package_backend(
 
     manifest: Dict[str, Any] = {
         "name": name,
+        "slug": slug or name,
         "version": version,
         "task_type": task_type or "",
         "entrypoint": entrypoint,

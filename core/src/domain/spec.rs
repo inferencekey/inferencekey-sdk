@@ -74,18 +74,36 @@ struct NamedField<'a> {
 /// The fields that must be present (non-empty after trimming).
 fn required_fields(spec: &WorkloadSpec) -> [NamedField<'_>; 3] {
     [
-        NamedField { label: "name", value: &spec.name },
-        NamedField { label: "slug", value: &spec.slug },
-        NamedField { label: "model", value: &spec.model },
+        NamedField {
+            label: "name",
+            value: &spec.name,
+        },
+        NamedField {
+            label: "slug",
+            value: &spec.slug,
+        },
+        NamedField {
+            label: "model",
+            value: &spec.model,
+        },
     ]
 }
 
 /// Every string-bearing field, used to scan for leaked secrets.
 fn string_fields(spec: &WorkloadSpec) -> Vec<NamedField<'_>> {
     let mut fields = vec![
-        NamedField { label: "name", value: &spec.name },
-        NamedField { label: "slug", value: &spec.slug },
-        NamedField { label: "model", value: &spec.model },
+        NamedField {
+            label: "name",
+            value: &spec.name,
+        },
+        NamedField {
+            label: "slug",
+            value: &spec.slug,
+        },
+        NamedField {
+            label: "model",
+            value: &spec.model,
+        },
     ];
     let optional: [(&str, &Option<String>); 6] = [
         ("project", &spec.project),
@@ -110,7 +128,10 @@ fn looks_like_secret(value: &str) -> bool {
 /// Ensure a required field is non-empty (ignoring surrounding whitespace).
 fn ensure_present(field: &NamedField<'_>) -> CoreResult<()> {
     match field.value.trim().is_empty() {
-        true => Err(CoreError::Validation(format!("{} must not be empty", field.label))),
+        true => Err(CoreError::Validation(format!(
+            "{} must not be empty",
+            field.label
+        ))),
         false => Ok(()),
     }
 }
@@ -118,7 +139,9 @@ fn ensure_present(field: &NamedField<'_>) -> CoreResult<()> {
 /// Ensure a field does not carry a secret token.
 fn ensure_no_secret(field: &NamedField<'_>) -> CoreResult<()> {
     match looks_like_secret(field.value) {
-        true => Err(CoreError::Config("secrets must never go in specs".to_owned())),
+        true => Err(CoreError::Config(
+            "secrets must never go in specs".to_owned(),
+        )),
         false => Ok(()),
     }
 }
@@ -162,7 +185,10 @@ fn wrong_credential_type(token: &str) -> CoreError {
 
 /// A token with no recognised credential prefix.
 fn not_an_sdk_token(token: &str) -> CoreError {
-    CoreError::Config(format!("{} is not an ik_sdk_ management token", redact(token)))
+    CoreError::Config(format!(
+        "{} is not an ik_sdk_ management token",
+        redact(token)
+    ))
 }
 
 #[cfg(test)]
@@ -205,12 +231,39 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_a_custom_backend() {
+        let mut spec = base_spec();
+        spec.backend = Backend::Custom("echo".to_owned());
+        assert!(validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn spec_with_custom_backend_serializes_backend_to_its_slug() {
+        let mut spec = base_spec();
+        spec.backend = Backend::Custom("echo".to_owned());
+        let value = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(value["backend"], serde_json::json!("echo"));
+    }
+
+    #[test]
+    fn spec_with_custom_backend_round_trips_through_serde() {
+        let mut spec = base_spec();
+        spec.backend = Backend::Custom("echo".to_owned());
+        let json = serde_json::to_string(&spec).expect("serialize");
+        let parsed: WorkloadSpec = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.backend, Backend::Custom("echo".to_owned()));
+    }
+
+    #[test]
     fn canonical_slug_matches_server_slugify() {
         // Must stay in lockstep with the server's `slugify`: lowercase, every
         // non-alphanumeric run → one dash, no leading/trailing dashes.
         let cases = [
             ("support-bot", "support-bot"),
-            ("Gemma 4 26B (llama.cpp / GGUF) on R9700", "gemma-4-26b-llama-cpp-gguf-on-r9700"),
+            (
+                "Gemma 4 26B (llama.cpp / GGUF) on R9700",
+                "gemma-4-26b-llama-cpp-gguf-on-r9700",
+            ),
             ("  Mixed_Case--Slug  ", "mixed-case-slug"),
             ("already-canonical", "already-canonical"),
             ("UPPER", "upper"),
@@ -234,7 +287,10 @@ mod tests {
             let mut spec = base_spec();
             mutate(&mut spec);
             let err = validate_spec(&spec).expect_err(label);
-            assert!(is_validation(&err), "{label}: expected validation error, got {err:?}");
+            assert!(
+                is_validation(&err),
+                "{label}: expected validation error, got {err:?}"
+            );
         }
     }
 
@@ -244,15 +300,24 @@ mod tests {
             ("live in name", |s| s.name = "ik_live_abc".to_owned()),
             ("sdk in slug", |s| s.slug = "ik_sdk_abc".to_owned()),
             ("live in model", |s| s.model = "ik_live_zzz".to_owned()),
-            ("sdk in command", |s| s.command = Some("ik_sdk_xyz".to_owned())),
-            ("live in description", |s| s.description = Some("ik_live_d".to_owned())),
-            ("sdk in worker_id", |s| s.worker_id = Some("ik_sdk_w".to_owned())),
+            ("sdk in command", |s| {
+                s.command = Some("ik_sdk_xyz".to_owned())
+            }),
+            ("live in description", |s| {
+                s.description = Some("ik_live_d".to_owned())
+            }),
+            ("sdk in worker_id", |s| {
+                s.worker_id = Some("ik_sdk_w".to_owned())
+            }),
         ];
         for (label, mutate) in cases {
             let mut spec = base_spec();
             mutate(&mut spec);
             let err = validate_spec(&spec).expect_err(label);
-            assert!(is_config(&err), "{label}: expected config error, got {err:?}");
+            assert!(
+                is_config(&err),
+                "{label}: expected config error, got {err:?}"
+            );
         }
     }
 
@@ -274,7 +339,10 @@ mod tests {
         match err {
             CoreError::Permission { code, message } => {
                 assert_eq!(code, PermissionCode::WrongCredentialType);
-                assert!(!message.contains("secretvalue"), "raw token leaked: {message}");
+                assert!(
+                    !message.contains("secretvalue"),
+                    "raw token leaked: {message}"
+                );
             }
             other => panic!("expected permission error, got {other:?}"),
         }
@@ -285,7 +353,10 @@ mod tests {
         let cases = ["", "sk-openai", "bearer abc", "ik_live", "ik_sdk"];
         for token in cases {
             let err = assert_sdk_token(token).expect_err(token);
-            assert!(is_config(&err), "{token:?}: expected config error, got {err:?}");
+            assert!(
+                is_config(&err),
+                "{token:?}: expected config error, got {err:?}"
+            );
         }
     }
 }

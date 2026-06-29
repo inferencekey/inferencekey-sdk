@@ -3,36 +3,53 @@
 //! Pure: parsing and rendering only, no IO. `serde` (de)serializes them as their
 //! wire strings so they drop straight into request/response bodies.
 
-use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Inference backend. The serialized form is the `backend` wire string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+///
+/// The native variants carry no data and serialize to their fixed wire strings
+/// (`ollama`, `vllm`, `vllm-omni`, `sglang`, `llamacpp`). Any other wire string
+/// deserializes to [`Backend::Custom`] carrying the slug verbatim, so a
+/// `WorkloadResponse` naming a custom (SDK-published) backend never fails to
+/// parse. `Custom` re-serializes to that same slug.
+///
+/// Carrying a `String` means `Backend` is **not** `Copy`; clone it where a value
+/// is needed by ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Backend {
     Ollama,
     Vllm,
-    #[serde(rename = "vllm-omni")]
     VllmOmni,
     Sglang,
     /// llama.cpp: prebuilt `llama-server` (GGUF, OpenAI-compatible). The worker
     /// resolves the install path per node hardware (ROCm/Metal tarball, or apt
     /// CUDA on NVIDIA). `text2text` only today.
     Llamacpp,
+    /// A custom backend published through the SDK, identified by its slug.
+    Custom(String),
 }
 
 impl Backend {
-    /// The wire string (e.g. `"vllm-omni"`).
-    pub fn as_str(&self) -> &'static str {
+    /// The wire string (e.g. `"vllm-omni"`, or the slug for [`Backend::Custom`]).
+    ///
+    /// Native variants borrow a `'static` string; `Custom` borrows its slug. The
+    /// `Cow` lets both share one return type without allocating for natives.
+    pub fn as_str(&self) -> Cow<'_, str> {
         match self {
-            Backend::Ollama => "ollama",
-            Backend::Vllm => "vllm",
-            Backend::VllmOmni => "vllm-omni",
-            Backend::Sglang => "sglang",
-            Backend::Llamacpp => "llamacpp",
+            Backend::Ollama => Cow::Borrowed("ollama"),
+            Backend::Vllm => Cow::Borrowed("vllm"),
+            Backend::VllmOmni => Cow::Borrowed("vllm-omni"),
+            Backend::Sglang => Cow::Borrowed("sglang"),
+            Backend::Llamacpp => Cow::Borrowed("llamacpp"),
+            Backend::Custom(slug) => Cow::Borrowed(slug.as_str()),
         }
     }
 
-    /// Parse a wire string into a [`Backend`].
+    /// Parse a wire string into a native [`Backend`]. Returns `None` for any
+    /// string that is not a native backend (use [`Backend::from_wire`] to accept
+    /// custom slugs).
     pub fn from_str_opt(s: &str) -> Option<Self> {
         match s {
             "ollama" => Some(Backend::Ollama),
@@ -42,6 +59,25 @@ impl Backend {
             "llamacpp" => Some(Backend::Llamacpp),
             _ => None,
         }
+    }
+
+    /// Parse any wire string. Native backends map to their variant; everything
+    /// else becomes [`Backend::Custom`]. Never fails.
+    pub fn from_wire(s: &str) -> Self {
+        Backend::from_str_opt(s).unwrap_or_else(|| Backend::Custom(s.to_owned()))
+    }
+}
+
+impl Serialize for Backend {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Backend {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(Backend::from_wire(&s))
     }
 }
 
@@ -138,7 +174,7 @@ mod tests {
             Backend::Sglang,
             Backend::Llamacpp,
         ] {
-            assert_eq!(Backend::from_str_opt(b.as_str()), Some(b));
+            assert_eq!(Backend::from_str_opt(b.as_str().as_ref()), Some(b.clone()));
         }
         assert_eq!(Backend::from_str_opt("llamacpp"), Some(Backend::Llamacpp));
         assert_eq!(Backend::from_str_opt("nope"), None);
@@ -153,6 +189,51 @@ mod tests {
     fn backend_serializes_as_kebab_wire_string() {
         let json = serde_json::to_string(&Backend::VllmOmni).expect("serialize");
         assert_eq!(json, "\"vllm-omni\"");
+    }
+
+    #[test]
+    fn native_backends_serde_round_trip_to_their_wire_strings() {
+        let cases = [
+            (Backend::Ollama, "\"ollama\""),
+            (Backend::Vllm, "\"vllm\""),
+            (Backend::VllmOmni, "\"vllm-omni\""),
+            (Backend::Sglang, "\"sglang\""),
+            (Backend::Llamacpp, "\"llamacpp\""),
+        ];
+        for (variant, wire) in cases {
+            let json = serde_json::to_string(&variant).expect("serialize");
+            assert_eq!(json, wire, "serialize {variant:?}");
+            let parsed: Backend = serde_json::from_str(wire).expect("deserialize");
+            assert_eq!(parsed, variant, "deserialize {wire}");
+            assert_eq!(Backend::from_wire(variant.as_str().as_ref()), variant);
+        }
+    }
+
+    #[test]
+    fn custom_backend_serializes_to_its_slug() {
+        let json = serde_json::to_string(&Backend::Custom("echo".to_owned())).expect("serialize");
+        assert_eq!(json, "\"echo\"");
+        assert_eq!(Backend::Custom("echo".to_owned()).as_str(), "echo");
+    }
+
+    #[test]
+    fn unknown_wire_string_deserializes_to_custom() {
+        let parsed: Backend = serde_json::from_str("\"echo\"").expect("deserialize");
+        assert_eq!(parsed, Backend::Custom("echo".to_owned()));
+        assert_eq!(
+            Backend::from_wire("echo"),
+            Backend::Custom("echo".to_owned())
+        );
+        // Native strings still map to native variants, never to Custom.
+        assert_eq!(Backend::from_wire("vllm"), Backend::Vllm);
+    }
+
+    #[test]
+    fn custom_backend_round_trips_through_serde() {
+        let original = Backend::Custom("my-cool-backend".to_owned());
+        let json = serde_json::to_string(&original).expect("serialize");
+        let parsed: Backend = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, original);
     }
 
     #[test]

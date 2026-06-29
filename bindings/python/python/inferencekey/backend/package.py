@@ -46,6 +46,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to requirements.txt (optional; empty one bundled if omitted).",
     )
     parser.add_argument("--name", required=True, help="Backend name.")
+    parser.add_argument(
+        "--slug",
+        default=None,
+        help="Publish slug the Manager registers under (optional; defaults to --name).",
+    )
     parser.add_argument("--version", required=True, help="Backend version string.")
     parser.add_argument(
         "--task-type",
@@ -76,6 +81,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             entrypoint=args.entrypoint,
             requirements=args.requirements,
             name=args.name,
+            slug=args.slug,
             version=args.version,
             task_type=args.task_type,
             out_dir=args.out_dir,

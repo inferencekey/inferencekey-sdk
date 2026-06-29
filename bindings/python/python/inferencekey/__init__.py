@@ -41,6 +41,7 @@ from .errors import (
     PermissionDenied,
     ValidationError,
 )
+from .publish import publish_custom_backend
 from .types import EmbedResult, EndpointRef, ReadinessEvent, TextChunk, TextResult, WorkloadSpec
 
 if TYPE_CHECKING:  # for type checkers / IDEs only — no native ext at import time
@@ -84,6 +85,7 @@ __all__ = [
     "BackendError",
     "BackendSetupError",
     "BackendEntrypointError",
+    "publish_custom_backend",
 ]
 
 __version__ = "0.1.0"
