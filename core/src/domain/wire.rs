@@ -135,7 +135,7 @@ pub fn to_create_request(spec: &WorkloadSpec) -> CreateWorkloadRequest {
         // task_type is required on the wire; default to text2text when unset
         // (matches the Manager's server-side default).
         task_type: spec.task_type.unwrap_or(TaskType::Text2Text),
-        backend: spec.backend,
+        backend: spec.backend.clone(),
         model_name: spec.model.clone(),
         config: build_config(spec),
         worker_id: spec.worker_id.clone(),
@@ -149,23 +149,30 @@ pub fn to_create_request(spec: &WorkloadSpec) -> CreateWorkloadRequest {
 /// diff's `to` value is the spec's desired value, decoded back into the typed
 /// request field. Unknown field names are ignored.
 pub fn to_update_request(spec: &WorkloadSpec, diffs: &[FieldDiff]) -> UpdateWorkloadRequest {
-    diffs.iter().fold(UpdateWorkloadRequest::default(), |req, diff| {
-        apply_diff_to_update(req, spec, diff)
-    })
+    diffs
+        .iter()
+        .fold(UpdateWorkloadRequest::default(), |req, diff| {
+            apply_diff_to_update(req, spec, diff)
+        })
 }
 
 /// Compute drift for the fields the spec declares. `task_type` is never
 /// compared because it is not patchable. Ordering is stable (declaration order).
 pub fn diff_workload(spec: &WorkloadSpec, current: &WorkloadResponse) -> Vec<FieldDiff> {
-    let policy_kind_changed = diff_execution_policy(&current.execution_policy, &spec.execution_policy);
+    let policy_kind_changed =
+        diff_execution_policy(&current.execution_policy, &spec.execution_policy);
     [
         diff_string("name", &current.name, &spec.name),
-        diff_enum("backend", current.backend.as_str(), spec.backend.as_str()),
+        diff_enum("backend", &current.backend.as_str(), &spec.backend.as_str()),
         diff_string("model_name", &current.model_name, &spec.model),
         diff_opt_string("description", &current.description, &spec.description),
         diff_config(&current.config, build_config(spec)),
         diff_opt_string("worker_id", &current.worker_id, &spec.worker_id),
-        diff_opt_string("gpu_resource_id", &current.gpu_resource_id, &spec.gpu_resource_id),
+        diff_opt_string(
+            "gpu_resource_id",
+            &current.gpu_resource_id,
+            &spec.gpu_resource_id,
+        ),
         policy_kind_changed.clone(),
         diff_execution_policy_config(
             &current.execution_policy_config,
@@ -278,7 +285,7 @@ fn apply_diff_to_update(
     match diff.field.as_str() {
         "name" => req.name = Some(spec.name.clone()),
         "description" => req.description = spec.description.clone(),
-        "backend" => req.backend = Some(spec.backend),
+        "backend" => req.backend = Some(spec.backend.clone()),
         "model_name" => req.model_name = Some(spec.model.clone()),
         "config" => req.config = build_config(spec),
         "worker_id" => req.worker_id = spec.worker_id.clone(),
@@ -362,6 +369,25 @@ mod tests {
     }
 
     #[test]
+    fn workload_response_with_custom_backend_deserializes_without_error() {
+        // A custom (SDK-published) backend slug the wire enum has no variant for
+        // must round-trip as `Backend::Custom`, not fail the whole response.
+        let body = json!({
+            "id": "wl_echo",
+            "project_id": "proj_1",
+            "name": "echo",
+            "slug": "echo",
+            "task_type": "text2text",
+            "backend": "echo",
+            "model_name": "none",
+            "created_at": "2026-06-15T00:00:00Z",
+            "updated_at": "2026-06-15T00:00:00Z",
+        });
+        let parsed: WorkloadResponse = serde_json::from_value(body).expect("deserialize");
+        assert_eq!(parsed.backend, Backend::Custom("echo".to_string()));
+    }
+
+    #[test]
     fn build_config_shapes_vllm_command_and_version() {
         let cases = [
             (None, None, None),
@@ -402,7 +428,9 @@ mod tests {
                     task_type: TaskType::Text2Text,
                     backend: Backend::Vllm,
                     model_name: "meta-llama/Llama-3.1-8B-Instruct".to_string(),
-                    config: Some(json!({ "command": "vllm serve meta-llama/Llama-3.1-8B-Instruct" })),
+                    config: Some(
+                        json!({ "command": "vllm serve meta-llama/Llama-3.1-8B-Instruct" }),
+                    ),
                     worker_id: None,
                     gpu_resource_id: None,
                     execution_policy: None,
