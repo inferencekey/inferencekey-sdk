@@ -1,0 +1,3 @@
+# The custom backend runs PyTorch; the SDK runtime does not depend on torch.
+# CPU-only torch is enough for this example (no GPU, no weights downloaded).
+torch>=2.0
