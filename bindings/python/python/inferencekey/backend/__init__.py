@@ -28,6 +28,11 @@ from .base import (
     Job,
     Result,
 )
+from .packaging import (
+    BackendPackage,
+    package_backend,
+    read_manifest_from_archive,
+)
 from .serve import serve_backend
 
 __all__ = [
@@ -38,4 +43,7 @@ __all__ = [
     "BackendManifest",
     "TASK_TYPES",
     "serve_backend",
+    "package_backend",
+    "read_manifest_from_archive",
+    "BackendPackage",
 ]
