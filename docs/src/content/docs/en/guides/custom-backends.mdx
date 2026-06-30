@@ -1,0 +1,220 @@
+---
+title: Custom backends
+description: Bring your own PyTorch model as a custom inference backend — define it in Python (load once, process per job), package it, publish it to the platform, and target it from a WorkloadSpec.
+---
+
+import { Tabs, TabItem, Card, CardGrid, Aside, Steps, LinkCard } from "@astrojs/starlight/components";
+
+The built-in backends (`vllm`, `sglang`, `ollama`, `llamacpp`) cover most LLM serving. When you need to run **your own model** — a classifier, an embedding model, a scoring head, an image or audio model, anything you can express in PyTorch — you define a **custom backend**: a small Python class the SDK turns into a long-lived inference server, packages, and ships to your workers.
+
+You write two methods. The platform does the rest: distribution to workers, process supervision, and routing jobs to it.
+
+<CardGrid>
+  <Card title="Load once, process per job" icon="setting">
+    `setup()` loads your model a single time; `process(job)` reuses it for every request. No reloading per job.
+  </Card>
+  <Card title="Your own I/O shape" icon="puzzle">
+    Input and output are free JSON dicts — **not** OpenAI-compatible. A classifier returns `{"label", "score"}`; a text model returns `{"text"}`. You decide.
+  </Card>
+  <Card title="Private to your tenant" icon="approve-check">
+    A custom backend you publish is visible and usable only within your tenant. Other tenants never see it.
+  </Card>
+  <Card title="No platform rebuild" icon="rocket">
+    Publishing a custom backend is data + an artifact. You don't wait on a platform release to ship a new model type.
+  </Card>
+</CardGrid>
+
+<Aside type="note" title="When to use a custom backend">
+Reach for a built-in backend (`vllm`/`sglang`/`ollama`/`llamacpp`) when your model is a standard LLM served over the OpenAI-compatible API. Reach for a **custom backend** when the model or its I/O doesn't fit that mold — a non-chat modality, a bespoke pre/post-processing step, or a model you load and call yourself in PyTorch.
+</Aside>
+
+## 1. Define the backend
+
+A custom backend is a subclass of `CustomBackend` with two methods:
+
+- **`setup(ctx)`** — called **once** when the server starts. Instantiate your model here and stash it on `self`. Read knobs (device, model name, weights path) from `ctx.config`.
+- **`process(job)`** — called **per job**. Reuse the model loaded in `setup()` and return a `Result`.
+
+```python title="my_backend.py"
+import torch
+from torch import nn
+
+from inferencekey.backend import BackendContext, CustomBackend, Job, Result
+
+
+class SentimentBackend(CustomBackend):
+    # Optional metadata — surfaced to the platform and at GET /meta.
+    name = "tiny-sentiment"
+    version = "0.1.0"
+    task_type = "classification"
+
+    def setup(self, ctx: BackendContext) -> None:
+        # Called once. Build/load the model here; it stays resident for the
+        # life of the process. Device comes from config (defaults to "cpu").
+        self.device = str(ctx.config.get("device", "cpu"))
+        self.model = nn.Linear(8, 2).to(self.device).eval()
+
+    def process(self, job: Job) -> Result:
+        # Called per job. `job.input` is a free dict you define the shape of.
+        text = job.input.get("prompt") or _last_user_message(job.input)
+        logits = self._embed(text)               # your model call
+        label = "positive" if logits[1] > logits[0] else "negative"
+        return Result(output={"label": label, "score": float(max(logits))})
+```
+
+### The contract
+
+| Type | Shape | Notes |
+| --- | --- | --- |
+| `Job` | `{ "id": str, "input": dict }` | `input` is a free, JSON-serializable dict. Your backend defines its keys. |
+| `Result` | `{ "output": dict }` | `output` is a free dict. Wrap your return value as `Result(output=...)`. |
+| `BackendContext` | `{ "config": dict, "port": int }` | `config` is where you resolve `device`, `model_name`, weights, etc. |
+
+<Aside type="tip" title="Recommended input/output for text jobs">
+Input and output are **not** OpenAI-compatible — that's deliberate, so any modality fits. For text models that should interoperate with the platform's data plane, the recommended convention is to read `input.messages` (a list of `{role, content}`) or `input.prompt`, and to return `output.text`. Other modalities use whatever keys make sense (`{"values": [...]}`, `{"label", "score"}`, …).
+</Aside>
+
+### Error behavior
+
+- If **`setup()` raises**, the backend never becomes ready and the process exits non-zero — the platform sees it failed to come up.
+- If **`process()` raises**, that single job gets a `500` with a JSON error and the server **stays alive** for the next job.
+
+## 2. Run it locally
+
+Before packaging, run the backend on your machine exactly as a worker would. Your backend's dependencies (PyTorch, etc.) go in a `requirements.txt`; the SDK runtime itself needs none of them.
+
+<Steps>
+
+1. Install your backend's deps (CPU-only torch is plenty for testing):
+
+   ```bash
+   python -m venv .venv && . .venv/bin/activate
+   pip install torch --index-url https://download.pytorch.org/whl/cpu
+   ```
+
+2. Serve it on a loopback port:
+
+   ```bash
+   python -m inferencekey.backend.serve \
+     --port 8099 \
+     --backend my_backend:SentimentBackend \
+     --config-json '{"device": "cpu"}'
+   ```
+
+   The entrypoint is `module:Class`. Config can also come from the
+   `IK_BACKEND_ENTRYPOINT` / `IK_BACKEND_CONFIG` environment variables.
+
+3. Exercise the endpoints:
+
+   ```bash
+   curl -s http://127.0.0.1:8099/healthz          # 200 once setup() finished
+   curl -s http://127.0.0.1:8099/meta             # {"name","version","task_type",...}
+   curl -s -X POST http://127.0.0.1:8099/process \
+     -d '{"id":"j1","input":{"prompt":"i love this"}}'
+   # {"output": {"label": "positive", "score": ...}}
+   ```
+
+</Steps>
+
+You can also start it from code instead of the CLI:
+
+```python
+from inferencekey.backend import serve_backend
+from my_backend import SentimentBackend
+
+serve_backend(SentimentBackend, port=8099, config={"device": "cpu"})
+```
+
+<Aside type="note">
+The runtime serves a small, SDK-owned HTTP schema: `GET /healthz` (ready only after `setup()`), `POST /process`, and `GET /meta`. It binds `127.0.0.1` only.
+</Aside>
+
+## 3. Package it
+
+`package_backend` (or the equivalent CLI) bundles your code, its `requirements.txt`, and a `manifest.json` into a single `.tar.gz` with a checksum.
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+```python title="package.py"
+from inferencekey.backend import package_backend
+
+pkg = package_backend(
+    src="my_backend.py",                      # file or directory
+    entrypoint="my_backend:SentimentBackend",
+    requirements="requirements.txt",
+    name="tiny-sentiment",
+    slug="tiny-sentiment",
+    version="0.1.0",
+    task_type="classification",
+    out_dir="dist",
+)
+print(pkg.path, pkg.sha256, pkg.size_bytes)
+```
+  </TabItem>
+  <TabItem label="CLI">
+```bash
+python -m inferencekey.backend.package \
+  --src my_backend.py \
+  --entrypoint my_backend:SentimentBackend \
+  --requirements requirements.txt \
+  --name tiny-sentiment --slug tiny-sentiment \
+  --version 0.1.0 --task-type classification \
+  --out dist
+```
+  </TabItem>
+</Tabs>
+
+<Aside type="caution" title="Package code, not weights">
+The artifact carries **code and a dependency list**, not multi-gigabyte model weights. Resolve weights inside `setup()` — load from disk, or pull from a model hub on first start. Keep the package small.
+</Aside>
+
+## 4. Publish it to the platform
+
+Upload the artifact with your control token. The metadata travels from the package's manifest.
+
+```python title="publish.py"
+from inferencekey import publish_custom_backend
+
+result = publish_custom_backend(
+    tenant_id="<your-tenant-id>",
+    package_path="dist/tiny-sentiment-0.1.0.tar.gz",
+    token="ik_sdk_...",                       # your control token
+)
+print(result["id"], result["slug"], result["sha256"])
+```
+
+Once published, the custom backend appears in your tenant's **Custom backends** page in the dashboard, where you (and your teammates) can see and manage it. It is private to your tenant.
+
+<Aside type="note">
+You can also upload from the dashboard's **Custom backends** page (drag in the `.tar.gz` and fill name / slug / version / task type / entrypoint). The SDK and the UI hit the same place.
+</Aside>
+
+## 5. Use it in a workload
+
+Target the custom backend by its **slug**, exactly where you'd pass a built-in backend. `ensure()` creates (or reconciles) the workload; when a worker picks it up, the platform delivers the package to it, starts your backend once, and routes jobs to it.
+
+```python title="use_it.py"
+from inferencekey import ManagementClient, WorkloadSpec
+
+mgmt = ManagementClient.from_env(project="acme")
+
+ref = mgmt.ensure(WorkloadSpec(
+    name="sentiment",
+    slug="sentiment",
+    model="tiny-sentiment",
+    backend="tiny-sentiment",     # the slug you published
+    task_type="classification",
+))
+```
+
+<Aside type="tip">
+`WorkloadSpec.backend` accepts a built-in `Backend` enum **or** a custom backend slug string. The slug is resolved against the custom backends published in your tenant — a slug from another tenant is rejected. The workload's `task_type` must match the one the backend declared.
+</Aside>
+
+From the dashboard you get the same outcome: on the **New workload** form, the backend selector lists your tenant's custom backends alongside the built-ins; pick one and create the workload.
+
+## What happens after that
+
+You declared the workload; the platform reconciles it. When a worker is assigned, it pulls your published package, verifies it, installs your `requirements.txt` in an isolated environment, starts your backend **once** (your `setup()` runs, the model loads), and then forwards each incoming job to `process()`. You never manage the process, the download, or the placement.
+
+<LinkCard title="Backends & policies" href="/en/reference/backends-and-policies/" description="The built-in backends, the task-type modalities, and execution policies." />

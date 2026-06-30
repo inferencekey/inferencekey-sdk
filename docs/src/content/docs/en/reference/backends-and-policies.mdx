@@ -24,9 +24,14 @@ The `backend` field selects the serving engine. In code you pass the `Backend` e
 | `Backend.VLLM_OMNI` / `Backend.VllmOmni` | `vllm-omni` | vLLM for multimodal / omni models. Same command-driven config as `vllm`. |
 | `Backend.SGLANG` / `Backend.Sglang` | `sglang` | Structured / programmatic generation workloads on the SGLang runtime. |
 | `Backend.LLAMACPP` / `Backend.Llamacpp` | `llamacpp` | Prebuilt `llama-server` for **GGUF** models (OpenAI-compatible). Strong on AMD/ROCm and Apple Silicon; `text2text` only. |
+| *(custom backend slug)* | `<your-slug>` | **Your own PyTorch model**, defined in Python and published to your tenant. Use when the model or its I/O doesn't fit a built-in. See [Custom backends](/en/guides/custom-backends/). |
 
 <Aside type="note">
 Python uses the `UPPER_SNAKE` members (`Backend.VLLM`); TypeScript uses the `PascalCase` members (`Backend.Vllm`). They map to the same wire strings shown above.
+</Aside>
+
+<Aside type="tip" title="Custom backends">
+Beyond the built-ins, you can publish a **custom backend** — your own model as a small Python class (`setup()` loads it once, `process(job)` runs each request) — and target it from a `WorkloadSpec` by its slug (`backend="<your-slug>"`). Its I/O is a free JSON dict, not OpenAI-compatible, so any modality fits. It's private to your tenant. See the [Custom backends](/en/guides/custom-backends/) guide.
 </Aside>
 
 ### Backend config
