@@ -1,3 +1,9 @@
 # The custom backend runs PyTorch; the SDK runtime does not depend on torch.
 # CPU-only torch is enough for this example (no GPU, no weights downloaded).
-torch>=2.0
+# A worker installs these non-interactively with `pip install -r`, so the file
+# must be self-contained: the extra index + the explicit `+cpu` local version
+# pin make pip resolve the lightweight CPU build directly (a few hundred MB)
+# instead of the default CUDA wheels (several GB).
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.0,<3 ; sys_platform != "linux"
+torch==2.12.1+cpu ; sys_platform == "linux"
