@@ -1,0 +1,23 @@
+# Inference-only dependencies for the LP-MusicCaps custom backend.
+# The SDK runtime itself imports NONE of these — they belong to this backend.
+#
+# VERSION PINS MATTER. LP-MusicCaps' BartCaptionModel.generate() targets the
+# transformers 4.26.x generation API; newer transformers (5.x) change BART
+# generation internals and raise at inference time. Pin transformers to 4.26.1
+# and a torch that has wheels for it. This combination has wheels for
+# CPython 3.9–3.11 (the version LP-MusicCaps was built against — see the
+# upstream Dockerfile `pytorch/pytorch:2.1.0`). It is NOT installable on
+# CPython 3.13, which only ships torch>=2.5 / transformers>=5. Build the
+# backend package with a 3.9–3.11 interpreter.
+#
+# Install torch first from the CPU wheel index, then the rest — see README.
+torch<2.2
+torchaudio<2.2
+transformers==4.26.1
+librosa>=0.8
+numpy
+einops
+soundfile
+# audioread lets librosa decode mp3/ogg without a system ffmpeg for common
+# cases; ffmpeg on PATH is still the most robust decoder for exotic formats.
+audioread

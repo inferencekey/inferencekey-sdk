@@ -1,0 +1,11 @@
+# Model weights are downloaded at setup() time, never committed.
+*.pth
+*.pth.partial
+# Local venvs and scratch audio.
+.venv/
+*.wav
+*.mp3
+*.flac
+*.ogg
+__pycache__/
+*.pyc

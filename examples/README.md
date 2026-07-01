@@ -56,6 +56,7 @@ PyTorch and serving it with the SDK's `CustomBackend` contract:
 | --- | --- | --- |
 | [`custom-backend-echo`](./custom-backend-echo) | Py | The smallest `CustomBackend`: load a trivial `nn.Module` **once** in `setup()`, process jobs in `process()`, served over the SDK's loopback HTTP runtime (`python -m inferencekey.backend.serve`). No weights downloaded. |
 | [`custom-backend-text-sentiment`](./custom-backend-text-sentiment) | Py | The **text** representative: a tiny in-memory sentiment classifier (`nn.Embedding` + `nn.Linear`) over a fixed vocabulary. Real text jobs (`input.text`/`prompt` → `output.label`), `GET /meta` metadata, and the `serve_backend` code helper. No weights downloaded. |
+| [`custom-backend-music-caption`](./custom-backend-music-caption) | Py | A real-world **`audio2text`** backend wrapping **LP-MusicCaps**: given a musical clip (`input.audio_b64`) it returns a natural-language description of the song (`output.description`). Loads a BART captioning model **once** in `setup()`, downloading the weights from Hugging Face on first start (never shipped in the package). Vendors an inference-only subset of `lpmc/`. Needs `transformers==4.26.1` on CPython 3.9–3.11. |
 
 ## Hello world
 
