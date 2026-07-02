@@ -111,6 +111,11 @@ class MusicCaptionBackend(CustomBackend):
     version = "0.1.0"
     task_type = "audio2text"
     requirements = "requirements.txt"
+    # LP-MusicCaps' BartCaptionModel.generate() targets the transformers 4.26.x
+    # API, whose transformers/torch wheels only cover CPython 3.9–3.11. The
+    # worker honours this via uv (`uv venv --python`), so the backend runs on
+    # 3.11 even on a node whose default python3 is 3.13.
+    requires_python = ">=3.9,<3.12"
 
     def setup(self, ctx: BackendContext) -> None:
         # Device is read explicitly from config; default CPU, no GPU
