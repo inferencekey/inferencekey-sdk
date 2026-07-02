@@ -131,6 +131,7 @@ def package_backend(
     slug: Optional[str] = None,
     task_type: Optional[str] = None,
     requirements: Optional[str] = None,
+    requires_python: Optional[str] = None,
     description: Optional[str] = None,
 ) -> BackendPackage:
     """Bundle a custom backend into ``<out_dir>/<name>-<version>.tar.gz``.
@@ -139,9 +140,11 @@ def package_backend(
     from ``src`` (a ``.py`` file or a directory), a ``requirements.txt`` (the
     file at ``requirements`` if given, otherwise an empty one so the layout is
     stable), and a root ``manifest.json`` carrying ``name``, ``slug``,
-    ``version``, ``task_type``, ``entrypoint``, ``sdk_protocol`` and optional
-    ``description``. ``slug`` is the publish identifier the Manager registers the
-    backend under; it defaults to ``name`` when omitted.
+    ``version``, ``task_type``, ``requires_python``, ``entrypoint``,
+    ``sdk_protocol`` and optional ``description``. ``slug`` is the publish
+    identifier the Manager registers the backend under; it defaults to ``name``
+    when omitted. ``requires_python`` is a PEP 440 specifier (empty when
+    omitted) the worker feeds to ``uv`` to provision the pinned interpreter.
 
     The metadata is taken verbatim from the arguments: this never imports the
     backend or ``torch``. Validation happens *before* any file is written, so a
@@ -179,6 +182,7 @@ def package_backend(
         "slug": slug or name,
         "version": version,
         "task_type": task_type or "",
+        "requires_python": requires_python or "",
         "entrypoint": entrypoint,
         "sdk_protocol": SDK_PROTOCOL,
     }

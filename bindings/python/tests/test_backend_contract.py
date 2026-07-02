@@ -83,6 +83,7 @@ class DescribedBackend(CustomBackend):
     version = "0.2.0"
     task_type = "embedding"
     requirements = "requirements.txt"
+    requires_python = ">=3.9,<3.12"
 
     def setup(self, ctx: BackendContext) -> None:  # pragma: no cover
         pass
@@ -99,6 +100,7 @@ def test_manifest_reads_declared_class_attributes() -> None:
         "version": "0.2.0",
         "task_type": "embedding",
         "requirements": "requirements.txt",
+        "requires_python": ">=3.9,<3.12",
     }
     assert m.task_type in TASK_TYPES
 
@@ -107,3 +109,4 @@ def test_manifest_defaults_to_class_name_when_undeclared() -> None:
     m = MinimalBackend().manifest()
     assert m.name == "MinimalBackend"
     assert m.version == "" and m.task_type == "" and m.requirements == ""
+    assert m.requires_python == ""

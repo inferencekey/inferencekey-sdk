@@ -65,6 +65,10 @@ class BackendManifest:
     version: str = ""
     task_type: str = ""
     requirements: str = ""
+    #: PEP 440 version specifier the backend's deps need (e.g. ``">=3.9,<3.12"``
+    #: or an exact ``"3.11"``). Empty means no constraint. The worker feeds this
+    #: to ``uv`` so the venv gets the pinned Python regardless of the node's.
+    requires_python: str = ""
 
     def to_wire(self) -> Dict[str, Any]:
         """Render to the JSON-serializable dict returned by ``GET /meta``."""
@@ -73,6 +77,7 @@ class BackendManifest:
             "version": self.version,
             "task_type": self.task_type,
             "requirements": self.requirements,
+            "requires_python": self.requires_python,
         }
 
 
@@ -183,6 +188,11 @@ class CustomBackend(ABC):
     task_type: str = ""
     #: By convention, a path reference to the backend's ``requirements.txt``.
     requirements: str = ""
+    #: PEP 440 version specifier the backend's deps need (e.g. ``">=3.9,<3.12"``
+    #: or an exact ``"3.11"``). Empty means "no constraint" — the runtime picks a
+    #: sane default Python. Declare this when a pinned dep only ships wheels for
+    #: certain Python versions so the worker provisions the right interpreter.
+    requires_python: str = ""
 
     def manifest(self) -> BackendManifest:
         """Return this backend's declarative metadata for ``GET /meta``.
@@ -196,6 +206,7 @@ class CustomBackend(ABC):
             version=self.version,
             task_type=self.task_type,
             requirements=self.requirements,
+            requires_python=self.requires_python,
         )
 
     @abstractmethod

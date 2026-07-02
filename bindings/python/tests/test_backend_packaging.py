@@ -184,6 +184,31 @@ def test_task_type_optional(dummy_src, tmp_path):
     assert pkg.manifest["task_type"] == ""
 
 
+def test_requires_python_optional_yields_empty(dummy_src, tmp_path):
+    pkg = package_backend(
+        src=str(dummy_src),
+        entrypoint="backend:DummyBackend",
+        name="dummy",
+        version="0.1.0",
+        out_dir=str(tmp_path / "out"),
+    )
+    assert pkg.manifest["requires_python"] == ""
+
+
+def test_requires_python_written_to_manifest(dummy_src, tmp_path):
+    pkg = package_backend(
+        src=str(dummy_src),
+        entrypoint="backend:DummyBackend",
+        name="dummy",
+        version="0.1.0",
+        requires_python=">=3.9,<3.12",
+        out_dir=str(tmp_path / "out"),
+    )
+    assert pkg.manifest["requires_python"] == ">=3.9,<3.12"
+    manifest = read_manifest_from_archive(pkg.path)
+    assert manifest["requires_python"] == ">=3.9,<3.12"
+
+
 def test_invalid_entrypoint_raises_and_no_artifact(dummy_src, tmp_path):
     out = tmp_path / "out"
     with pytest.raises(PackagingError):
@@ -307,6 +332,32 @@ def test_cli_creates_artifact_and_prints(dummy_src, dummy_requirements, tmp_path
     artifact_path, sha = printed[0], printed[1]
     assert Path(artifact_path).is_file()
     assert sha == hashlib.sha256(Path(artifact_path).read_bytes()).hexdigest()
+
+
+def test_cli_requires_python_flag_written(dummy_src, tmp_path, capsys):
+    from inferencekey.backend import package as package_cli
+
+    out = tmp_path / "out"
+    rc = package_cli.main(
+        [
+            "--src",
+            str(dummy_src),
+            "--entrypoint",
+            "backend:DummyBackend",
+            "--name",
+            "dummy",
+            "--version",
+            "0.1.0",
+            "--requires-python",
+            ">=3.9,<3.12",
+            "--out",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    artifact_path = capsys.readouterr().out.strip().splitlines()[0]
+    manifest = read_manifest_from_archive(artifact_path)
+    assert manifest["requires_python"] == ">=3.9,<3.12"
 
 
 def test_cli_invalid_entrypoint_exits_nonzero(dummy_src, tmp_path):

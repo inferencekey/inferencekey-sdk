@@ -53,6 +53,7 @@ class MetaBackend(CustomBackend):
     version = "1.2.3"
     task_type = "classification"
     requirements = "requirements.txt"
+    requires_python = ">=3.9,<3.12"
 
     def setup(self, ctx: BackendContext) -> None:
         pass
@@ -233,6 +234,7 @@ def test_meta_returns_declared_metadata() -> None:
             "version": "1.2.3",
             "task_type": "classification",
             "requirements": "requirements.txt",
+            "requires_python": ">=3.9,<3.12",
         }
     finally:
         httpd.shutdown()
@@ -250,6 +252,7 @@ def test_meta_falls_back_to_class_name_without_metadata() -> None:
             "version": "",
             "task_type": "",
             "requirements": "",
+            "requires_python": "",
         }
     finally:
         httpd.shutdown()

@@ -59,6 +59,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="One of the SDK TASK_TYPES (optional).",
     )
     parser.add_argument(
+        "--requires-python",
+        dest="requires_python",
+        default=None,
+        help="PEP 440 Python specifier the backend needs, "
+        "e.g. '>=3.9,<3.12' or '3.11' (optional; empty means no constraint).",
+    )
+    parser.add_argument(
         "--out",
         dest="out_dir",
         required=True,
@@ -84,6 +91,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             slug=args.slug,
             version=args.version,
             task_type=args.task_type,
+            requires_python=args.requires_python,
             out_dir=args.out_dir,
             description=args.description,
         )
