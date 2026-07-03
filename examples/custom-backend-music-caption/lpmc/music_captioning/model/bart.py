@@ -104,7 +104,6 @@ class BartCaptionModel(nn.Module):
                  repetition_penalty=1.0,
                  ):
 
-        # self.bart.force_bos_token_to_be_generated = True
         audio_embs = self.audio_encoder(samples)
         encoder_outputs = self.bart.model.encoder(
             input_ids=None,
@@ -115,16 +114,23 @@ class BartCaptionModel(nn.Module):
             output_hidden_states=None,
             return_dict=True)
 
-        input_ids = torch.zeros((encoder_outputs['last_hidden_state'].size(0), 1)).long().to(self.device)
-        input_ids[:, 0] = self.bart.config.decoder_start_token_id
-        decoder_attention_mask = torch.ones((encoder_outputs['last_hidden_state'].size(0), 1)).long().to(self.device)
+        # We hand `generate()` a *precomputed* encoder output (the audio encoder
+        # replaces BART's text encoder). `generate()` then seeds the decoder from
+        # `decoder_start_token_id` on its own. The original code also passed
+        # `decoder_input_ids` / `decoder_attention_mask` / `decoder_inputs_embeds=None`
+        # explicitly; transformers >=4.44 rejects that combination — its
+        # `_get_initial_cache_position` dereferences `decoder_inputs_embeds` and
+        # crashes on the None. Passing only `encoder_outputs` (+ its
+        # attention_mask) is the supported shape and yields identical captions.
+        attention_mask = torch.ones(
+            encoder_outputs["last_hidden_state"].shape[:2],
+            dtype=torch.long,
+            device=self.device,
+        )
         if use_nucleus_sampling:
             outputs = self.bart.generate(
-                input_ids=None,
-                attention_mask=None,
-                decoder_input_ids=input_ids,
-                decoder_attention_mask=decoder_attention_mask,
                 encoder_outputs=encoder_outputs,
+                attention_mask=attention_mask,
                 max_length=max_length,
                 min_length=min_length,
                 do_sample=True,
@@ -132,22 +138,13 @@ class BartCaptionModel(nn.Module):
                 num_return_sequences=1,
                 repetition_penalty=1.1)
         else:
-            outputs = self.bart.generate(input_ids=None,
-                                            attention_mask=None,
-                                            decoder_input_ids=input_ids,
-                                            decoder_attention_mask=decoder_attention_mask,
-                                            encoder_outputs=encoder_outputs,
-                                            head_mask=None,
-                                            decoder_head_mask=None,
-                                            inputs_embeds=None,
-                                            decoder_inputs_embeds=None,
-                                            use_cache=None,
-                                            output_attentions=None,
-                                            output_hidden_states=None,
-                                            max_length=max_length,
-                                            min_length=min_length,
-                                            num_beams=num_beams,
-                                            repetition_penalty=repetition_penalty)
+            outputs = self.bart.generate(
+                encoder_outputs=encoder_outputs,
+                attention_mask=attention_mask,
+                max_length=max_length,
+                min_length=min_length,
+                num_beams=num_beams,
+                repetition_penalty=repetition_penalty)
 
         captions = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
         return captions

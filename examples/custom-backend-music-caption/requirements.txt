@@ -6,22 +6,18 @@ inferencekey
 # Inference-only dependencies for the LP-MusicCaps custom backend.
 # The SDK runtime itself imports NONE of these — they belong to this backend.
 #
-# VERSION PINS MATTER. LP-MusicCaps' BartCaptionModel.generate() targets the
-# transformers 4.26.x generation API; newer transformers (5.x) change BART
-# generation internals and raise at inference time. Pin transformers to 4.26.1
-# and a torch that has wheels for it. This combination has wheels for
-# CPython 3.9–3.11 (the version LP-MusicCaps was built against — see the
-# upstream Dockerfile `pytorch/pytorch:2.1.0`). It is NOT installable on
-# CPython 3.13, which only ships torch>=2.5 / transformers>=5. Build the
-# backend package with a 3.9–3.11 interpreter.
-#
-# Install torch first from the CPU wheel index, then the rest — see README.
-torch<2.2
-torchaudio<2.2
-transformers==4.26.1
+# Modern torch + transformers. BartCaptionModel.generate() was adapted to the
+# transformers >= 4.44 generation API (it passes only `encoder_outputs`, no
+# manual decoder_input_ids), so the old torch<2.2 / transformers==4.26.1 pins
+# are gone. Modern wheels are what let this run on recent GPUs: NVIDIA CUDA and
+# AMD ROCm publish wheels for new architectures (e.g. RDNA4/gfx120X) only for
+# torch >= 2.7. On an AMD node the worker points pip at the ROCm wheel index so
+# `torch` resolves to a `+rocm` build; on NVIDIA it comes from PyPI (CUDA).
+# pick_device() then selects the accelerator (falling back to CPU).
+torch>=2.2
+torchaudio>=2.2
+transformers>=4.44
 librosa>=0.8
-# torch<2.2 is compiled against the NumPy 1.x ABI; NumPy 2.x breaks it at
-# import time ("Failed to initialize NumPy: _ARRAY_API not found"). Pin <2.
 numpy<2
 einops
 soundfile

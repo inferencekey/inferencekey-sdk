@@ -28,6 +28,7 @@ from .base import (
     Job,
     Result,
 )
+from .device import pick_device
 from .packaging import (
     BackendPackage,
     package_backend,
@@ -42,6 +43,7 @@ __all__ = [
     "BackendContext",
     "BackendManifest",
     "TASK_TYPES",
+    "pick_device",
     "serve_backend",
     "package_backend",
     "read_manifest_from_archive",

@@ -20,6 +20,13 @@ Run it (from the SDK repo root, with this folder importable)::
 
     python -m inferencekey.backend.serve \\
         --port 8099 \\
+        --backend backend:MusicCaptionBackend
+
+By default the backend auto-selects the node's accelerator (CUDA / ROCm / MPS,
+else CPU). Pin a device explicitly if you need to::
+
+    python -m inferencekey.backend.serve \\
+        --port 8099 \\
         --backend backend:MusicCaptionBackend \\
         --config-json '{"device": "cpu"}'
 
@@ -42,7 +49,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from inferencekey.backend import BackendContext, CustomBackend, Job, Result
+from inferencekey.backend import (
+    BackendContext,
+    CustomBackend,
+    Job,
+    Result,
+    pick_device,
+)
 
 from lpmc.music_captioning.model.bart import BartCaptionModel
 from lpmc.utils.audio_utils import STR_CH_FIRST, load_audio
@@ -111,11 +124,13 @@ class MusicCaptionBackend(CustomBackend):
     version = "0.1.0"
     task_type = "audio2text"
     requirements = "requirements.txt"
-    # LP-MusicCaps' BartCaptionModel.generate() targets the transformers 4.26.x
-    # API, whose transformers/torch wheels only cover CPython 3.9–3.11. The
-    # worker honours this via uv (`uv venv --python`), so the backend runs on
-    # 3.11 even on a node whose default python3 is 3.13.
-    requires_python = ">=3.9,<3.12"
+    # Runs on modern torch + transformers (>=4.44), so it installs on any
+    # CPython 3.9–3.13 and — crucially — can use a recent-GPU accelerator:
+    # NVIDIA CUDA and AMD ROCm both ship torch wheels for new architectures
+    # (e.g. RDNA4/gfx120X) only for torch >= 2.7, which the old 4.26.x pin
+    # excluded. generate() was adapted for the newer transformers API (see
+    # lpmc/music_captioning/model/bart.py).
+    requires_python = ">=3.9"
 
     def setup(self, ctx: BackendContext) -> None:
         # Some nodes preset HF_HUB_ENABLE_HF_TRANSFER=1 (the accelerated
@@ -124,9 +139,13 @@ class MusicCaptionBackend(CustomBackend):
         # bart-base") falls back to the plain HTTP downloader that always works.
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
-        # Device is read explicitly from config; default CPU, no GPU
-        # autodetection and no forced .cuda().
-        self.device = str(ctx.config.get("device", "cpu"))
+        # Device selection: default "auto" picks the node's accelerator —
+        # CUDA (NVIDIA) or ROCm (AMD, also spelled "cuda") or Metal ("mps"),
+        # falling back to CPU. The operator can still pin an explicit device in
+        # config (e.g. {"device": "cpu"} or {"device": "cuda:1"}); pick_device
+        # validates it and degrades to CPU with a warning if that node's torch
+        # can't use it, so a job never crashes on a bad device string.
+        self.device = pick_device(str(ctx.config.get("device", "auto")))
         weights_dir = Path(
             ctx.config.get("weights_dir", str(_DEFAULT_WEIGHTS_DIR))
         )
