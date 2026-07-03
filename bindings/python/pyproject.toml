@@ -11,15 +11,32 @@ license = "Apache-2.0"
 requires-python = ">=3.9"
 authors = [{ name = "InferenceKey", email = "dev@inferencekey.com" }]
 keywords = ["inferencekey", "ai", "llm", "inference", "openai-compatible", "sdk"]
+# No incluimos un classifier `License ::`: con `license = "Apache-2.0"` (SPDX,
+# PEP 639) la licencia ya va en los metadatos y los build tools modernos
+# rechazan duplicarla como classifier.
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
-    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
 
 [project.urls]
 Homepage = "https://docs.inferencekey.com"
+Documentation = "https://docs.inferencekey.com"
 Repository = "https://github.com/inferencekey/inferencekey-sdk"
+Issues = "https://github.com/inferencekey/inferencekey-sdk/issues"
 
 [tool.maturin]
 # The native extension is `_inferencekey`; the pure-Python wrapper package
