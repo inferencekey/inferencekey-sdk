@@ -20,7 +20,9 @@ torch<2.2
 torchaudio<2.2
 transformers==4.26.1
 librosa>=0.8
-numpy
+# torch<2.2 is compiled against the NumPy 1.x ABI; NumPy 2.x breaks it at
+# import time ("Failed to initialize NumPy: _ARRAY_API not found"). Pin <2.
+numpy<2
 einops
 soundfile
 # audioread lets librosa decode mp3/ogg without a system ffmpeg for common
