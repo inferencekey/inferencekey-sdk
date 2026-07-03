@@ -1,3 +1,8 @@
+# InferenceKey SDK runtime (provides inferencekey.backend.serve), from PyPI.
+# Installed into the backend venv so the worker's
+# `python -m inferencekey.backend.serve` resolves it from site-packages.
+inferencekey
+
 # The custom backend runs PyTorch; the SDK runtime does not depend on torch.
 # CPU-only torch is enough for this example (no GPU, no weights downloaded).
 torch>=2.0

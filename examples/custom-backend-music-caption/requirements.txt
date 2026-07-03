@@ -1,3 +1,8 @@
+# InferenceKey SDK runtime (provides inferencekey.backend.serve), from PyPI.
+# Installed into the backend venv so the worker's
+# `python -m inferencekey.backend.serve` resolves it from site-packages.
+inferencekey
+
 # Inference-only dependencies for the LP-MusicCaps custom backend.
 # The SDK runtime itself imports NONE of these — they belong to this backend.
 #
