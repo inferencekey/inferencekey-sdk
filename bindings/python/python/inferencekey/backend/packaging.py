@@ -103,20 +103,29 @@ def _collect_code_members(src: Path) -> List[Tuple[Path, str]]:
     """Return ``(filesystem_path, arcname)`` pairs for the backend code.
 
     A single ``.py`` file maps to its bare filename at the archive root; a
-    directory is added recursively under its own name, in sorted order for a
-    deterministic layout. ``manifest.json``/``requirements.txt`` at the source
-    root are skipped — this module owns those names in the artifact.
+    directory has its *contents* added recursively **at the archive root**
+    (not under the directory's own name), in sorted order for a deterministic
+    layout. Rooting the contents is what makes the ``entrypoint`` (e.g.
+    ``backend:MusicCaptionBackend``) importable: the worker puts the extracted
+    dir on ``PYTHONPATH``, so ``backend.py`` must live at its root, not one
+    level down under the source folder's name. ``manifest.json``/
+    ``requirements.txt`` at the source root are skipped — this module owns
+    those names in the artifact.
     """
     if src.is_file():
         return [(src, src.name)]
 
     members: List[Tuple[Path, str]] = []
-    base = src.name
     for path in sorted(src.rglob("*")):
         if not path.is_file():
             continue
         rel = path.relative_to(src)
-        arcname = f"{base}/{rel.as_posix()}"
+        arcname = rel.as_posix()
+        # This module writes its own manifest.json/requirements.txt at the
+        # archive root; skip same-named files at the source root so they don't
+        # collide now that contents are rooted (nested ones are fine).
+        if arcname in (MANIFEST_NAME, REQUIREMENTS_NAME):
+            continue
         members.append((path, arcname))
     return members
 

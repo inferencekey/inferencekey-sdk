@@ -143,13 +143,17 @@ def test_sha256_and_size_match_disk(dummy_src, dummy_requirements, tmp_path):
 
 
 def test_package_directory_source(tmp_path):
-    pkgdir = tmp_path / "mypkg"
-    pkgdir.mkdir()
+    # The *contents* of the source dir are rooted in the archive (so a
+    # top-level ``backend.py`` yields entrypoint ``backend:...``). To ship a
+    # nested package ``mypkg``, point ``src`` at the parent that contains it.
+    root = tmp_path / "srcroot"
+    pkgdir = root / "mypkg"
+    pkgdir.mkdir(parents=True)
     (pkgdir / "__init__.py").write_text("", encoding="utf-8")
     (pkgdir / "backend.py").write_text(_DUMMY_SOURCE, encoding="utf-8")
 
     pkg = package_backend(
-        src=str(pkgdir),
+        src=str(root),
         entrypoint="mypkg.backend:DummyBackend",
         name="dummy",
         version="0.1.0",
