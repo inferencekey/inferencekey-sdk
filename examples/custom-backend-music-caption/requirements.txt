@@ -28,3 +28,7 @@ soundfile
 # audioread lets librosa decode mp3/ogg without a system ffmpeg for common
 # cases; ffmpeg on PATH is still the most robust decoder for exotic formats.
 audioread
+# The model downloads facebook/bart-base from the HF hub. Some nodes preset
+# HF_HUB_ENABLE_HF_TRANSFER=1; hf_transfer satisfies it (setup() also disables
+# it defensively). Harmless if unused.
+hf_transfer

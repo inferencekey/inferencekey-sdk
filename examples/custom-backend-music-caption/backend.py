@@ -118,6 +118,12 @@ class MusicCaptionBackend(CustomBackend):
     requires_python = ">=3.9,<3.12"
 
     def setup(self, ctx: BackendContext) -> None:
+        # Some nodes preset HF_HUB_ENABLE_HF_TRANSFER=1 (the accelerated
+        # downloader), which hard-fails if the `hf_transfer` package is absent
+        # in this venv. Disable it so BartConfig.from_pretrained("facebook/
+        # bart-base") falls back to the plain HTTP downloader that always works.
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+
         # Device is read explicitly from config; default CPU, no GPU
         # autodetection and no forced .cuda().
         self.device = str(ctx.config.get("device", "cpu"))
