@@ -16,7 +16,13 @@ inferencekey
 # pick_device() then selects the accelerator (falling back to CPU).
 torch>=2.2
 torchaudio>=2.2
-transformers>=4.44
+# Upper-bounded to <5: transformers 5.x lazily pulls in torchvision when
+# importing BART, and on a ROCm node the base image's torchvision (exposed to
+# the venv via the torch-link .pth) is ABI-incompatible with the venv's torch
+# ("operator torchvision::nms does not exist"), breaking the BART import. The
+# 4.44–4.57 line has the modern generation API this backend targets without the
+# torchvision pull-in, and is verified end-to-end on CUDA and ROCm.
+transformers>=4.44,<5
 librosa>=0.8
 numpy<2
 einops
