@@ -1,0 +1,7 @@
+# This example calls the workload over HTTP, so it needs the SDK + requests.
+#
+# local, unpublished build — see ../CONTRIBUTING.md#4-depending-on-the-sdk:
+#   ( cd ../../bindings/python && maturin develop --release )
+# or, once published:
+#   inferencekey>=0.1.0
+requests>=2.28
