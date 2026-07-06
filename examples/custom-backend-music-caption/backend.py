@@ -74,14 +74,35 @@ _N_SAMPLES = _CHUNK_DURATION * _TARGET_SR  # 160000
 
 
 def _download_weights(weights_dir: Path) -> Path:
-    """Return the path to ``transfer.pth``, downloading it once if missing."""
+    """Return the path to ``transfer.pth``, downloading it once if missing.
+
+    Concurrency-safe: the worker launches several backend processes (one per
+    slot), each of which calls ``setup()``. A naive "download to a shared
+    ``.partial`` then rename" races — the first process to rename removes the
+    ``.partial`` out from under the others, which then crash with
+    ``FileNotFoundError: ...transfer.pth.partial -> transfer.pth``. We fix that
+    by downloading to a **per-process** temp file and doing an atomic
+    ``os.replace`` (which is fine to run concurrently — last writer wins, same
+    bytes), re-checking for an already-good file at each step.
+    """
     weights_dir.mkdir(parents=True, exist_ok=True)
     weights_path = weights_dir / "transfer.pth"
     if weights_path.exists() and weights_path.stat().st_size > 0:
         return weights_path
-    tmp_path = weights_path.with_suffix(".pth.partial")
-    urllib.request.urlretrieve(_WEIGHTS_URL, tmp_path)
-    tmp_path.replace(weights_path)
+    # Unique temp path per process so concurrent setups don't clobber each other.
+    tmp_path = weights_dir / f"transfer.pth.{os.getpid()}.partial"
+    try:
+        urllib.request.urlretrieve(_WEIGHTS_URL, tmp_path)
+        # Another process may have finished first; only replace if we still need to.
+        if not (weights_path.exists() and weights_path.stat().st_size > 0):
+            os.replace(tmp_path, weights_path)
+    finally:
+        # Clean up our temp file if it survived (e.g. someone else won the race).
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
     return weights_path
 
 
