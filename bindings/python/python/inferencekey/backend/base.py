@@ -137,6 +137,112 @@ class Job:
         """Render to the JSON-serializable dict for transport."""
         return {"id": self.id, "input": self.input}
 
+    # --- Typed accessors -------------------------------------------------
+    #
+    # ``input`` stays a free dict (the contract is deliberately schema-less),
+    # but the *same job* reaches ``process()`` with different envelopes
+    # depending on the caller — a raw ``/process`` curl vs. the platform's
+    # OpenAI-compatible data plane. These accessors hide that difference so a
+    # backend reads one shape and works from both, instead of hard-coding a
+    # single key and 500-ing when the other caller shows up (which is exactly
+    # how the audio2text example first broke).
+
+    def text(self) -> str:
+        """Return the prompt text for a text2text/classification job.
+
+        Accepts both the ``{"prompt": ...}`` shape and the chat shape
+        ``{"messages": [{"role", "content"}, ...]}`` (last user message wins).
+        Raises :class:`ValueError` if neither is present.
+        """
+        prompt = self.input.get("prompt")
+        if isinstance(prompt, str) and prompt:
+            return prompt
+        for msg in reversed(self.messages()):
+            if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+                return msg["content"]
+        # Fall back to the last message with string content, whatever its role.
+        for msg in reversed(self.messages()):
+            if isinstance(msg.get("content"), str) and msg["content"]:
+                return msg["content"]
+        raise ValueError(
+            "job input has no text: expected 'prompt' or 'messages' with content"
+        )
+
+    def messages(self) -> "list[Dict[str, Any]]":
+        """Return the chat ``messages`` list (empty if the job carries none)."""
+        msgs = self.input.get("messages")
+        return msgs if isinstance(msgs, list) else []
+
+    def audio_bytes(self) -> bytes:
+        """Return the raw audio bytes for an audio2text job, from EITHER shape.
+
+        * Native ``/process``: ``input.audio_b64`` (base64 of the audio file).
+        * Public API (``POST .../v1/audio/transcriptions``): the manager forwards
+          the OpenAI multipart body base64-encoded in ``input.raw_body_b64``
+          (with ``input.raw_body_content_type`` carrying the boundary); we parse
+          the multipart and return the ``file`` part's bytes.
+
+        Raises :class:`ValueError` if no audio can be found or decoded — mapped
+        to a clean error by the runtime.
+        """
+        import base64
+        import binascii
+
+        b64 = self.input.get("audio_b64")
+        if isinstance(b64, str) and b64:
+            try:
+                return base64.b64decode(b64, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError(f"input.audio_b64 is not valid base64: {exc}")
+
+        raw_b64 = self.input.get("raw_body_b64")
+        content_type = self.input.get("raw_body_content_type") or ""
+        if isinstance(raw_b64, str) and raw_b64 and content_type.startswith("multipart/"):
+            try:
+                raw = base64.b64decode(raw_b64, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError(f"input.raw_body_b64 is not valid base64: {exc}")
+            data = _multipart_file_bytes(raw, content_type)
+            if data:
+                return data
+            raise ValueError(
+                "multipart body carried no file part; send audio as the 'file' field"
+            )
+
+        raise ValueError(
+            "job input carries no audio: expected 'audio_b64' (native) or a "
+            "multipart body in 'raw_body_b64' (public /v1/audio/transcriptions)"
+        )
+
+
+def _multipart_file_bytes(raw: bytes, content_type: str) -> "bytes | None":
+    """First file part's bytes from a multipart/form-data body (stdlib parser).
+
+    Prefers the part named ``file`` (OpenAI's transcription field); falls back to
+    the first part with a filename or an ``audio/*`` content type.
+    """
+    import email
+
+    header = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode()
+    msg = email.message_from_bytes(header + raw)
+    if not msg.is_multipart():
+        return None
+    fallback = None
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        disp = part.get("Content-Disposition", "") or ""
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+        if 'name="file"' in disp or "name=file" in disp:
+            return payload
+        if fallback is None and (
+            "filename=" in disp or (part.get_content_type() or "").startswith("audio/")
+        ):
+            fallback = payload
+    return fallback
+
 
 @dataclass
 class Result:

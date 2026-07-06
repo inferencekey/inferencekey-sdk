@@ -38,8 +38,6 @@ Attribution: LP-MusicCaps by SeungHeon Doh et al.
 
 from __future__ import annotations
 
-import base64
-import binascii
 import os
 import sys
 import tempfile
@@ -56,21 +54,6 @@ from inferencekey.backend import (
     Result,
     pick_device,
 )
-
-from lpmc.music_captioning.model.bart import BartCaptionModel
-from lpmc.utils.audio_utils import STR_CH_FIRST, load_audio
-from lpmc.utils.eval_utils import load_pretrained
-
-#: LP-MusicCaps transfer checkpoint on the Hugging Face hub.
-_WEIGHTS_URL = "https://huggingface.co/seungheondoh/lp-music-caps/resolve/main/transfer.pth"
-#: Default cache location for the downloaded weights.
-_DEFAULT_WEIGHTS_DIR = Path.home() / ".cache" / "inferencekey" / "lp-music-caps"
-#: From the original hparams.yaml (only these two values are actually used).
-_MAX_LENGTH = 128
-#: 10 s at 16 kHz — one captioning chunk.
-_TARGET_SR = 16000
-_CHUNK_DURATION = 10
-_N_SAMPLES = _CHUNK_DURATION * _TARGET_SR  # 160000
 
 
 def _download_weights(weights_dir: Path) -> Path:
@@ -181,13 +164,11 @@ class MusicCaptionBackend(CustomBackend):
         print("model loaded", file=sys.stderr, flush=True)
 
     def process(self, job: Job) -> Result:
-        audio_b64 = job.input.get("audio_b64")
-        if not isinstance(audio_b64, str) or not audio_b64:
-            raise ValueError("input must carry a base64 string 'audio_b64'")
-        try:
-            audio_bytes = base64.b64decode(audio_b64, validate=True)
-        except (binascii.Error, ValueError) as exc:
-            raise ValueError(f"input.audio_b64 is not valid base64: {exc}")
+        # job.audio_bytes() accepts both the native `audio_b64` shape and the
+        # public data plane's multipart `/v1/audio/transcriptions` body, so the
+        # same backend works whether you curl `/process` directly or hit the
+        # public endpoint with an `ik_live_` key.
+        audio_bytes = job.audio_bytes()
 
         num_beams = int(job.input.get("num_beams", 5))
 
