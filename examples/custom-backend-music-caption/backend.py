@@ -55,6 +55,21 @@ from inferencekey.backend import (
     pick_device,
 )
 
+from lpmc.music_captioning.model.bart import BartCaptionModel
+from lpmc.utils.audio_utils import STR_CH_FIRST, load_audio
+from lpmc.utils.eval_utils import load_pretrained
+
+#: LP-MusicCaps transfer checkpoint on the Hugging Face hub.
+_WEIGHTS_URL = "https://huggingface.co/seungheondoh/lp-music-caps/resolve/main/transfer.pth"
+#: Default cache location for the downloaded weights.
+_DEFAULT_WEIGHTS_DIR = Path.home() / ".cache" / "inferencekey" / "lp-music-caps"
+#: From the original hparams.yaml (only these two values are actually used).
+_MAX_LENGTH = 128
+#: 10 s at 16 kHz — one captioning chunk.
+_TARGET_SR = 16000
+_CHUNK_DURATION = 10
+_N_SAMPLES = _CHUNK_DURATION * _TARGET_SR  # 160000
+
 
 def _download_weights(weights_dir: Path) -> Path:
     """Return the path to ``transfer.pth``, downloading it once if missing.
