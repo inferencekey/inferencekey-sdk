@@ -22,6 +22,13 @@ Endpoints (a minimal, SDK-owned schema — **not** OpenAI-compatible):
 * ``POST /process`` — body ``{"id": str, "input": {...}}``; returns ``200``
   ``{"output": {...}}``. A bad body is ``400``; a raising ``process()`` is
   ``500`` ``{"error": "..."}`` and the server stays alive.
+* ``POST /forecast`` — body ``{"id": str, "target": [...], "horizon": int}``
+  (see :class:`~inferencekey.backend.ForecastRequest`); returns ``200``
+  ``{"forecast": {...}}``. Same body/readiness handling as ``/process``: a bad
+  body is ``400``, a raising ``forecast()`` is ``500`` and the server stays
+  alive. If the backend does not implement ``forecast()`` it answers ``501``
+  ``{"error": "backend does not support forecast"}`` — the capability is
+  optional, so ``process``-only backends keep working unchanged.
 
 To start a backend from code instead of the CLI, use :func:`serve_backend`.
 
@@ -45,7 +52,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple, Union
 
 from ..errors import BackendEntrypointError, BackendSetupError
-from .base import BackendContext, CustomBackend, Job, Result
+from .base import (
+    BackendContext,
+    CustomBackend,
+    ForecastRequest,
+    ForecastResult,
+    Job,
+    Result,
+)
 
 #: Loopback only — the runtime never binds a routable interface.
 HOST = "127.0.0.1"
@@ -116,6 +130,9 @@ class _BackendState:
     def process(self, job: Job) -> Result:
         return self._backend.process(job)
 
+    def forecast(self, request: ForecastRequest) -> ForecastResult:
+        return self._backend.forecast(request)
+
     def manifest(self) -> Dict[str, Any]:
         """The backend's declarative metadata, as a JSON-serializable dict."""
         return self._backend.manifest().to_wire()
@@ -152,28 +169,46 @@ def _make_handler(state: _BackendState) -> type:
                 return
             self._send_json(404, {"error": "not found"})
 
-        def do_POST(self) -> None:  # noqa: N802 — stdlib API
-            if self.path.split("?", 1)[0] != "/process":
-                self._send_json(404, {"error": "not found"})
-                return
-            if not state.ready:
-                self._send_json(503, {"error": "backend not ready"})
-                return
+        def _read_json_body(self) -> "Optional[Dict[str, Any]]":
+            """Read and decode the request body, or send a 4xx and return ``None``.
 
+            Enforces the same limits for every POST endpoint: a valid
+            ``Content-Length`` within :data:`_MAX_BODY_BYTES` and a well-formed
+            JSON body. On any violation it sends the error response itself and
+            returns ``None`` so the caller just bails.
+            """
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 self._send_json(400, {"error": "invalid Content-Length"})
-                return
+                return None
             if length < 0 or length > _MAX_BODY_BYTES:
                 self._send_json(400, {"error": "request body too large"})
-                return
+                return None
 
             raw = self.rfile.read(length) if length else b""
             try:
-                data = json.loads(raw.decode("utf-8")) if raw else {}
+                return json.loads(raw.decode("utf-8")) if raw else {}
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 self._send_json(400, {"error": f"invalid JSON body: {exc}"})
+                return None
+
+        def do_POST(self) -> None:  # noqa: N802 — stdlib API
+            path = self.path.split("?", 1)[0]
+            if path == "/process":
+                self._handle_process()
+            elif path == "/forecast":
+                self._handle_forecast()
+            else:
+                self._send_json(404, {"error": "not found"})
+
+        def _handle_process(self) -> None:
+            if not state.ready:
+                self._send_json(503, {"error": "backend not ready"})
+                return
+
+            data = self._read_json_body()
+            if data is None:
                 return
 
             try:
@@ -198,6 +233,47 @@ def _make_handler(state: _BackendState) -> type:
                     {
                         "error": "process() must return a Result; wrap your "
                         "value as Result(output=...)"
+                    },
+                )
+                return
+            self._send_json(200, result.to_wire())
+
+        def _handle_forecast(self) -> None:
+            if not state.ready:
+                self._send_json(503, {"error": "backend not ready"})
+                return
+
+            data = self._read_json_body()
+            if data is None:
+                return
+
+            try:
+                request = ForecastRequest.from_wire(data)
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+
+            try:
+                result = state.forecast(request)
+            except NotImplementedError:
+                # The backend does not implement forecast() — a distinct,
+                # expected condition (501), not a per-request failure (500).
+                self._send_json(
+                    501, {"error": "backend does not support forecast"}
+                )
+                return
+            except Exception as exc:  # noqa: BLE001 — keep the server alive
+                _log_err(f"forecast failed for request {request.id}:")
+                traceback.print_exc(file=sys.stderr)
+                self._send_json(500, {"error": str(exc)})
+                return
+
+            if not isinstance(result, ForecastResult):
+                self._send_json(
+                    500,
+                    {
+                        "error": "forecast() must return a ForecastResult; wrap "
+                        "your value as ForecastResult(median=...)"
                     },
                 )
                 return

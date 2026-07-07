@@ -25,6 +25,8 @@ from .base import (
     BackendContext,
     BackendManifest,
     CustomBackend,
+    ForecastRequest,
+    ForecastResult,
     Job,
     Result,
 )
@@ -40,6 +42,8 @@ __all__ = [
     "CustomBackend",
     "Job",
     "Result",
+    "ForecastRequest",
+    "ForecastResult",
     "BackendContext",
     "BackendManifest",
     "TASK_TYPES",

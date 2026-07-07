@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 
 #: The task types the product supports. ``text2text`` is the default; a backend
@@ -48,7 +48,12 @@ TASK_TYPES = (
     "reranker",
     "classification",
     "reward",
+    "forecast",
 )
+
+#: Default quantile levels a forecast reports when the request omits them: a
+#: symmetric 80% interval around the median.
+DEFAULT_QUANTILE_LEVELS = (0.1, 0.5, 0.9)
 
 
 @dataclass
@@ -259,6 +264,232 @@ class Result:
         return {"output": self.output}
 
 
+def _as_float_list(value: Any, field_name: str) -> List[float]:
+    """Coerce a JSON array of numbers to ``List[float]`` or raise ``ValueError``.
+
+    Accepts ``int`` and ``float`` (JSON has no int/float distinction), rejects
+    ``bool`` (which is an ``int`` subclass in Python) and anything non-numeric,
+    with a message naming ``field_name`` so the 400 says *what* is wrong.
+    """
+    if not isinstance(value, list):
+        raise ValueError(f"'{field_name}' must be a JSON array of numbers")
+    out: List[float] = []
+    for i, item in enumerate(value):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise ValueError(
+                f"'{field_name}[{i}]' must be a number, got {type(item).__name__}"
+            )
+        out.append(float(item))
+    return out
+
+
+@dataclass
+class ForecastRequest:
+    """One time-series forecast request handed to :meth:`CustomBackend.forecast`.
+
+    A single series per request (batching multiple series is out of scope for
+    v1). ``id`` correlates the request across logs and responses, mirroring
+    :class:`Job`.
+
+    Fields:
+
+    * ``target`` — the observed history of the series (non-empty list of
+      numbers).
+    * ``horizon`` — how many future steps to predict (``int > 0``).
+    * ``timestamps`` — optional ISO8601 timestamps for the history; when given
+      the backend may echo forward-dated timestamps in the result.
+    * ``freq`` — optional pandas-style frequency string for the series (e.g.
+      ``"D"``, ``"H"``, ``"5min"``, ``"W"``, ``"M"``). Foundation time-series
+      models (Chronos-2, TimesFM, Moirai) use it to (a) generate the output
+      forecast window's timestamps and (b) feed the frequency to the model. The
+      SDK does not validate the exact pandas syntax — any non-empty string is
+      accepted and the backend interprets it.
+    * ``quantile_levels`` — quantiles to report, each in the open interval
+      ``(0, 1)``; defaults to ``[0.1, 0.5, 0.9]``.
+    * ``past_covariates`` — optional named series aligned to the history; each
+      list must have ``len(target)`` values.
+    * ``future_covariates`` — optional named series known for the future
+      window; each list must have ``horizon`` values.
+
+    Minimal valid request::
+
+        {"id": "f1", "target": [1, 2, 3, 4, 5], "horizon": 3}
+    """
+
+    id: str
+    target: List[float]
+    horizon: int
+    timestamps: Optional[List[str]] = None
+    freq: Optional[str] = None
+    quantile_levels: List[float] = field(
+        default_factory=lambda: list(DEFAULT_QUANTILE_LEVELS)
+    )
+    past_covariates: Optional[Dict[str, List[float]]] = None
+    future_covariates: Optional[Dict[str, List[float]]] = None
+
+    @classmethod
+    def from_wire(cls, data: Dict[str, Any]) -> "ForecastRequest":
+        """Build a :class:`ForecastRequest` from a decoded ``/forecast`` body.
+
+        Raises :class:`ValueError` (mapped to a ``400`` by the runtime) with a
+        message that says *what* is missing or malformed — never a traceback.
+        """
+        if not isinstance(data, dict):
+            raise ValueError("forecast request must be a JSON object")
+
+        req_id = data.get("id")
+        if not isinstance(req_id, str) or not req_id:
+            raise ValueError("forecast 'id' must be a non-empty string")
+
+        if "target" not in data:
+            raise ValueError("forecast 'target' is required (the series history)")
+        target = _as_float_list(data.get("target"), "target")
+        if not target:
+            raise ValueError("forecast 'target' must be a non-empty list of numbers")
+
+        if "horizon" not in data:
+            raise ValueError("forecast 'horizon' is required (steps to predict)")
+        horizon = data.get("horizon")
+        if isinstance(horizon, bool) or not isinstance(horizon, int):
+            raise ValueError("forecast 'horizon' must be an integer")
+        if horizon <= 0:
+            raise ValueError(f"forecast 'horizon' must be > 0, got {horizon}")
+
+        timestamps = data.get("timestamps")
+        if timestamps is not None:
+            if not isinstance(timestamps, list) or not all(
+                isinstance(t, str) for t in timestamps
+            ):
+                raise ValueError("forecast 'timestamps' must be a list of strings")
+            if len(timestamps) != len(target):
+                raise ValueError(
+                    f"forecast 'timestamps' has {len(timestamps)} values but "
+                    f"target has {len(target)}"
+                )
+
+        freq = data.get("freq")
+        if freq is not None and (not isinstance(freq, str) or not freq):
+            raise ValueError("forecast 'freq' must be a non-empty string")
+
+        raw_levels = data.get("quantile_levels")
+        if raw_levels is None:
+            quantile_levels = list(DEFAULT_QUANTILE_LEVELS)
+        else:
+            quantile_levels = _as_float_list(raw_levels, "quantile_levels")
+            for q in quantile_levels:
+                if not (0.0 < q < 1.0):
+                    raise ValueError(
+                        f"forecast 'quantile_levels' must each be in (0, 1), got {q}"
+                    )
+
+        past_covariates = cls._validate_covariates(
+            data.get("past_covariates"),
+            "past_covariate",
+            len(target),
+            "target length",
+        )
+        future_covariates = cls._validate_covariates(
+            data.get("future_covariates"),
+            "future_covariate",
+            horizon,
+            "horizon",
+        )
+
+        return cls(
+            id=req_id,
+            target=target,
+            horizon=horizon,
+            timestamps=timestamps,
+            freq=freq,
+            quantile_levels=quantile_levels,
+            past_covariates=past_covariates,
+            future_covariates=future_covariates,
+        )
+
+    @staticmethod
+    def _validate_covariates(
+        raw: Any, label: str, expected_len: int, expected_desc: str
+    ) -> Optional[Dict[str, List[float]]]:
+        """Validate a covariates map: dict of name → list of ``expected_len`` numbers.
+
+        Returns ``None`` when ``raw`` is absent. ``label`` names the covariate in
+        error messages (e.g. ``future_covariate 'temp' has 3 values but horizon
+        is 24``).
+        """
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise ValueError(f"forecast '{label}s' must be a JSON object")
+        out: Dict[str, List[float]] = {}
+        for name, series in raw.items():
+            values = _as_float_list(series, f"{label} '{name}'")
+            if len(values) != expected_len:
+                raise ValueError(
+                    f"{label} '{name}' has {len(values)} values but "
+                    f"{expected_desc} is {expected_len}"
+                )
+            out[name] = values
+        return out
+
+    def to_wire(self) -> Dict[str, Any]:
+        """Render to the JSON-serializable dict for transport.
+
+        Omits optional fields that are ``None`` so the wire form of a minimal
+        request stays minimal.
+        """
+        payload: Dict[str, Any] = {
+            "id": self.id,
+            "target": self.target,
+            "horizon": self.horizon,
+            "quantile_levels": self.quantile_levels,
+        }
+        if self.timestamps is not None:
+            payload["timestamps"] = self.timestamps
+        if self.freq is not None:
+            payload["freq"] = self.freq
+        if self.past_covariates is not None:
+            payload["past_covariates"] = self.past_covariates
+        if self.future_covariates is not None:
+            payload["future_covariates"] = self.future_covariates
+        return payload
+
+
+@dataclass
+class ForecastResult:
+    """The outcome of :meth:`CustomBackend.forecast`.
+
+    * ``median`` — the point forecast, one value per future step
+      (``len == horizon``).
+    * ``quantiles`` — optional map of quantile level (as a string key, e.g.
+      ``"0.1"``) to a list of predicted values (``len == horizon``); the median
+      quantile (``"0.5"``) need not be duplicated here.
+    * ``timestamps`` — optional ISO8601 timestamps for the forecast window
+      (``len == horizon``).
+
+    Wire form::
+
+        {"forecast": {"median": [...], "timestamps": [...],
+                      "quantiles": {"0.1": [...], "0.9": [...]}}}
+    """
+
+    median: List[float] = field(default_factory=list)
+    quantiles: Optional[Dict[str, List[float]]] = None
+    timestamps: Optional[List[str]] = None
+
+    def to_wire(self) -> Dict[str, Any]:
+        """Render to the JSON-serializable dict returned by ``/forecast``.
+
+        Optional fields (``timestamps``, ``quantiles``) are omitted when unset so
+        a bare median forecast stays compact.
+        """
+        forecast: Dict[str, Any] = {"median": self.median}
+        if self.timestamps is not None:
+            forecast["timestamps"] = self.timestamps
+        if self.quantiles is not None:
+            forecast["quantiles"] = self.quantiles
+        return {"forecast": forecast}
+
+
 @dataclass
 class BackendContext:
     """What the runtime passes to :meth:`CustomBackend.setup`.
@@ -333,3 +564,27 @@ class CustomBackend(ABC):
         the server stays alive for the next one.
         """
         raise NotImplementedError
+
+    def forecast(self, request: ForecastRequest) -> ForecastResult:
+        """Predict a time series (optional capability, not abstract).
+
+        This is **opt-in**: the default raises :class:`NotImplementedError`, so
+        backends that only implement :meth:`process` stay valid and the runtime
+        answers ``501`` on ``POST /forecast``. A forecasting backend reuses the
+        model loaded in :meth:`setup` (no new lifecycle) and overrides this to
+        return a :class:`ForecastResult`.
+
+        Raising a *generic* exception here yields a ``500`` for this request
+        while the server stays alive, mirroring :meth:`process`.
+
+        A forecasting backend reads ``request.freq`` (the pandas-style frequency,
+        e.g. ``"D"``) when it needs to date the output window's timestamps or feed
+        the frequency to the model; it is ``None`` when the caller omits it.
+
+        Example (a trivial persistence forecaster)::
+
+            def forecast(self, request: ForecastRequest) -> ForecastResult:
+                last = request.target[-1]
+                return ForecastResult(median=[last] * request.horizon)
+        """
+        raise NotImplementedError("backend does not support forecast")
