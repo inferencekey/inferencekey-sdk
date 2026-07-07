@@ -1,0 +1,31 @@
+# --- The SDK (this example's own runtime deps) -----------------------------
+# main.py calls the workload over HTTP, so it needs the SDK + requests.
+#
+# local, unpublished build — see ../CONTRIBUTING.md#4-depending-on-the-sdk:
+#   ( cd ../../bindings/python && maturin develop --release )
+# or, once published:
+#   inferencekey>=0.1.0
+requests>=2.28
+
+# --- The custom backend's deps (installed into the backend's venv) ---------
+# The SDK runtime that serves the backend imports NONE of these — they belong
+# to backend.py (chronos-2). The worker installs them into the backend's venv
+# from this file (name = "chronos-2", requirements = "requirements.txt").
+
+# The InferenceKey SDK runtime provides `inferencekey.backend.serve`, which the
+# worker launches inside the backend venv; keep it resolvable from site-packages.
+inferencekey
+
+# Chronos-2 lives in the chronos-2 line of chronos-forecasting (>= 2.0.0rc1);
+# `from chronos import Chronos2Pipeline` needs it.
+chronos-forecasting>=2.0.0rc1
+# predict_df is a pandas API; the backend builds the context/future DataFrames.
+pandas
+# Pinned <2 for torch ABI compatibility, like the other examples.
+numpy<2
+# Standard torch — Chronos-2 uses no custom CUDA kernels, so a recent wheel runs
+# on NVIDIA CUDA or AMD ROCm. On an AMD node the worker points pip at the ROCm
+# wheel index so `torch` resolves to a `+rocm` build (e.g. for RDNA4/gfx120x,
+# which only has wheels for torch >= 2.7); on NVIDIA it comes from PyPI (CUDA).
+# pick_device() then selects the accelerator, falling back to CPU.
+torch>=2.2

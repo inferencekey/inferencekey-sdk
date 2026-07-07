@@ -1,0 +1,32 @@
+# --- The SDK (this example's own runtime deps) -----------------------------
+# main.py calls the workload over HTTP, so it needs the SDK + requests.
+#
+# local, unpublished build — see ../CONTRIBUTING.md#4-depending-on-the-sdk:
+#   ( cd ../../bindings/python && maturin develop --release )
+# or, once published:
+#   inferencekey>=0.1.0
+requests>=2.28
+
+# --- The custom backend's deps (installed into the backend's venv) ---------
+# The SDK runtime that serves the backend imports NONE of these — they belong
+# to backend.py (timesfm). The worker installs them into the backend's venv
+# from this file (name = "timesfm", requirements = "requirements.txt").
+
+# The InferenceKey SDK runtime provides `inferencekey.backend.serve`, which the
+# worker launches inside the backend venv; keep it resolvable from site-packages.
+inferencekey
+
+# TimesFM 2.5, PyTorch backend. `import timesfm;
+# timesfm.TimesFM_2p5_200M_torch.from_pretrained(...)` needs it. The [torch]
+# extra pulls in the PyTorch runtime the model uses.
+timesfm[torch]
+# forecast() builds numpy arrays for the model inputs.
+numpy<2
+# pandas is only used to synthesise output timestamps when the request carries a
+# `freq`/`timestamps` axis; the forecast itself is numpy.
+pandas
+# Standard torch — TimesFM uses no custom CUDA kernels, so a recent wheel runs on
+# NVIDIA CUDA or AMD ROCm. On an AMD node the worker points pip at the ROCm wheel
+# index so `torch` resolves to a `+rocm` build (RDNA4/gfx120x needs torch >= 2.7);
+# on NVIDIA it comes from PyPI (CUDA). pick_device() then selects the accelerator.
+torch>=2.2
