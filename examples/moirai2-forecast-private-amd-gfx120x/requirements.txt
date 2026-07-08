@@ -12,17 +12,17 @@ requests>=2.28
 # to backend.py (moirai2). The worker installs them into the backend's venv
 # from this file (name = "moirai2", requirements = "requirements.txt").
 #
-# CPU-only backend (see the packaged manifest's `cpu_only`): uni2ts pins an
-# older stack (`torch>=2.1,<2.5`, `scipy~=1.11.3`) that has NO wheels for the
-# node's ROCm torch or for CPython 3.13 — so a GPU/py3.13 install is
-# unresolvable. Instead this backend runs on **CPU under CPython 3.12** (declared
-# via requires_python), where uni2ts installs cleanly with its own pinned deps
-# (including a CPU torch). Moirai 2.0 R-small is tiny, so CPU inference is fine.
+# ROCm/torch note: uni2ts pins `torch>=2.1,<2.5` and `scipy~=1.11.3`, neither of
+# which has a wheel for the node's ROCm torch or for CPython 3.13. On an AMD
+# node the worker installs a ROCm torch FIRST and then applies an install-time
+# **override** (torch==<rocm build>, scipy>=1.14), so uni2ts installs against the
+# GPU torch and a py3.13-wheel scipy instead of dragging in its own capped pins.
+# Result: Moirai runs on the AMD GPU like the other forecast backends.
 
 # The InferenceKey SDK runtime provides `inferencekey.backend.serve`, which the
 # worker launches inside the backend venv; keep it resolvable from site-packages.
 inferencekey==0.260708.1124
 
-# Moirai 2.0 (uni2ts) is only published from GitHub. Installed with its own deps
-# (torch CPU, gluonts, scipy, einops, …) — no torch pinning games needed on CPU.
+# Moirai 2.0 (uni2ts) is only published from GitHub. Installed with its own deps;
+# torch/scipy are overridden to GPU-compatible builds by the worker (see above).
 uni2ts @ git+https://github.com/SalesforceAIResearch/uni2ts.git
