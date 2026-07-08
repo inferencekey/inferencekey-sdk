@@ -142,6 +142,7 @@ def package_backend(
     requirements: Optional[str] = None,
     requires_python: Optional[str] = None,
     description: Optional[str] = None,
+    cpu_only: bool = False,
 ) -> BackendPackage:
     """Bundle a custom backend into ``<out_dir>/<name>-<version>.tar.gz``.
 
@@ -195,6 +196,10 @@ def package_backend(
         "entrypoint": entrypoint,
         "sdk_protocol": SDK_PROTOCOL,
     }
+    # Only emit cpu_only when set, so packages that don't need it stay identical
+    # to before (the worker defaults the field to false).
+    if cpu_only:
+        manifest["cpu_only"] = True
     if description is not None:
         manifest["description"] = description
 

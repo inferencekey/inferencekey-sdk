@@ -12,42 +12,17 @@ requests>=2.28
 # to backend.py (moirai2). The worker installs them into the backend's venv
 # from this file (name = "moirai2", requirements = "requirements.txt").
 #
-# ROCm/torch note (why this file is unusual): uni2ts pins `torch>=2.1,<2.5`,
-# but AMD RDNA4 (gfx120x) ROCm wheels start at `torch>=2.7`. Installing uni2ts
-# with its own deps would drag in that `<2.5` pin and make the venv unresolvable
-# on this hardware. So we install uni2ts with **--no-deps** and declare its
-# inference-time dependencies here ourselves — pinning torch WITHOUT an upper
-# bound so the worker's ROCm wheel (2.7+) satisfies it. Moirai's forecast path
-# does not use torch APIs that changed across 2.4→2.7.
+# CPU-only backend (see the packaged manifest's `cpu_only`): uni2ts pins an
+# older stack (`torch>=2.1,<2.5`, `scipy~=1.11.3`) that has NO wheels for the
+# node's ROCm torch or for CPython 3.13 — so a GPU/py3.13 install is
+# unresolvable. Instead this backend runs on **CPU under CPython 3.12** (declared
+# via requires_python), where uni2ts installs cleanly with its own pinned deps
+# (including a CPU torch). Moirai 2.0 R-small is tiny, so CPU inference is fine.
 
 # The InferenceKey SDK runtime provides `inferencekey.backend.serve`, which the
 # worker launches inside the backend venv; keep it resolvable from site-packages.
-inferencekey
+inferencekey==0.260708.1124
 
-# Moirai 2.0 (uni2ts) is only published from GitHub. It is installed from a
-# branch whose dependency metadata does not cap torch, so the worker's already
-# installed ROCm torch (2.7+) is kept. (uni2ts main pins `torch<2.5`, which is
-# incompatible with the AMD RDNA4 / gfx120x ROCm wheels that start at 2.7 — a
-# requirements.txt cannot pass a per-package `--no-deps` to uv, so the cap is
-# avoided at the source instead.) uni2ts's inference-time deps are pinned below.
+# Moirai 2.0 (uni2ts) is only published from GitHub. Installed with its own deps
+# (torch CPU, gluonts, scipy, einops, …) — no torch pinning games needed on CPU.
 uni2ts @ git+https://github.com/SalesforceAIResearch/uni2ts.git
-
-# --- uni2ts's inference-time dependencies (pinned so they resolve regardless) --
-# These mirror uni2ts's own pins EXCEPT torch, which we uncap for ROCm.
-lightning>=2.0
-gluonts~=0.14.3
-numpy~=1.26.0
-scipy~=1.11.3
-einops==0.7.*
-jaxtyping~=0.2.24
-python-dotenv==1.0.0
-hydra-core==1.3
-orjson
-safetensors
-huggingface_hub>=0.23.0
-pandas
-# Standard torch — Moirai uses no custom CUDA kernels, so a recent wheel runs on
-# NVIDIA CUDA or AMD ROCm. Uncapped (unlike uni2ts's <2.5) so the AMD RDNA4
-# (gfx120x) ROCm wheel (torch>=2.7) resolves; on NVIDIA it comes from PyPI.
-# pick_device() then selects the accelerator, falling back to CPU.
-torch>=2.2
