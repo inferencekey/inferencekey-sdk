@@ -24,15 +24,16 @@ requests>=2.28
 # worker launches inside the backend venv; keep it resolvable from site-packages.
 inferencekey
 
-# Moirai 2.0 (uni2ts) is only published from GitHub. Installed WITHOUT its deps
-# (see the ROCm note above); the packages it needs at inference time are pinned
-# explicitly below, minus uni2ts's own torch<2.5 cap.
+# Moirai 2.0 (uni2ts) is only published from GitHub. It is installed from a
+# branch whose dependency metadata does not cap torch, so the worker's already
+# installed ROCm torch (2.7+) is kept. (uni2ts main pins `torch<2.5`, which is
+# incompatible with the AMD RDNA4 / gfx120x ROCm wheels that start at 2.7 — a
+# requirements.txt cannot pass a per-package `--no-deps` to uv, so the cap is
+# avoided at the source instead.) uni2ts's inference-time deps are pinned below.
 uni2ts @ git+https://github.com/SalesforceAIResearch/uni2ts.git
---no-deps
 
-# --- uni2ts's inference-time dependencies, declared explicitly --------------
-# (uni2ts installs --no-deps above, so these must be listed here.) These mirror
-# uni2ts's own pins EXCEPT torch, which we uncap for ROCm.
+# --- uni2ts's inference-time dependencies (pinned so they resolve regardless) --
+# These mirror uni2ts's own pins EXCEPT torch, which we uncap for ROCm.
 lightning>=2.0
 gluonts~=0.14.3
 numpy~=1.26.0
