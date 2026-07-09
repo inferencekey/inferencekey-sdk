@@ -14,8 +14,7 @@ requests>=2.28
 
 # The InferenceKey SDK runtime provides `inferencekey.backend.serve`, which the
 # worker launches inside the backend venv; keep it resolvable from site-packages.
-inferencekey
-
+inferencekey==0.260708.1124
 # TimesFM 2.5, PyTorch backend. `import timesfm;
 # timesfm.TimesFM_2p5_200M_torch.from_pretrained(...)` needs it. The [torch]
 # extra pulls in the PyTorch runtime the model uses.
