@@ -22,6 +22,10 @@ inferencekey==0.260709.1212
 # Kronos's own requirements (kronos_model/kronos.py + module.py import these).
 einops==0.8.1
 huggingface_hub==0.33.1
+# The worker sets HF_HUB_ENABLE_HF_TRANSFER=1 in its environment for faster HF
+# downloads; huggingface_hub then hard-requires the hf_transfer package at
+# download time (from_pretrained). Declare it so the venv has it.
+hf_transfer
 safetensors
 tqdm
 # forecast() builds OHLCV DataFrames and stacks sample paths with numpy/pandas.
