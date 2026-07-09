@@ -326,6 +326,12 @@ class ForecastRequest:
     )
     past_covariates: Optional[Dict[str, List[float]]] = None
     future_covariates: Optional[Dict[str, List[float]]] = None
+    # Sampling controls for probabilistic backends (e.g. Kronos, which draws
+    # Monte-Carlo sample paths and derives quantiles from them). Ignored by
+    # backends that don't sample. `num_samples` sets how many paths to draw;
+    # `return_samples` asks the backend to also return the raw paths.
+    num_samples: Optional[int] = None
+    return_samples: bool = False
 
     @classmethod
     def from_wire(cls, data: Dict[str, Any]) -> "ForecastRequest":
@@ -395,6 +401,19 @@ class ForecastRequest:
             "horizon",
         )
 
+        num_samples = data.get("num_samples")
+        if num_samples is not None:
+            if isinstance(num_samples, bool) or not isinstance(num_samples, int):
+                raise ValueError("forecast 'num_samples' must be an integer")
+            if num_samples <= 0:
+                raise ValueError(
+                    f"forecast 'num_samples' must be > 0, got {num_samples}"
+                )
+
+        return_samples = data.get("return_samples", False)
+        if not isinstance(return_samples, bool):
+            raise ValueError("forecast 'return_samples' must be a boolean")
+
         return cls(
             id=req_id,
             target=target,
@@ -404,6 +423,8 @@ class ForecastRequest:
             quantile_levels=quantile_levels,
             past_covariates=past_covariates,
             future_covariates=future_covariates,
+            num_samples=num_samples,
+            return_samples=return_samples,
         )
 
     @staticmethod
@@ -451,6 +472,10 @@ class ForecastRequest:
             payload["past_covariates"] = self.past_covariates
         if self.future_covariates is not None:
             payload["future_covariates"] = self.future_covariates
+        if self.num_samples is not None:
+            payload["num_samples"] = self.num_samples
+        if self.return_samples:
+            payload["return_samples"] = self.return_samples
         return payload
 
 
@@ -465,28 +490,37 @@ class ForecastResult:
       quantile (``"0.5"``) need not be duplicated here.
     * ``timestamps`` — optional ISO8601 timestamps for the forecast window
       (``len == horizon``).
+    * ``samples`` — optional raw sample paths from a probabilistic backend, of
+      shape ``[num_samples][horizon]`` (each row a full path over the horizon).
+      Only populated when the caller asked for it (``return_samples``); omitted
+      otherwise so the wire form is unchanged for existing callers.
 
     Wire form::
 
         {"forecast": {"median": [...], "timestamps": [...],
-                      "quantiles": {"0.1": [...], "0.9": [...]}}}
+                      "quantiles": {"0.1": [...], "0.9": [...]},
+                      "samples": [[...], [...], ...]}}
     """
 
     median: List[float] = field(default_factory=list)
     quantiles: Optional[Dict[str, List[float]]] = None
     timestamps: Optional[List[str]] = None
+    samples: Optional[List[List[float]]] = None
 
     def to_wire(self) -> Dict[str, Any]:
         """Render to the JSON-serializable dict returned by ``/forecast``.
 
-        Optional fields (``timestamps``, ``quantiles``) are omitted when unset so
-        a bare median forecast stays compact.
+        Optional fields (``timestamps``, ``quantiles``, ``samples``) are omitted
+        when unset so a bare median forecast stays compact and the response is
+        byte-identical for callers that don't request the extras.
         """
         forecast: Dict[str, Any] = {"median": self.median}
         if self.timestamps is not None:
             forecast["timestamps"] = self.timestamps
         if self.quantiles is not None:
             forecast["quantiles"] = self.quantiles
+        if self.samples is not None:
+            forecast["samples"] = self.samples
         return {"forecast": forecast}
 
 

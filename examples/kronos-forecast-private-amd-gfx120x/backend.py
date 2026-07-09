@@ -142,8 +142,12 @@ class KronosBackend(CustomBackend):
         )
 
         # --- run n_paths stochastic samples and collect the close forecasts ---
+        # The caller can override how many Monte-Carlo paths to draw via
+        # `num_samples` (more paths → smoother quantiles / richer sample set);
+        # otherwise the backend's configured default (self.n_paths) is used.
+        n_paths = request.num_samples if request.num_samples is not None else self.n_paths
         paths: List[Any] = []
-        for _ in range(self.n_paths):
+        for _ in range(n_paths):
             pred_df = self.predictor.predict(
                 df=df,
                 x_timestamp=x_ts,
@@ -166,7 +170,19 @@ class KronosBackend(CustomBackend):
             str(q): [float(x) for x in np.quantile(stacked, q, axis=0)]
             for q in request.quantile_levels
         }
-        return ForecastResult(median=median, quantiles=(quantiles or None), timestamps=y_iso)
+        # Expose the raw sample paths only when asked — the same paths the
+        # quantiles above are derived from, shape [n_paths][horizon].
+        samples = (
+            [[float(x) for x in row] for row in stacked]
+            if request.return_samples
+            else None
+        )
+        return ForecastResult(
+            median=median,
+            quantiles=(quantiles or None),
+            timestamps=y_iso,
+            samples=samples,
+        )
 
 
 def _build_timestamps(
