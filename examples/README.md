@@ -41,6 +41,7 @@ the model runs:
 | _(planned)_ `chat-streaming-private-nvidia` | Py | Private | NVIDIA | `vllm` | `fixed` | Pin a chat workload to your NVIDIA worker + a specific GPU resource. |
 | _(planned)_ `chat-streaming-private-amd-gfx120x` | Py | Private | AMD R9700 (gfx120x) | `vllm` | `fixed` | Same, on an AMD ROCm RDNA4 worker — note the ROCm-specific serve flags. |
 | [`gguf-llamacpp-private-amd`](./gguf-llamacpp-private-amd) | Py | Private | AMD R9700 (gfx120x) | `llamacpp` | `fixed` | Serve a **GGUF** model (Gemma 4 26B) with `llama-server` on an AMD ROCm worker. The `command` points at a GGUF repo/file (`-hf <repo> --hf-file <file.gguf>`); no venv, no safetensors. |
+| [`gguf-embedding-llamacpp-private-amd`](./gguf-embedding-llamacpp-private-amd) | Py | Private | AMD R9700 (gfx120x) | `llamacpp` | `fixed` | Serve a **GGUF embedding** model (Qwen3-Embedding-8B) with `llama-server --embedding --pooling last` and call `embed()`. Same GGUF/`llamacpp` path as above but modality `embedding` — the only embedding runtime on RDNA4, where `sglang` is unsupported. |
 
 There is a fuller, two-language streaming demo today at
 [`docs/sdk-demo`](../../../docs/sdk-demo) in the parent repo; the examples here
