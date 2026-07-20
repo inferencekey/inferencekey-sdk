@@ -96,16 +96,26 @@ pub enum TaskType {
     Embedding,
     #[serde(rename = "text2image")]
     Text2Image,
+    #[serde(rename = "text2video")]
+    Text2Video,
     #[serde(rename = "text2audio")]
     Text2Audio,
+    #[serde(rename = "image2image")]
+    Image2Image,
+    #[serde(rename = "image2video")]
+    Image2Video,
     #[serde(rename = "audio2text")]
     Audio2Text,
+    #[serde(rename = "omni")]
+    Omni,
     #[serde(rename = "reranker")]
     Reranker,
     #[serde(rename = "classification")]
     Classification,
     #[serde(rename = "reward")]
     Reward,
+    #[serde(rename = "forecast")]
+    Forecast,
 }
 
 impl TaskType {
@@ -115,11 +125,16 @@ impl TaskType {
             TaskType::Text2Text => "text2text",
             TaskType::Embedding => "embedding",
             TaskType::Text2Image => "text2image",
+            TaskType::Text2Video => "text2video",
             TaskType::Text2Audio => "text2audio",
+            TaskType::Image2Image => "image2image",
+            TaskType::Image2Video => "image2video",
             TaskType::Audio2Text => "audio2text",
+            TaskType::Omni => "omni",
             TaskType::Reranker => "reranker",
             TaskType::Classification => "classification",
             TaskType::Reward => "reward",
+            TaskType::Forecast => "forecast",
         }
     }
 }
@@ -245,11 +260,16 @@ mod tests {
             TaskType::Text2Text,
             TaskType::Embedding,
             TaskType::Text2Image,
+            TaskType::Text2Video,
             TaskType::Text2Audio,
+            TaskType::Image2Image,
+            TaskType::Image2Video,
             TaskType::Audio2Text,
+            TaskType::Omni,
             TaskType::Reranker,
             TaskType::Classification,
             TaskType::Reward,
+            TaskType::Forecast,
         ];
         for variant in variants {
             let json = serde_json::to_string(&variant).expect("serialize");

@@ -26,11 +26,16 @@ class TaskType(_Str):
     TEXT2TEXT = "text2text"
     EMBEDDING = "embedding"
     TEXT2IMAGE = "text2image"
+    TEXT2VIDEO = "text2video"
     TEXT2AUDIO = "text2audio"
+    IMAGE2IMAGE = "image2image"
+    IMAGE2VIDEO = "image2video"
     AUDIO2TEXT = "audio2text"
+    OMNI = "omni"
     RERANKER = "reranker"
     CLASSIFICATION = "classification"
     REWARD = "reward"
+    FORECAST = "forecast"
 
 
 class OnDrift(_Str):
