@@ -23,7 +23,8 @@
 use std::ffi::{c_char, c_int, CString};
 
 use inferencekey_core::{
-    embed, ensure, generate_text, EmbedParams, GenerateTextParams, OnDrift, ReqwestHttp,
+    embed, ensure, generate_text, rerank, EmbedParams, GenerateTextParams, OnDrift, RerankParams,
+    ReqwestHttp,
     WorkloadSpec,
 };
 
@@ -203,6 +204,50 @@ unsafe fn run_embed(
     let params: EmbedParams = parse_json(params_json)?;
     let result = client
         .block_on(embed(
+            client.http(),
+            client.base_url(),
+            project_slug,
+            workload_slug,
+            api_key,
+            params,
+        ))
+        .map_err(map_call_error)?;
+    write_json(&result, out_json)
+}
+
+/// Run a rerank request. `params_json` is a `RerankParams` as JSON; on
+/// success writes a `RerankResult` JSON string to `*out_json`.
+///
+/// # Safety
+/// See [`ik_ensure`]; the same pointer rules apply.
+#[no_mangle]
+pub unsafe extern "C" fn ik_rerank(
+    client: *mut Client,
+    project_slug: *const c_char,
+    workload_slug: *const c_char,
+    api_key: *const c_char,
+    params_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    run_rerank(client, project_slug, workload_slug, api_key, params_json, out_json).ok_or_err()
+}
+
+unsafe fn run_rerank(
+    client: *mut Client,
+    project_slug: *const c_char,
+    workload_slug: *const c_char,
+    api_key: *const c_char,
+    params_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> Result<(), c_int> {
+    let client = as_ref(client)?;
+    let project_slug = borrow_str(project_slug, "project_slug").map_err(|_| IK_ERR_INVALID_UTF8)?;
+    let workload_slug =
+        borrow_str(workload_slug, "workload_slug").map_err(|_| IK_ERR_INVALID_UTF8)?;
+    let api_key = borrow_str(api_key, "api_key").map_err(|_| IK_ERR_INVALID_UTF8)?;
+    let params: RerankParams = parse_json(params_json)?;
+    let result = client
+        .block_on(rerank(
             client.http(),
             client.base_url(),
             project_slug,

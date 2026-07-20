@@ -89,6 +89,20 @@ export interface EmbedResult {
   raw: unknown;
 }
 
+export interface RerankItem {
+  /** Index of the document in the request `documents` array. */
+  index: number;
+  /** Relevance score against the query (higher = better). */
+  relevanceScore: number;
+}
+
+export interface RerankResult {
+  /** Documents scored against the query, ordered highest-first. */
+  results: RerankItem[];
+  model: string;
+  raw: unknown;
+}
+
 const DEFAULT_BASE_URL = "https://api.inferencekey.com";
 
 function env(name: string): string | undefined {
@@ -447,5 +461,36 @@ export class Endpoint {
       JSON.stringify({ input }),
     );
     return JSON.parse(raw) as EmbedResult;
+  }
+
+  async rerank(params: {
+    query: string;
+    documents: string[];
+    topN?: number;
+  }): Promise<RerankResult> {
+    const body: Record<string, unknown> = {
+      query: params.query,
+      documents: params.documents,
+    };
+    if (params.topN !== undefined) body.top_n = params.topN;
+    const raw = await this.native.rerank(
+      this.projectSlug,
+      this.workloadSlug,
+      this.apiKey,
+      JSON.stringify(body),
+    );
+    const parsed = JSON.parse(raw) as {
+      results: Array<{ index: number; relevance_score: number }>;
+      model: string;
+      raw: unknown;
+    };
+    return {
+      results: parsed.results.map((r) => ({
+        index: r.index,
+        relevanceScore: r.relevance_score,
+      })),
+      model: parsed.model,
+      raw: parsed.raw,
+    };
   }
 }

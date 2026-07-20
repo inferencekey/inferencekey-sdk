@@ -19,7 +19,8 @@ use pyo3::prelude::*;
 use inferencekey_core::ports::http::HttpPort;
 use inferencekey_core::{
     delete as core_delete, embed, ensure, generate_text, generate_text_stream, readiness_events,
-    CoreError, CoreResult, EmbedParams, GenerateTextParams, OnDrift, ReadinessEvent, ReqwestHttp,
+    rerank, CoreError, CoreResult, EmbedParams, GenerateTextParams, OnDrift, ReadinessEvent,
+    RerankParams, ReqwestHttp,
     TextChunk, WorkloadSpec,
 };
 
@@ -197,6 +198,30 @@ impl Client {
         let params: EmbedParams = parse_json(params_json)?;
         let result = py.allow_threads(|| {
             self.block_on(embed(
+                self.port(),
+                &self.base_url,
+                project_slug,
+                workload_slug,
+                api_key,
+                params,
+            ))
+        });
+        result.map_err(map_core_error).and_then(to_json)
+    }
+
+    /// Run a rerank request. `params_json` is a JSON `RerankParams`;
+    /// returns a `RerankResult` as JSON.
+    fn rerank(
+        &self,
+        py: Python<'_>,
+        project_slug: &str,
+        workload_slug: &str,
+        api_key: &str,
+        params_json: &str,
+    ) -> PyResult<String> {
+        let params: RerankParams = parse_json(params_json)?;
+        let result = py.allow_threads(|| {
+            self.block_on(rerank(
                 self.port(),
                 &self.base_url,
                 project_slug,

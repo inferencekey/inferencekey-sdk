@@ -19,7 +19,8 @@ use tokio::sync::Mutex;
 use inferencekey_core::ports::http::HttpPort;
 use inferencekey_core::{
     delete as core_delete, embed, ensure, generate_text, generate_text_stream, readiness_events,
-    CoreError, EmbedParams, GenerateTextParams, OnDrift, ReadinessEvent, ReqwestHttp, TextChunk,
+    rerank, CoreError, EmbedParams, GenerateTextParams, OnDrift, ReadinessEvent, RerankParams,
+    ReqwestHttp, TextChunk,
 };
 use inferencekey_core::WorkloadSpec;
 
@@ -182,6 +183,32 @@ impl Client {
         let http = self.http.clone();
         let base_url = self.base_url.clone();
         let result = embed(
+            port(&http),
+            &base_url,
+            &project_slug,
+            &workload_slug,
+            &api_key,
+            params,
+        )
+        .await
+        .map_err(map_core_error)?;
+        to_json(result)
+    }
+
+    /// Run a rerank request. `params_json` is a JSON `RerankParams`;
+    /// resolves to a `RerankResult` as JSON.
+    #[napi]
+    pub async fn rerank(
+        &self,
+        project_slug: String,
+        workload_slug: String,
+        api_key: String,
+        params_json: String,
+    ) -> Result<String> {
+        let params: RerankParams = parse_json(&params_json)?;
+        let http = self.http.clone();
+        let base_url = self.base_url.clone();
+        let result = rerank(
             port(&http),
             &base_url,
             &project_slug,

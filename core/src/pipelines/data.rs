@@ -83,6 +83,33 @@ pub struct EmbedResult {
     pub raw: Value,
 }
 
+/// Inputs for [`rerank`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RerankParams {
+    pub query: String,
+    pub documents: Vec<String>,
+    /// Return only the `top_n` highest-scoring documents. `None` returns all.
+    pub top_n: Option<u32>,
+}
+
+/// One scored document in a rerank result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RerankItem {
+    /// Index of the document in the request `documents` array.
+    pub index: usize,
+    /// Relevance score of the document against the query (higher = better).
+    pub relevance_score: f64,
+}
+
+/// A rerank result: documents scored against the query, highest first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RerankResult {
+    pub results: Vec<RerankItem>,
+    pub model: String,
+    /// The full upstream response, untouched.
+    pub raw: Value,
+}
+
 // ---------------------------------------------------------------------------
 // EFFECT: public entry points
 // ---------------------------------------------------------------------------
@@ -137,6 +164,22 @@ pub async fn embed(
     let req = HttpRequest::with_body(HttpMethod::Post, url, api_key, body);
     let value = http.request_json(req).await?;
     parse_embed_result(&value)
+}
+
+/// Run a rerank request and decode the result.
+pub async fn rerank(
+    http: &dyn HttpPort,
+    base_url: &str,
+    project_slug: &str,
+    workload_slug: &str,
+    api_key: &str,
+    params: RerankParams,
+) -> CoreResult<RerankResult> {
+    let url = build_endpoint_url(base_url, project_slug, workload_slug, "rerank");
+    let body = build_rerank_body(workload_slug, &params)?;
+    let req = HttpRequest::with_body(HttpMethod::Post, url, api_key, body);
+    let value = http.request_json(req).await?;
+    parse_rerank_result(&value)
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +256,22 @@ fn build_embed_body(workload_slug: &str, params: &EmbedParams) -> CoreResult<Val
             "input": params.input,
         })),
     }
+}
+
+/// Build the `/rerank` request body.
+fn build_rerank_body(workload_slug: &str, params: &RerankParams) -> CoreResult<Value> {
+    if params.query.trim().is_empty() {
+        return Err(invalid("query must not be empty"));
+    }
+    if params.documents.is_empty() {
+        return Err(invalid("documents must not be empty"));
+    }
+    let mut body = Map::new();
+    body.insert("model".to_string(), json!(resolve_model(workload_slug)));
+    body.insert("query".to_string(), json!(params.query));
+    body.insert("documents".to_string(), json!(params.documents));
+    insert_opt(&mut body, "top_n", params.top_n.map(Value::from));
+    Ok(Value::Object(body))
 }
 
 /// The OpenAI `model` field: the workload slug, or `"default"` when unnamed.
@@ -298,6 +357,49 @@ fn parse_embedding(item: &Value) -> CoreResult<Vec<f64>> {
         .iter()
         .map(|n| n.as_f64().ok_or_else(|| drift("data[].embedding[]")))
         .collect()
+}
+
+/// Decode a rerank response into a [`RerankResult`].
+///
+/// llama.cpp / the OpenAI-style rerank shape returns
+/// `{"results": [{"index": i, "relevance_score": s}, ...], "model": "..."}`.
+/// The results come back already sorted highest-first.
+fn parse_rerank_result(value: &Value) -> CoreResult<RerankResult> {
+    let results = value
+        .get("results")
+        .and_then(Value::as_array)
+        .ok_or_else(|| drift("results"))?;
+    let results = results.iter().map(parse_rerank_item).collect::<CoreResult<_>>()?;
+    // `model` is best-effort: the rerank response shape "might change" (llama.cpp
+    // README) and some builds omit it, so fall back to empty rather than erroring
+    // on an otherwise-valid ranked result.
+    let model = optional_str(value, "model").unwrap_or_default();
+    Ok(RerankResult {
+        results,
+        model,
+        raw: value.clone(),
+    })
+}
+
+/// Decode one `results[i]` into a [`RerankItem`].
+///
+/// The score key is `relevance_score` in the Jina/Cohere shape llama.cpp
+/// follows; accept a bare `score` too, since the llama.cpp README warns the
+/// exact shape "might change" and some builds emit `score`.
+fn parse_rerank_item(item: &Value) -> CoreResult<RerankItem> {
+    let index = item
+        .get("index")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| drift("results[].index"))? as usize;
+    let relevance_score = item
+        .get("relevance_score")
+        .or_else(|| item.get("score"))
+        .and_then(Value::as_f64)
+        .ok_or_else(|| drift("results[].relevance_score"))?;
+    Ok(RerankItem {
+        index,
+        relevance_score,
+    })
 }
 
 /// Borrow `choices[0]` or report drift naming the missing field.

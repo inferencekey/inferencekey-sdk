@@ -29,7 +29,16 @@ from .errors import (
     PermissionDenied,
     ValidationError,
 )
-from .types import EmbedResult, EndpointRef, ReadinessEvent, TextChunk, TextResult, WorkloadSpec
+from .types import (
+    EmbedResult,
+    EndpointRef,
+    ReadinessEvent,
+    RerankItem,
+    RerankResult,
+    TextChunk,
+    TextResult,
+    WorkloadSpec,
+)
 
 _DEFAULT_BASE_URL = "https://api.inferencekey.com"
 
@@ -372,6 +381,37 @@ class Endpoint:
         data = json.loads(raw)
         return EmbedResult(
             embeddings=data["embeddings"],
+            model=data["model"],
+            raw=data.get("raw", {}),
+        )
+
+    def rerank(
+        self,
+        *,
+        query: str,
+        documents: List[str],
+        top_n: Optional[int] = None,
+    ) -> RerankResult:
+        """Rerank ``documents`` by relevance to ``query``, highest first.
+
+        Returns a :class:`RerankResult` whose ``results`` are ordered best-first;
+        each item's ``index`` points back into ``documents``. Pass ``top_n`` to
+        return only the highest-scoring ``top_n`` documents.
+        """
+        body = _drop_none({"query": query, "documents": list(documents), "top_n": top_n})
+        raw = _call(
+            self._native.rerank,
+            self._project_slug,
+            self.workload_slug,
+            self._api_key,
+            json.dumps(body),
+        )
+        data = json.loads(raw)
+        return RerankResult(
+            results=[
+                RerankItem(index=r["index"], relevance_score=r["relevance_score"])
+                for r in data["results"]
+            ],
             model=data["model"],
             raw=data.get("raw", {}),
         )

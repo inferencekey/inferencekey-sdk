@@ -58,8 +58,8 @@ pub use domain::spec::WorkloadSpec;
 
 pub use pipelines::management::{delete, ensure, readiness_events, EndpointRef, ReadinessEvent};
 pub use pipelines::data::{
-    embed, generate_text, generate_text_stream, ChatMessage, EmbedParams, EmbedResult,
-    GenerateTextParams, TextChunk, TextResult,
+    embed, generate_text, generate_text_stream, rerank, ChatMessage, EmbedParams, EmbedResult,
+    GenerateTextParams, RerankItem, RerankParams, RerankResult, TextChunk, TextResult,
 };
 
 pub use adapters::reqwest_http::ReqwestHttp;

@@ -111,6 +111,27 @@ class EmbedResult:
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class RerankItem:
+    """One scored document in a rerank result."""
+
+    index: int
+    relevance_score: float
+
+
+@dataclass(frozen=True)
+class RerankResult:
+    """A rerank result: documents scored against the query, highest first.
+
+    ``results`` is ordered best-first; each item's ``index`` points back into
+    the ``documents`` list passed to :meth:`Endpoint.rerank`.
+    """
+
+    results: List[RerankItem]
+    model: str
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+
 def _wire(value: Any) -> Any:
     """Render an enum (or str) to its wire string; pass ``None`` through."""
     if value is None:

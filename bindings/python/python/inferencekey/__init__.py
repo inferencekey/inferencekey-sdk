@@ -42,7 +42,16 @@ from .errors import (
     ValidationError,
 )
 from .publish import publish_custom_backend
-from .types import EmbedResult, EndpointRef, ReadinessEvent, TextChunk, TextResult, WorkloadSpec
+from .types import (
+    EmbedResult,
+    EndpointRef,
+    ReadinessEvent,
+    RerankItem,
+    RerankResult,
+    TextChunk,
+    TextResult,
+    WorkloadSpec,
+)
 
 if TYPE_CHECKING:  # for type checkers / IDEs only — no native ext at import time
     from .clients import DataClient, Endpoint, ManagementClient
@@ -73,6 +82,8 @@ __all__ = [
     "TextChunk",
     "ReadinessEvent",
     "EmbedResult",
+    "RerankResult",
+    "RerankItem",
     "ManagementClient",
     "DataClient",
     "Endpoint",
