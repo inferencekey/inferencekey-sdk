@@ -37,6 +37,25 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 
+class InvalidInput(ValueError):
+    """The **client's** job input is malformed — a 4xx condition, not a bug.
+
+    Raised by :class:`Job`'s input accessors (:meth:`Job.text`,
+    :meth:`Job.audio_bytes`, …) when the caller sent no usable input: an audio
+    transcription request without a ``file`` part, a text job with neither
+    ``prompt`` nor ``messages``, base64 that won't decode, and so on. The HTTP
+    runtime (:mod:`inferencekey.backend.serve`) catches this **before** the
+    generic handler and answers ``400`` — an honest "your request was wrong",
+    distinct from a ``500`` raised by a genuine failure inside the model.
+
+    It subclasses :class:`ValueError` on purpose: backends (and user code) that
+    already wrote ``except ValueError`` keep catching it unchanged — this is a
+    strictly retrocompatible refinement, not a new exception surface. Only the
+    input accessors raise it; a ``ValueError`` raised anywhere else (e.g. inside
+    the user's ``process()``) is still a real 500, never reclassified to 400.
+    """
+
+
 #: The task types the product supports. ``text2text`` is the default; a backend
 #: declares which one it implements via :attr:`CustomBackend.task_type`.
 TASK_TYPES = (
@@ -157,7 +176,7 @@ class Job:
 
         Accepts both the ``{"prompt": ...}`` shape and the chat shape
         ``{"messages": [{"role", "content"}, ...]}`` (last user message wins).
-        Raises :class:`ValueError` if neither is present.
+        Raises :class:`InvalidInput` if neither is present — a 4xx client error.
         """
         prompt = self.input.get("prompt")
         if isinstance(prompt, str) and prompt:
@@ -169,7 +188,7 @@ class Job:
         for msg in reversed(self.messages()):
             if isinstance(msg.get("content"), str) and msg["content"]:
                 return msg["content"]
-        raise ValueError(
+        raise InvalidInput(
             "job input has no text: expected 'prompt' or 'messages' with content"
         )
 
@@ -187,8 +206,8 @@ class Job:
           (with ``input.raw_body_content_type`` carrying the boundary); we parse
           the multipart and return the ``file`` part's bytes.
 
-        Raises :class:`ValueError` if no audio can be found or decoded — mapped
-        to a clean error by the runtime.
+        Raises :class:`InvalidInput` if no audio can be found or decoded — a 4xx
+        client error, mapped to a clean ``400`` by the runtime.
         """
         import base64
         import binascii
@@ -198,7 +217,7 @@ class Job:
             try:
                 return base64.b64decode(b64, validate=True)
             except (binascii.Error, ValueError) as exc:
-                raise ValueError(f"input.audio_b64 is not valid base64: {exc}")
+                raise InvalidInput(f"input.audio_b64 is not valid base64: {exc}")
 
         raw_b64 = self.input.get("raw_body_b64")
         content_type = self.input.get("raw_body_content_type") or ""
@@ -206,15 +225,15 @@ class Job:
             try:
                 raw = base64.b64decode(raw_b64, validate=True)
             except (binascii.Error, ValueError) as exc:
-                raise ValueError(f"input.raw_body_b64 is not valid base64: {exc}")
+                raise InvalidInput(f"input.raw_body_b64 is not valid base64: {exc}")
             data = _multipart_file_bytes(raw, content_type)
             if data:
                 return data
-            raise ValueError(
+            raise InvalidInput(
                 "multipart body carried no file part; send audio as the 'file' field"
             )
 
-        raise ValueError(
+        raise InvalidInput(
             "job input carries no audio: expected 'audio_b64' (native) or a "
             "multipart body in 'raw_body_b64' (public /v1/audio/transcriptions)"
         )

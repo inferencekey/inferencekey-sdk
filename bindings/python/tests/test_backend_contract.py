@@ -9,6 +9,7 @@ from inferencekey.backend import (
     BackendContext,
     BackendManifest,
     CustomBackend,
+    InvalidInput,
     Job,
     Result,
 )
@@ -67,6 +68,71 @@ def test_job_input_defaults_to_empty_dict() -> None:
 def test_job_from_wire_rejects_bad_payloads(bad: object) -> None:
     with pytest.raises(ValueError):
         Job.from_wire(bad)  # type: ignore[arg-type]
+
+
+# --- B1: InvalidInput — client input errors are 4xx, retrocompatible with ValueError ---
+
+
+def test_invalid_input_is_subclass_of_value_error() -> None:
+    # Retrocompat: backends already catching ValueError keep catching this.
+    assert issubclass(InvalidInput, ValueError)
+    assert isinstance(InvalidInput("x"), ValueError)
+
+
+def test_audio_bytes_without_audio_raises_invalid_input() -> None:
+    job = Job(id="j1", input={})
+    with pytest.raises(InvalidInput):
+        job.audio_bytes()
+    # And it is catchable as a plain ValueError (retrocompat).
+    with pytest.raises(ValueError):
+        job.audio_bytes()
+
+
+def test_audio_bytes_multipart_without_file_part_raises_invalid_input() -> None:
+    import base64
+
+    # A well-formed multipart body that carries no 'file' part → client error.
+    boundary = "BOUNDARY"
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="model"\r\n\r\n'
+        "whisper-1\r\n"
+        f"--{boundary}--\r\n"
+    ).encode()
+    job = Job(
+        id="j1",
+        input={
+            "raw_body_b64": base64.b64encode(body).decode(),
+            "raw_body_content_type": f"multipart/form-data; boundary={boundary}",
+        },
+    )
+    with pytest.raises(InvalidInput):
+        job.audio_bytes()
+
+
+def test_audio_bytes_returns_file_part_when_present() -> None:
+    import base64
+
+    boundary = "BOUNDARY"
+    audio = b"RIFFfakeaudio"
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="file"; filename="a.wav"\r\n'
+        "Content-Type: audio/wav\r\n\r\n"
+    ).encode() + audio + f"\r\n--{boundary}--\r\n".encode()
+    job = Job(
+        id="j1",
+        input={
+            "raw_body_b64": base64.b64encode(body).decode(),
+            "raw_body_content_type": f"multipart/form-data; boundary={boundary}",
+        },
+    )
+    assert job.audio_bytes() == audio
+
+
+def test_text_without_prompt_or_messages_raises_invalid_input() -> None:
+    with pytest.raises(InvalidInput):
+        Job(id="j1", input={}).text()
 
 
 def test_backend_context_defaults() -> None:

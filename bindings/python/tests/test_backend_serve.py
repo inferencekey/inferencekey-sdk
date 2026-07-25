@@ -82,6 +82,34 @@ class NotAResultBackend(CustomBackend):
         return {"output": {}}  # type: ignore[return-value]
 
 
+class TranscribeBackend(CustomBackend):
+    """Reads audio via Job.audio_bytes() — raises InvalidInput when absent.
+
+    Exercises B1: input the client got wrong → 400, not 500.
+    """
+
+    def setup(self, ctx: BackendContext) -> None:
+        pass
+
+    def process(self, job: Job) -> Result:
+        audio = job.audio_bytes()  # raises InvalidInput when no audio present
+        return Result(output={"bytes": len(audio)})
+
+
+class ArbitraryValueErrorBackend(CustomBackend):
+    """process() raises a plain ValueError from the *model*, not from input.
+
+    B1 retrocompat guard: a bare ValueError is a real bug → stays 500, never
+    reclassified to a 400 'client's fault'. Only InvalidInput is a 400.
+    """
+
+    def setup(self, ctx: BackendContext) -> None:
+        pass
+
+    def process(self, job: Job) -> Result:
+        raise ValueError("model exploded internally")
+
+
 class NotABackend:
     pass
 
@@ -296,6 +324,49 @@ def test_serve_backend_importable_from_package() -> None:
     from inferencekey.backend import serve_backend as exported
 
     assert exported is serve_mod.serve_backend
+
+
+# --- B1: InvalidInput → 400; arbitrary exception (incl. bare ValueError) → 500 ---
+
+
+def test_process_invalid_input_yields_400() -> None:
+    # The motivating case: a transcription job with no 'file' part. The backend
+    # raises InvalidInput via audio_bytes(); the runtime must answer 400, NOT
+    # the misleading 500 that map_upstream_error would turn into a 503.
+    port = _free_port()
+    httpd, _state = serve_mod.serve_backend(TranscribeBackend, port, block=False)
+    try:
+        status, body = _post(port, "/process", {"id": "j1", "input": {}})
+        assert status == 400, body
+        assert "error" in body
+        # And the server stays alive: a valid audio job afterwards succeeds.
+        import base64
+
+        b64 = base64.b64encode(b"RIFFfakeaudio").decode()
+        status, body = _post(
+            port, "/process", {"id": "j2", "input": {"audio_b64": b64}}
+        )
+        assert status == 200 and body["output"]["bytes"] == 13
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_process_bare_value_error_stays_500() -> None:
+    # Retrocompat guard: a ValueError from the user's model is a real bug and
+    # must stay 500 — never reclassified to a 400 'client's fault'. Only
+    # InvalidInput (a ValueError subclass) is a 400.
+    port = _free_port()
+    httpd, _state = serve_mod.serve_backend(
+        ArbitraryValueErrorBackend, port, block=False
+    )
+    try:
+        status, body = _post(port, "/process", {"id": "j1", "input": {}})
+        assert status == 500, body
+        assert "error" in body
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
 # --- C-5: clearer error when process() does not return a Result ---

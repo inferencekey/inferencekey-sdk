@@ -57,6 +57,7 @@ from .base import (
     CustomBackend,
     ForecastRequest,
     ForecastResult,
+    InvalidInput,
     Job,
     Result,
 )
@@ -219,9 +220,18 @@ def _make_handler(state: _BackendState) -> type:
 
             try:
                 result = state.process(job)
+            except InvalidInput as exc:
+                # The client's input was malformed (e.g. a transcription request
+                # with no audio). That is a 4xx — the caller's fault, not the
+                # model's — so return 400, not the misleading 500 a generic
+                # failure gets. Caught BEFORE `except Exception` on purpose.
+                self._send_json(400, {"error": str(exc)})
+                return
             except Exception as exc:  # noqa: BLE001 — keep the server alive
                 # Resilience: log the traceback for operators, return a clean
-                # 500 to the caller, and stay alive for the next job.
+                # 500 to the caller, and stay alive for the next job. A bare
+                # ValueError from the user's model is a real bug (500), NOT a
+                # client error — only InvalidInput (above) is reclassified.
                 _log_err(f"process failed for job {job.id}:")
                 traceback.print_exc(file=sys.stderr)
                 self._send_json(500, {"error": str(exc)})
@@ -261,6 +271,12 @@ def _make_handler(state: _BackendState) -> type:
                 self._send_json(
                     501, {"error": "backend does not support forecast"}
                 )
+                return
+            except InvalidInput as exc:
+                # Malformed client input surfaced from an input accessor → 400,
+                # caught BEFORE the generic handler; a bare ValueError from the
+                # user's model stays a real 500 below.
+                self._send_json(400, {"error": str(exc)})
                 return
             except Exception as exc:  # noqa: BLE001 — keep the server alive
                 _log_err(f"forecast failed for request {request.id}:")

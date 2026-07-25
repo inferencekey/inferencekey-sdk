@@ -27,6 +27,7 @@ from .base import (
     CustomBackend,
     ForecastRequest,
     ForecastResult,
+    InvalidInput,
     Job,
     Result,
 )
@@ -40,6 +41,7 @@ from .serve import serve_backend
 
 __all__ = [
     "CustomBackend",
+    "InvalidInput",
     "Job",
     "Result",
     "ForecastRequest",
