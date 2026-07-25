@@ -1,0 +1,39 @@
+# InferenceKey SDK runtime (provides inferencekey.backend.serve), from PyPI.
+# Installed into the backend venv so the worker's
+# `python -m inferencekey.backend.serve` resolves it from site-packages.
+inferencekey
+
+# Inference-only dependencies for the SANA 1.5 text2image backend.
+# The SDK runtime itself imports NONE of these — they belong to this backend.
+#
+# torch: SanaPipeline needs a recent build, and modern wheels are also what let
+# this run on recent GPUs — AMD ROCm publishes wheels for new architectures
+# (e.g. RDNA4/gfx120X) only for torch >= 2.7. On an AMD node the worker points
+# pip at the ROCm wheel index so `torch` resolves to a `+rocm` build; on NVIDIA
+# it comes from PyPI (CUDA). pick_device() then selects the accelerator.
+torch>=2.7
+
+# diffusers: SanaPipeline (and the SANA transformer/VAE classes) landed well
+# before this, but 0.38 is the line verified end-to-end on ROCm gfx1201.
+diffusers>=0.38
+
+# transformers: SANA's text encoder (Gemma-based) is loaded through
+# transformers. Unlike the music-caption backend this one does NOT hit the
+# torchvision import path, so the 5.x line is fine and is what ships in the
+# ROCm base image.
+transformers>=4.44
+
+# sentencepiece + protobuf: required by the Gemma tokenizer used by the text
+# encoder. Without them from_pretrained fails with a "requires the
+# SentencePiece library" error at load time, not at import time.
+sentencepiece
+protobuf
+
+# accelerate: diffusers uses it for sharded checkpoint loading (low_cpu_mem_
+# usage). That is what keeps the host-RAM peak near a single ~5 GB shard
+# instead of the full ~16 GB — the difference between loading and OOM-ing on a
+# small-RAM node.
+accelerate>=0.31
+
+# Pillow: encoding the generated image to PNG before base64.
+Pillow>=9
