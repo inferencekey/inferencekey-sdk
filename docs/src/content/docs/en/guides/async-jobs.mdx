@@ -1,0 +1,443 @@
+---
+title: Async jobs & webhooks
+description: Submit long-running inference as a background job and receive the result on your own HTTPS endpoint — the request envelope for every modality, the callback payload you receive, how to verify its signature, and the retry schedule.
+---
+
+import { Tabs, TabItem, Card, CardGrid, Aside, Steps, LinkCard } from "@astrojs/starlight/components";
+
+Every inference route has a synchronous form: you POST, you hold the connection, you get the result. That breaks down when the work takes longer than a client is willing to wait — image generation, long transcriptions, batch embeddings.
+
+The **async jobs endpoint** is the same inference surface, decoupled. You POST a job, get a `job_id` back in milliseconds, and we deliver the result to an HTTPS endpoint you own.
+
+<CardGrid>
+  <Card title="One endpoint, every modality" icon="puzzle">
+    A single `POST …/jobs` takes a `kind` field: chat, embeddings, rerank, audio, images, forecast. No per-modality async route to learn.
+  </Card>
+  <Card title="Your context, returned verbatim" icon="approve-check">
+    Attach any JSON `context` (an order id, a user id). It comes back untouched in the callback, so you don't need a lookup table.
+  </Card>
+  <Card title="Signed callbacks" icon="seti:lock">
+    Each delivery carries an HMAC-SHA256 signature over the timestamp and body, so you can prove it came from us.
+  </Card>
+  <Card title="Retries with backoff" icon="rocket">
+    A callback that fails is retried five times over roughly six hours. A brief outage on your side doesn't lose the result.
+  </Card>
+</CardGrid>
+
+## Before you start
+
+Async delivery needs two things configured on the workload, both in the dashboard under **Workloads → your workload → Endpoints**:
+
+<Steps>
+
+1. **Enable the `jobs` toggle.** It gates the async surface as a whole.
+
+2. **Enable the toggle for the modality you'll submit.** A `kind: "chat"` async job needs both `jobs` **and** `chat` enabled. This is deliberate: turning off the sync chat route shouldn't leave chat reachable through the async one.
+
+3. **Set your webhook URL and generate a signing secret.** The URL must be `https://` and publicly resolvable — see [Webhook URL requirements](#webhook-url-requirements).
+
+</Steps>
+
+<Aside type="caution" title="No webhook URL, no result">
+The job still runs and still bills, but the result has nowhere to go and is dropped. There is no polling endpoint to fall back on — the callback is the only delivery channel. Configure the URL before submitting.
+</Aside>
+
+## 1. Submit a job
+
+```http
+POST /endpoint/{project}/{workload}/jobs
+Authorization: Bearer ik_live_…
+Content-Type: application/json
+```
+
+The envelope has three fields: the `kind` that picks the modality, the `body` that is the ordinary OpenAI-shaped request for that modality, and your optional `context`.
+
+```json title="Request"
+{
+  "kind": "embeddings",
+  "body": {
+    "model": "bge-m3",
+    "input": "the quick brown fox"
+  },
+  "context": { "orderId": "ord_8821", "userId": "u_42" }
+}
+```
+
+You get `202 Accepted` immediately:
+
+```json title="Response"
+{ "job_id": "9f1c3a7e-5d02-4a11-b7c8-2e6481c1cf29" }
+```
+
+That `job_id` appears in the callback, so you can correlate. The response comes back as soon as the job is queued — it says nothing about whether inference succeeded.
+
+<Tabs>
+  <TabItem label="Python">
+
+```python
+import os, requests
+
+BASE = "https://cloud.inferencekey.com"
+resp = requests.post(
+    f"{BASE}/endpoint/gpu-workloads/my-workload/jobs",
+    headers={"Authorization": f"Bearer {os.environ['INFERENCEKEY_API_KEY']}"},
+    json={
+        "kind": "embeddings",
+        "body": {"model": "bge-m3", "input": "the quick brown fox"},
+        "context": {"orderId": "ord_8821"},
+    },
+    timeout=30,
+)
+resp.raise_for_status()
+job_id = resp.json()["job_id"]
+```
+
+  </TabItem>
+  <TabItem label="TypeScript">
+
+```ts
+const BASE = "https://cloud.inferencekey.com";
+const res = await fetch(`${BASE}/endpoint/gpu-workloads/my-workload/jobs`, {
+  method: "POST",
+  headers: {
+    Authorization: `Bearer ${process.env.INFERENCEKEY_API_KEY}`,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    kind: "embeddings",
+    body: { model: "bge-m3", input: "the quick brown fox" },
+    context: { orderId: "ord_8821" },
+  }),
+});
+if (!res.ok) throw new Error(`submit failed: ${res.status}`);
+const { job_id: jobId } = await res.json();
+```
+
+  </TabItem>
+  <TabItem label="curl">
+
+```sh
+curl -X POST "https://cloud.inferencekey.com/endpoint/gpu-workloads/my-workload/jobs" \
+  -H "Authorization: Bearer $INFERENCEKEY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "kind": "embeddings",
+    "body": {"model": "bge-m3", "input": "the quick brown fox"},
+    "context": {"orderId": "ord_8821"}
+  }'
+```
+
+  </TabItem>
+</Tabs>
+
+## 2. The `kind` field, per modality
+
+`body` is exactly the body you would have sent to the synchronous route — same shape, same fields. Only the wrapper changes.
+
+| `kind` | Sync equivalent | Notes |
+|---|---|---|
+| `chat` (or `chat_completions`) | `POST /v1/chat/completions` | Validated against the chat schema at submit time. `stream` is ignored — async never streams. |
+| `embeddings` | `POST /v1/embeddings` | |
+| `rerank` (or `reranking`) | `POST /v1/rerank` | |
+| `audio_speech` | `POST /v1/audio/speech` | Text → audio (TTS). |
+| `audio_generate` | `POST /v1/audio/generate` | Generative audio (diffusion). |
+| `audio_transcriptions` | `POST /v1/audio/transcriptions` | Audio → text. Takes a file — see [file uploads](#3-file-uploads-audio-and-images). |
+| `images` (or `images_generations`) | `POST /v1/images/generations` | Text → image. |
+| `images_edits` | `POST /v1/images/edits` | Takes a file. |
+| `images_variations` | `POST /v1/images/variations` | Takes a file. |
+| `forecast` | `POST …/forecast` | Time-series forecasting on a custom backend. |
+
+<Aside type="note" title="audio_voices is synchronous only">
+Listing available TTS voices is read-only metadata that returns instantly, so it has no async form. Use `GET /v1/audio/voices` and you'll get an explicit error if you try to submit it as a job.
+</Aside>
+
+An unrecognized `kind` returns `400` listing the accepted values.
+
+## 3. File uploads (audio and images)
+
+Transcriptions, image edits and image variations are file uploads: synchronously you send them as `multipart/form-data`. The async envelope is JSON, so a multipart body can't be nested inside it directly.
+
+Instead, send the **exact bytes you would have POSTed** as base64 in `body_b64`, and declare the matching `content_type`:
+
+```json title="Async transcription"
+{
+  "kind": "audio_transcriptions",
+  "body_b64": "LS0tLS0tV2ViS2l0Rm9ybUJvdW5kYXJ5…",
+  "content_type": "multipart/form-data; boundary=----WebKitFormBoundaryAbC123",
+  "context": { "recordingId": "rec_5" }
+}
+```
+
+We forward those bytes to the model runtime untouched, so the multipart boundary survives intact.
+
+<Aside type="caution" title="The boundary must match byte-for-byte">
+`content_type` is required whenever `body_b64` is set, and the boundary in it must be exactly the one used inside the encoded body — it is case-sensitive. A mismatch makes the runtime report missing fields.
+</Aside>
+
+Rules for the two forms:
+
+- Send **either** `body` (JSON) **or** `body_b64` + `content_type` (raw bytes) — never both, and never neither. Both cases return `400`.
+- `body_b64` is not accepted for `kind: "chat"`; chat is always JSON.
+- Malformed base64 is rejected at submit time, so you find out immediately rather than through a failed callback.
+
+<Tabs>
+  <TabItem label="Python">
+
+```python
+import base64, os, requests
+from requests_toolbelt.multipart.encoder import MultipartEncoder
+
+# Build the same multipart body the sync route would receive.
+enc = MultipartEncoder(fields={
+    "model": "whisper-large-v3",
+    "file": ("audio.mp3", open("audio.mp3", "rb"), "audio/mpeg"),
+})
+raw = enc.to_string()  # bytes, with the boundary baked in
+
+requests.post(
+    "https://cloud.inferencekey.com/endpoint/gpu-workloads/my-stt/jobs",
+    headers={"Authorization": f"Bearer {os.environ['INFERENCEKEY_API_KEY']}"},
+    json={
+        "kind": "audio_transcriptions",
+        "body_b64": base64.b64encode(raw).decode(),
+        # enc.content_type carries the exact boundary used above.
+        "content_type": enc.content_type,
+        "context": {"recordingId": "rec_5"},
+    },
+    timeout=30,
+).raise_for_status()
+```
+
+  </TabItem>
+  <TabItem label="TypeScript">
+
+```ts
+import { readFile } from "node:fs/promises";
+
+const form = new FormData();
+form.set("model", "whisper-large-v3");
+form.set("file", new Blob([await readFile("audio.mp3")]), "audio.mp3");
+
+// Serialize the multipart body and capture the generated boundary.
+const req = new Request("https://example.invalid", { method: "POST", body: form });
+const raw = Buffer.from(await req.arrayBuffer());
+const contentType = req.headers.get("content-type")!;
+
+await fetch("https://cloud.inferencekey.com/endpoint/gpu-workloads/my-stt/jobs", {
+  method: "POST",
+  headers: {
+    Authorization: `Bearer ${process.env.INFERENCEKEY_API_KEY}`,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    kind: "audio_transcriptions",
+    body_b64: raw.toString("base64"),
+    content_type: contentType,
+    context: { recordingId: "rec_5" },
+  }),
+});
+```
+
+  </TabItem>
+</Tabs>
+
+## 4. The callback you receive
+
+When the job finishes we `POST` to your webhook URL:
+
+```http
+POST https://your-app.example.com/hooks/inferencekey
+Content-Type: application/json
+X-InferenceKey-Event: job
+X-InferenceKey-Job-Id: 9f1c3a7e-5d02-4a11-b7c8-2e6481c1cf29
+X-InferenceKey-Signature: t=1769385600,v1=5257a869e7ecebe7…
+```
+
+```json title="Callback body"
+{
+  "event": "job.completed",
+  "ts": "2026-07-25T18:40:00Z",
+  "job_id": "9f1c3a7e-5d02-4a11-b7c8-2e6481c1cf29",
+  "context": { "orderId": "ord_8821", "userId": "u_42" },
+  "data": {
+    "job_id": "9f1c3a7e-5d02-4a11-b7c8-2e6481c1cf29",
+    "status": "ok",
+    "payload": { "data": [{ "embedding": [0.013, -0.271, "…"] }] },
+    "metrics": { "…": "…" },
+    "usage": { "input_tokens": 7, "output_tokens": 0, "total_tokens": 7 }
+  }
+}
+```
+
+Top-level fields:
+
+| Field | Meaning |
+|---|---|
+| `event` | `job.completed` on success, `job.failed` on error. |
+| `ts` | RFC 3339 timestamp of the delivery attempt. |
+| `job_id` | Matches the `job_id` from your 202 response. |
+| `context` | **Your** context, verbatim. Absent if you didn't send one. |
+| `data` | The job result (see below). |
+
+Inside `data`:
+
+| Field | Meaning |
+|---|---|
+| `status` | `ok` or an error status. |
+| `payload` | The JSON result, for JSON-returning modalities (embeddings, rerank, chat, forecast). |
+| `output` | Plain-text output, when the modality produces text. |
+| `binary_b64` | Base64 result bytes for binary modalities (audio, images). |
+| `content_type` | MIME type that pairs with `binary_b64`, e.g. `image/png`. |
+| `usage` | Token counts, when the runtime reports them. |
+| `units` | Physical units — audio seconds, images generated. |
+| `error` | Present when `event` is `job.failed`; carries the failure reason. |
+
+<Aside type="note" title="Your context is never mixed with ours">
+We attach internal routing metadata to the job as well, but it is stripped before delivery. The `context` you read is exactly the JSON you sent — no wrapper keys to unpick.
+</Aside>
+
+Always branch on `event` (or `data.status`) before reading the result: a `job.failed` callback is a normal delivery, not a transport error.
+
+## 5. Verify the signature
+
+If you generated a signing secret, every delivery carries `X-InferenceKey-Signature`:
+
+```
+t=1769385600,v1=<hex hmac-sha256>
+```
+
+The signed value is the timestamp, a literal dot, then the **raw request body**: `"{t}.{body}"`. Compute HMAC-SHA256 with your secret and compare against `v1` in constant time.
+
+<Aside type="caution" title="Sign the raw bytes">
+Verify against the exact body bytes you received, before any JSON parse-and-reserialize. Re-encoding changes key order and whitespace, which changes the hash.
+</Aside>
+
+<Tabs>
+  <TabItem label="Python">
+
+```python
+import hashlib, hmac, time
+
+def verify(raw_body: bytes, header: str, secret: str, tolerance: int = 300) -> bool:
+    parts = dict(p.split("=", 1) for p in header.split(",") if "=" in p)
+    ts, sig = parts.get("t"), parts.get("v1")
+    if not ts or not sig:
+        return False
+    # Reject stale timestamps so a captured callback can't be replayed.
+    if abs(time.time() - int(ts)) > tolerance:
+        return False
+    expected = hmac.new(
+        secret.encode(), f"{ts}.".encode() + raw_body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, sig)
+```
+
+```python title="Flask handler"
+@app.post("/hooks/inferencekey")
+def hook():
+    if not verify(request.get_data(), request.headers.get("X-InferenceKey-Signature", ""), SECRET):
+        return "", 401
+    event = request.get_json()
+    # Ack fast, then do the real work out of band.
+    enqueue_processing(event)
+    return "", 200
+```
+
+  </TabItem>
+  <TabItem label="TypeScript">
+
+```ts
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+export function verify(rawBody: Buffer, header: string, secret: string, tolerance = 300) {
+  const parts = Object.fromEntries(
+    header.split(",").map((p) => p.split("=", 2) as [string, string]),
+  );
+  const { t, v1 } = parts;
+  if (!t || !v1) return false;
+  // Reject stale timestamps so a captured callback can't be replayed.
+  if (Math.abs(Date.now() / 1000 - Number(t)) > tolerance) return false;
+
+  const expected = createHmac("sha256", secret)
+    .update(`${t}.`)
+    .update(rawBody)
+    .digest("hex");
+  const a = Buffer.from(expected);
+  const b = Buffer.from(v1);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+```
+
+```ts title="Express handler"
+// express.raw() keeps the body as bytes — required for verification.
+app.post("/hooks/inferencekey", express.raw({ type: "application/json" }), (req, res) => {
+  const sig = req.header("X-InferenceKey-Signature") ?? "";
+  if (!verify(req.body, sig, process.env.IK_WEBHOOK_SECRET!)) {
+    return res.sendStatus(401);
+  }
+  const event = JSON.parse(req.body.toString());
+  void enqueueProcessing(event);   // ack fast, work out of band
+  res.sendStatus(200);
+});
+```
+
+  </TabItem>
+</Tabs>
+
+If you haven't generated a secret, the header is omitted entirely — deliveries still arrive, unsigned. Generate one before going to production.
+
+## 6. Retries and delivery guarantees
+
+Respond **2xx** to accept a delivery. Anything else — a 4xx, a 5xx, a timeout, a connection failure — is treated as a failure and retried:
+
+| Attempt | Delay after previous |
+|---|---|
+| 1 → 2 | 1 minute |
+| 2 → 3 | 5 minutes |
+| 3 → 4 | 15 minutes |
+| 4 → 5 | 1 hour |
+| 5 → 6 | 6 hours |
+
+After the sixth failure the delivery is marked **terminal** and no longer retried. You can see terminal deliveries in the dashboard.
+
+Two constraints worth designing around:
+
+- **We wait 3 seconds.** A response slower than that counts as a timeout, even if your handler eventually succeeds. Acknowledge immediately and do the real work asynchronously.
+- **Delivery is at-least-once.** A handler that succeeds slowly can be retried, so the same `job_id` may arrive more than once. Make your handler idempotent — key on `job_id`.
+
+We do not follow redirects. Point the URL at its final destination.
+
+## Webhook URL requirements
+
+| Requirement | Why |
+|---|---|
+| `https://` only | Results may contain sensitive output; plaintext isn't acceptable. |
+| Publicly resolvable host | Hosts resolving to loopback, private, link-local or CGNAT ranges are rejected as SSRF targets — both when you save the URL and again at delivery time. |
+| No credentials in the URL | `https://user:pass@host/…` is rejected. Use the signing secret. |
+| Responds within 3 s | See above. |
+
+<Aside type="tip" title="Testing from localhost">
+Because private addresses are rejected, a local dev server can't receive callbacks directly. Use a public tunnel (ngrok, Cloudflare Tunnel) and register the public HTTPS URL. The dashboard's **Test** button sends a ping so you can confirm reachability before saving.
+</Aside>
+
+## Current limitations
+
+<Aside type="caution" title="Large binary results">
+Results are delivered through an internal message bus with a payload ceiling. A binary result above roughly **1 MB** — typically a 1024×1024 image, or a long TTS render — can exceed it. When that happens the job completes and bills, but the callback is never delivered.
+
+Until this is raised platform-wide, prefer smaller image dimensions or shorter audio segments for async work, and treat a missing callback for a large binary as this cause. JSON results (embeddings, rerank, chat, forecast) are far below the ceiling and unaffected.
+</Aside>
+
+Also note:
+
+- **No polling endpoint.** The callback is the only way to receive a result; there is no `GET /jobs/{id}`.
+- **No streaming.** `stream: true` in a chat body is ignored — async delivers one complete result.
+
+## Related
+
+<CardGrid>
+  <LinkCard title="Authentication" href="/en/guides/authentication/" description="API keys, scoping a key to specific endpoints." />
+  <LinkCard title="Common errors" href="/en/reference/common-errors/" description="What each error code means and how to resolve it." />
+  <LinkCard title="Custom backends" href="/en/guides/custom-backends/" description="Bring your own model — the backend behind kind: forecast." />
+  <LinkCard title="Wire format" href="/en/reference/wire-format/" description="The underlying job envelope shared by sync and async routes." />
+</CardGrid>
