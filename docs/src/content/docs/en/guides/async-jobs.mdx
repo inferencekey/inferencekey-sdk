@@ -402,6 +402,24 @@ If you haven't generated a secret, the header is omitted entirely — deliveries
 Each destination signs with its own secret, so verify against the secret issued for **your** endpoint — not one copied from another integration. The `job_id` and body are identical across destinations; only the signature differs.
 </Aside>
 
+### The test ping is signed too
+
+The dashboard's **Test endpoint** button sends a ping to your URL. Once the destination has a signing secret, that ping is signed with **the same scheme as a real callback** — same `X-InferenceKey-Signature` header, same `<timestamp>.<body>` value — so one verification routine covers both. Tell them apart by the event header, not by whether a signature is present:
+
+| | `X-InferenceKey-Event` | Signed? |
+|---|---|---|
+| Test ping | `ping` | Yes, once a secret exists |
+| Job result | `job` | Yes, whenever a secret exists |
+
+There is one case where a ping arrives **unsigned**: testing a destination you haven't added yet, since it has no secret to sign with. If your handler rejects every unsigned request — the correct default — that first test returns 401 and the dashboard won't unlock **Add**. Two ways out, both fine:
+
+- Add the destination first, generate its secret, then press **Test**. The ping is signed and verification passes.
+- Or let your handler accept an unsigned request **only** when `X-InferenceKey-Event: ping`, and keep requiring a signature on `job`. This is what Stripe and GitHub do for their verification pings.
+
+<Aside type="caution" title="Never accept an unsigned `job`">
+Whatever you do with pings, a callback carrying `X-InferenceKey-Event: job` without a valid signature must be rejected — that's the one that carries real results.
+</Aside>
+
 ## 6. Retries and delivery guarantees
 
 Respond **2xx** to accept a delivery. Anything else — a 4xx, a 5xx, a timeout, a connection failure — is treated as a failure and retried:
