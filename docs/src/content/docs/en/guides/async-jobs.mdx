@@ -34,7 +34,7 @@ Async delivery needs two things configured on the workload, both in the dashboar
 
 2. **Enable the toggle for the modality you'll submit.** A `kind: "chat"` async job needs both `jobs` **and** `chat` enabled. This is deliberate: turning off the sync chat route shouldn't leave chat reachable through the async one.
 
-3. **Add a webhook destination and generate its signing secret.** The URL must be `https://` and publicly resolvable — see [Webhook URL requirements](#webhook-url-requirements).
+3. **Add a webhook destination.** The URL must be `https://` and publicly resolvable — see [Webhook URL requirements](#webhook-url-requirements). Its signing secret is generated at the same time and shown once; copy it before leaving the panel. Then press **Test** on the saved row to send a signed ping.
 
 </Steps>
 
@@ -411,10 +411,9 @@ The dashboard's **Test endpoint** button sends a ping to your URL. Once the dest
 | Test ping | `ping` | Yes, once a secret exists |
 | Job result | `job` | Yes, whenever a secret exists |
 
-There is one case where a ping arrives **unsigned**: testing a destination you haven't added yet, since it has no secret to sign with. If your handler rejects every unsigned request — the correct default — that first test returns 401 and the dashboard won't unlock **Add**. Two ways out, both fine:
+Adding a destination mints its signing secret in the same step, so **every** ping you can send from the dashboard is signed. The secret's plaintext is shown once, right after you press **Add** — copy it then; afterwards only its prefix is visible.
 
-- Add the destination first, generate its secret, then press **Test**. The ping is signed and verification passes.
-- Or let your handler accept an unsigned request **only** when `X-InferenceKey-Event: ping`, and keep requiring a signature on `job`. This is what Stripe and GitHub do for their verification pings.
+That's why the order is add-then-test, not test-then-add: a ping can only be signed once the destination exists.
 
 <Aside type="caution" title="Never accept an unsigned `job`">
 Whatever you do with pings, a callback carrying `X-InferenceKey-Event: job` without a valid signature must be rejected — that's the one that carries real results.
