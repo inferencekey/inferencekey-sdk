@@ -34,13 +34,25 @@ Async delivery needs two things configured on the workload, both in the dashboar
 
 2. **Enable the toggle for the modality you'll submit.** A `kind: "chat"` async job needs both `jobs` **and** `chat` enabled. This is deliberate: turning off the sync chat route shouldn't leave chat reachable through the async one.
 
-3. **Set your webhook URL and generate a signing secret.** The URL must be `https://` and publicly resolvable — see [Webhook URL requirements](#webhook-url-requirements).
+3. **Add a webhook destination and generate its signing secret.** The URL must be `https://` and publicly resolvable — see [Webhook URL requirements](#webhook-url-requirements).
 
 </Steps>
 
 <Aside type="caution" title="No webhook URL, no result">
 The job still runs and still bills, but the result has nowhere to go and is dropped. There is no polling endpoint to fall back on — the callback is the only delivery channel. Configure the URL before submitting.
 </Aside>
+
+### Delivering to more than one place
+
+A workload can carry **up to 10 destinations**, and every job result is delivered to all of them. That's how you feed two consumer projects — say a billing service and an analytics pipeline — from a single workload without either one relaying to the other.
+
+Each destination is independent in all three senses that matter:
+
+- **Its own signing secret.** Rotating one consumer's secret never invalidates another's, so a compromised integration is contained.
+- **Its own retry schedule.** A consumer that is down retries (and eventually goes terminal) on its own; the healthy destinations are unaffected and never see a duplicate because of it.
+- **Its own on/off switch.** Muting a destination keeps its secret, so you can pause an integration without re-onboarding it later.
+
+The `jobs` toggle remains the master switch: turn it off and nothing is delivered anywhere, whatever the individual destinations say.
 
 ## 1. Submit a job
 
@@ -386,6 +398,10 @@ app.post("/hooks/inferencekey", express.raw({ type: "application/json" }), (req,
 
 If you haven't generated a secret, the header is omitted entirely — deliveries still arrive, unsigned. Generate one before going to production.
 
+<Aside type="note" title="One secret per destination">
+Each destination signs with its own secret, so verify against the secret issued for **your** endpoint — not one copied from another integration. The `job_id` and body are identical across destinations; only the signature differs.
+</Aside>
+
 ## 6. Retries and delivery guarantees
 
 Respond **2xx** to accept a delivery. Anything else — a 4xx, a 5xx, a timeout, a connection failure — is treated as a failure and retried:
@@ -398,7 +414,7 @@ Respond **2xx** to accept a delivery. Anything else — a 4xx, a 5xx, a timeout,
 | 4 → 5 | 1 hour |
 | 5 → 6 | 6 hours |
 
-After the sixth failure the delivery is marked **terminal** and no longer retried. You can see terminal deliveries in the dashboard.
+After the sixth failure the delivery is marked **terminal** and no longer retried. You can see terminal deliveries in the dashboard. This schedule is per destination: when a workload has several, each one retries on its own and one going terminal doesn't affect the rest.
 
 Two constraints worth designing around:
 
