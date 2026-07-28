@@ -34,12 +34,28 @@ MODEL = "google/gemma-4-26B-A4B-it-qat-q4_0-gguf"
 GGUF_FILE = "gemma-4-26B_q4_0-it.gguf"
 
 # llama-server launch command, run verbatim by the `llamacpp` backend:
-#   -ngl 99  -> offload all layers to the GPU
-#   -c 0     -> context window = the model's maximum (llama.cpp reads the
-#               trained context length from the GGUF metadata; this q4 fits
-#               up to 256K on the R9700's 32 GB)
+#   -ngl 99      -> offload all layers to the GPU
+#   -c 0         -> context window = the model's maximum (llama.cpp reads the
+#                   trained context length from the GGUF metadata; this q4 fits
+#                   up to 256K on the R9700's 32 GB)
+#   --parallel 1 -> ONE slot holding the whole context. Without it llama.cpp
+#                   picks n_parallel=4 and splits the context four ways, so a
+#                   long prompt no longer fits in a single slot. Raise it only
+#                   if you want concurrency more than you want context depth.
+#   -ub 4096     -> micro-batch: how many prompt tokens are evaluated per GPU
+#                   pass. This is the knob that moves prompt-processing speed
+#                   (measured on an R9700: 2142 -> 2861 tok/s at 32K, 830 -> 941
+#                   at 128K). `-b` alone does nothing — it only groups work that
+#                   is still chunked into micro-batches — so raise -ub, not -b.
+#                   Costs ~3 GB of VRAM; drop to 2048 if you need the headroom.
+# Prompt caching is left ON (the default): it costs a few hundred MB of host RAM
+# and turns a repeated 128K prompt from ~110 s into ~2 s. Only pass `--cache-ram 0`
+# if the host is genuinely short on RAM.
 # The worker injects the listen port; do not hard-code --port.
-COMMAND = f"llama-server -hf {MODEL} --hf-file {GGUF_FILE} -ngl 99 -c 0"
+COMMAND = (
+    f"llama-server -hf {MODEL} --hf-file {GGUF_FILE} "
+    "-ngl 99 -c 0 --parallel 1 -b 4096 -ub 4096"
+)
 
 SLUG = "gemma4-26b-llamacpp-amd"
 
