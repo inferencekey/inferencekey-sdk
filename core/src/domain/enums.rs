@@ -27,6 +27,11 @@ pub enum Backend {
     /// resolves the install path per node hardware (ROCm/Metal tarball, or apt
     /// CUDA on NVIDIA). `text2text` only today.
     Llamacpp,
+    /// stable-diffusion.cpp: resident `sd-server` (exposes the OpenAI images
+    /// surface `/v1/images/generations`). The worker compiles sd.cpp with CUDA
+    /// for the local GPU at bootstrap (no prebuilt Linux+CUDA release). Serves
+    /// `text2image` only.
+    StableDiffusionCpp,
     /// A custom backend published through the SDK, identified by its slug.
     Custom(String),
 }
@@ -43,6 +48,7 @@ impl Backend {
             Backend::VllmOmni => Cow::Borrowed("vllm-omni"),
             Backend::Sglang => Cow::Borrowed("sglang"),
             Backend::Llamacpp => Cow::Borrowed("llamacpp"),
+            Backend::StableDiffusionCpp => Cow::Borrowed("stablediffusioncpp"),
             Backend::Custom(slug) => Cow::Borrowed(slug.as_str()),
         }
     }
@@ -57,6 +63,7 @@ impl Backend {
             "vllm-omni" => Some(Backend::VllmOmni),
             "sglang" => Some(Backend::Sglang),
             "llamacpp" => Some(Backend::Llamacpp),
+            "stablediffusioncpp" => Some(Backend::StableDiffusionCpp),
             _ => None,
         }
     }
@@ -188,10 +195,15 @@ mod tests {
             Backend::VllmOmni,
             Backend::Sglang,
             Backend::Llamacpp,
+            Backend::StableDiffusionCpp,
         ] {
             assert_eq!(Backend::from_str_opt(b.as_str().as_ref()), Some(b.clone()));
         }
         assert_eq!(Backend::from_str_opt("llamacpp"), Some(Backend::Llamacpp));
+        assert_eq!(
+            Backend::from_str_opt("stablediffusioncpp"),
+            Some(Backend::StableDiffusionCpp)
+        );
         assert_eq!(Backend::from_str_opt("nope"), None);
     }
 
@@ -214,6 +226,7 @@ mod tests {
             (Backend::VllmOmni, "\"vllm-omni\""),
             (Backend::Sglang, "\"sglang\""),
             (Backend::Llamacpp, "\"llamacpp\""),
+            (Backend::StableDiffusionCpp, "\"stablediffusioncpp\""),
         ];
         for (variant, wire) in cases {
             let json = serde_json::to_string(&variant).expect("serialize");
