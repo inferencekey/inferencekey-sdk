@@ -32,6 +32,7 @@ export const Backend = {
   VllmOmni: "vllm-omni",
   Sglang: "sglang",
   Llamacpp: "llamacpp",
+  StableDiffusionCpp: "stablediffusioncpp",
 } as const;
 export type Backend = (typeof Backend)[keyof typeof Backend];
 

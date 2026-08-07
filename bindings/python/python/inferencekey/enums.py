@@ -18,6 +18,7 @@ class Backend(_Str):
     VLLM_OMNI = "vllm-omni"
     SGLANG = "sglang"
     LLAMACPP = "llamacpp"
+    STABLE_DIFFUSION_CPP = "stablediffusioncpp"
 
 
 class TaskType(_Str):
