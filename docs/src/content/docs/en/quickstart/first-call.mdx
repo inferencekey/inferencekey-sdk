@@ -167,6 +167,10 @@ for await (const chunk of ep.generateTextStream({ prompt: "Hola" })) {
 
 Under the hood the endpoint speaks **server-sent events**, terminated by `data: [DONE]`; the SDK parses those frames into `TextChunk`s for you. For the raw wire contract see the references below.
 
+<Aside type="tip" title="A stream can be cut by a server restart">
+  If the server restarts while your stream is open, the stream ends early with a retryable error (`server_shutting_down`). Discard the partial reply and send the request again: see [`server_shutting_down`: retry the request](/en/reference/common-errors/#server_shutting_down-retry-the-request).
+</Aside>
+
 <CardGrid>
   <LinkCard
     title="Wire format"

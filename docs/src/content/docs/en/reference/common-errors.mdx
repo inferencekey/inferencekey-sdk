@@ -354,6 +354,170 @@ const ep = data.endpoint(ref.workloadSlug, { apiKey: process.env.SUPPORT_IK_LIVE
 
 ---
 
+## `server_shutting_down`: retry the request
+
+The InferenceKey server that was handling your request is restarting (a deploy or a
+restart) and could not finish it. Nothing is wrong with your request or your credentials:
+it is **retryable**, and the same request sent again reaches another server, or the same
+one once it is back.
+
+The server gives every request still in flight about **24 seconds** after it starts
+shutting down to finish. Whatever is still open at that point ends with this error instead
+of a silent connection drop, so you never take a truncated answer for a complete one. A
+stream also ends this way **at once** when the GPU worker producing it shuts down.
+
+### What reaches the wire
+
+How the error looks depends on whether the response had started and on the route:
+
+| Request | What you get |
+| --- | --- |
+| Non-streaming call still waiting for its answer | HTTP `503`, header `Retry-After: 1`, the JSON body below |
+| Streaming chat completion (`stream: true`) | One error chunk, then `data: [DONE]`. A stream whose response has not started yet may get the `503` instead |
+| `/v1/messages` (Anthropic-compatible), non-streaming | HTTP `503`, header `Retry-After: 1`, Anthropic error body of type `overloaded_error` |
+| `/v1/messages`, streaming | One `event: error` of type `overloaded_error`, and no `[DONE]` (Anthropic streams have none) |
+| `/v1/audio/speech` with `stream: true` | Before any audio: the `503` above. After audio started: the chunked body is aborted without its terminating chunk, so your HTTP client reports a transfer error |
+
+The non-streaming `503` body:
+
+```json title="503 Service Unavailable  (Retry-After: 1)"
+{
+  "error": {
+    "message": "The server is shutting down before the request completed; retry the request.",
+    "type": "server_error",
+    "param": null,
+    "code": "server_shutting_down"
+  }
+}
+```
+
+The last two events of a streaming chat completion cut this way:
+
+```http title="POST .../v1/chat/completions  (stream: true)"
+data: {"error":{"code":"server_shutting_down","message":"The server is shutting down before the stream completed; retry the request.","type":"server_error"}}
+
+data: [DONE]
+```
+
+On `/v1/messages` the stream ends with:
+
+```http title="POST .../v1/messages  (stream: true)"
+event: error
+data: {"error":{"message":"The server is shutting down before the stream completed; retry the request.","type":"overloaded_error"},"type":"error"}
+```
+
+and the non-streaming `503` body there is
+`{"error":{"message":"The server is shutting down before the request completed; retry the request.","type":"overloaded_error"},"type":"error"}`.
+
+### What you see in the SDK
+
+The InferenceKey SDK does not retry by itself. A non-streaming call, or a stream that
+gets the `503` when it opens, raises the `503` with the raw body in the message:
+
+<Tabs syncKey="lang">
+<TabItem label="Python">
+```text
+inferencekey.errors.ApiError: api error (status 503): {"error":{"message":"The server is shutting down before the request completed; retry the request.","type":"server_error","param":null,"code":"server_shutting_down"}}
+```
+
+A stream cut after it opened raises while you iterate. This SDK version does not decode
+an error chunk, so the message does not name the code (it is the same for any error chunk):
+
+```text
+inferencekey.errors.ApiError: workload drifted from spec: choices[0]
+```
+</TabItem>
+<TabItem label="TypeScript">
+```text
+Error: api error (status 503): {"error":{"message":"The server is shutting down before the request completed; retry the request.","type":"server_error","param":null,"code":"server_shutting_down"}}
+```
+
+A stream cut after it opened throws inside the `for await` loop. This SDK version does
+not decode an error chunk, so the message does not name the code (it is the same for any
+error chunk):
+
+```text
+Error: workload drifted from spec: choices[0]
+```
+</TabItem>
+</Tabs>
+
+- **Symptom**: a call fails with `503` and `server_shutting_down`, or a stream stops early with an error, typically during a platform deploy.
+- **Cause**: the server (or the GPU worker serving the stream) shut down before the answer was complete.
+- **Fix**: retry the **whole** request after about one second (`Retry-After: 1`). For a stream, **discard the partial output** you already received: the retried request generates the reply again from the start, and it may differ from the cut one. Keep the number of attempts bounded.
+
+<Tabs syncKey="lang">
+<TabItem label="Python">
+```python title="stream_with_retry.py"
+import os
+import time
+from inferencekey import DataClient
+from inferencekey.errors import ApiError
+
+data = DataClient.from_env(project="acme")
+ep = data.endpoint("support-bot", api_key=os.environ["SUPPORT_IK_LIVE"])
+
+def cut_by_restart(e: ApiError) -> bool:
+    msg = str(e)
+    # The 503 names the code; a stream cut mid-way surfaces as an undecoded error chunk.
+    return "server_shutting_down" in msg or msg.startswith("workload drifted from spec: choices[0]")
+
+def stream_reply(prompt: str, attempts: int = 3) -> str:
+    for attempt in range(1, attempts + 1):
+        parts: list[str] = []  # start over on every attempt
+        try:
+            for chunk in ep.generate_text_stream(prompt=prompt):
+                parts.append(chunk.text)
+            return "".join(parts)
+        except ApiError as e:
+            if attempt == attempts or not cut_by_restart(e):
+                raise
+            time.sleep(1)  # Retry-After: 1
+```
+</TabItem>
+<TabItem label="TypeScript">
+```ts title="stream-with-retry.ts"
+import { DataClient } from "@inferencekey/sdk";
+
+const data = DataClient.fromEnv({ project: "acme" });
+const ep = data.endpoint("support-bot", { apiKey: process.env.SUPPORT_IK_LIVE });
+
+function cutByRestart(e: unknown): boolean {
+  const msg = (e as Error).message;
+  // The 503 names the code; a stream cut mid-way surfaces as an undecoded error chunk.
+  return msg.includes("server_shutting_down") || msg.startsWith("workload drifted from spec: choices[0]");
+}
+
+async function streamReply(prompt: string, attempts = 3): Promise<string> {
+  for (let attempt = 1; ; attempt++) {
+    let text = ""; // start over on every attempt
+    try {
+      for await (const chunk of ep.generateTextStream({ prompt })) {
+        text += chunk.text;
+      }
+      return text;
+    } catch (e) {
+      if (attempt >= attempts || !cutByRestart(e)) throw e;
+      await new Promise((resolve) => setTimeout(resolve, 1000)); // Retry-After: 1
+    }
+  }
+}
+```
+</TabItem>
+</Tabs>
+
+<Aside type="note" title="Calling the endpoint with the OpenAI or Anthropic SDK">
+The official OpenAI and Anthropic SDKs retry a `503` by themselves (they honour
+`Retry-After`), so a non-streaming call usually succeeds without any code on your side.
+They do **not** retry a stream that already started: the OpenAI Python SDK raises
+`openai.APIError` with `e.code == "server_shutting_down"` when it reads the error chunk,
+and the Anthropic SDKs surface the `overloaded_error` event as an error. Catch it, drop the partial
+output and send the request again. For a streamed `/v1/audio/speech` body, treat a
+transfer error the same way and request the whole file again.
+</Aside>
+
+---
+
 ## Quick reference
 
 | What you see | Plane / status | Python type | Cause in one line |
@@ -366,6 +530,7 @@ const ep = data.endpoint(ref.workloadSlug, { apiKey: process.env.SUPPORT_IK_LIVE
 | `configuration error: secrets must never go in specs` | local | `ConfigurationError` | A token was inlined into a spec field |
 | `authentication failed: …` | 401 | `AuthError` | Credential missing, invalid, or expired |
 | `not found: …` | 404 | `ApiError` | Workload/project does not exist |
+| `api error (status 503): …server_shutting_down…` or a stream that stops early | 503 / stream error | `ApiError` | The server restarted before the answer was complete: [retry the request](#server_shutting_down-retry-the-request) |
 
 In TypeScript every row above arrives as a single `Error`; match on the message text (and the
 bracketed code for the `403` rows).

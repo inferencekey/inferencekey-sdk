@@ -264,6 +264,8 @@ for await (const chunk of ep.generateTextStream({ prompt: "Hola" })) {
 }
 ```
 
+A stream cut by a server restart throws inside the loop; discard the partial reply and retry the call (see [`server_shutting_down`: retry the request](/en/reference/common-errors/#server_shutting_down-retry-the-request)).
+
 ### `ep.embed(params)`
 
 ```ts

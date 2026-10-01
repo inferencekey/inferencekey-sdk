@@ -213,6 +213,8 @@ for chunk in ep.generate_text_stream(prompt="Hola"):
     print(chunk.text, end="", flush=True)
 ```
 
+A stream cut by a server restart raises `ApiError` mid-iteration; discard the partial reply and retry the call (see [`server_shutting_down`: retry the request](/en/reference/common-errors/#server_shutting_down-retry-the-request)).
+
 ### embed
 
 ```python

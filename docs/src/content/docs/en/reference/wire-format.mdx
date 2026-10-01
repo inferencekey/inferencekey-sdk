@@ -335,6 +335,11 @@ data: {"id":"chatcmpl-9f2c...","object":"chat.completion.chunk","choices":[{"ind
 data: [DONE]
 ```
 
+If the server restarts before the stream completes, the stream ends with one error chunk
+(`"code":"server_shutting_down"`, type `server_error`) followed by `data: [DONE]`. The
+request is retryable: see
+[`server_shutting_down`: retry the request](/en/reference/common-errors/#server_shutting_down-retry-the-request).
+
 ### Embeddings
 
 ```json title="POST /endpoint/acme/billing/v1/embeddings"
