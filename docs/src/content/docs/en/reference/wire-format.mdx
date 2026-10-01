@@ -336,7 +336,8 @@ data: [DONE]
 ```
 
 If the server restarts before the stream completes, the stream ends with one error chunk
-(`"code":"server_shutting_down"`, type `server_error`) followed by `data: [DONE]`. The
+(`"code":"server_shutting_down"`, type `server_error`) followed by `data: [DONE]` (or a
+`503` if the response had not started). The
 request is retryable: see
 [`server_shutting_down`: retry the request](/en/reference/common-errors/#server_shutting_down-retry-the-request).
 

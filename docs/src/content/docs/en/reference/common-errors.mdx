@@ -1,6 +1,6 @@
 ---
 title: Common errors & how to fix them
-description: The real error messages and codes the InferenceKey SDK raises — wrong token type, scope and project mismatches, missing config, invalid specs, auth failures and 404s — with the cause and the fix for each, in Python and TypeScript.
+description: "The real error messages and codes the InferenceKey SDK raises: wrong token type, scope and project mismatches, missing config, invalid specs, auth failures, 404s and server restarts mid-request (server_shutting_down), with the cause and the fix for each, in Python and TypeScript."
 ---
 
 import { Tabs, TabItem, Aside, Card, CardGrid, LinkCard } from "@astrojs/starlight/components";
@@ -460,6 +460,8 @@ ep = data.endpoint("support-bot", api_key=os.environ["SUPPORT_IK_LIVE"])
 def cut_by_restart(e: ApiError) -> bool:
     msg = str(e)
     # The 503 names the code; a stream cut mid-way surfaces as an undecoded error chunk.
+    # That message is the same for every error code, so any mid-stream error chunk is
+    # retried, a bounded number of times.
     return "server_shutting_down" in msg or msg.startswith("workload drifted from spec: choices[0]")
 
 def stream_reply(prompt: str, attempts: int = 3) -> str:
@@ -485,6 +487,8 @@ const ep = data.endpoint("support-bot", { apiKey: process.env.SUPPORT_IK_LIVE })
 function cutByRestart(e: unknown): boolean {
   const msg = (e as Error).message;
   // The 503 names the code; a stream cut mid-way surfaces as an undecoded error chunk.
+  // That message is the same for every error code, so any mid-stream error chunk is
+  // retried, a bounded number of times.
   return msg.includes("server_shutting_down") || msg.startsWith("workload drifted from spec: choices[0]");
 }
 
