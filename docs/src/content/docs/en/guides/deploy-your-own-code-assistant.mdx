@@ -1,0 +1,266 @@
+---
+title: Deploy your own code assistant
+description: "Run Qwen3-Coder-Next (AWQ 4-bit) on vLLM on a single 80 GB cloud GPU, issue an API key scoped to that endpoint, and point Claude Code at it through the Anthropic-compatible /v1/messages route."
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from "@astrojs/starlight/components";
+import YouTube from "../../../../components/YouTube.astro";
+
+This guide deploys a coding model on your own GPU capacity and connects Claude Code to it. Every request from the coding assistant then runs on a worker in your project, behind an API key you control.
+
+It follows the walkthrough video step by step. Each section links to the moment in the video where that step happens.
+
+<YouTube id="do5-e8-Y7lk" title="InferenceKey: deploy your own code assistant" />
+
+What the video sets up:
+
+- **Model:** [`cyankiwi/Qwen3-Coder-Next-AWQ-4bit`](https://huggingface.co/cyankiwi/Qwen3-Coder-Next-AWQ-4bit), an 80B-parameter coding model quantized to 4 bits.
+- **Runtime:** vLLM 0.15.0.
+- **Hardware:** one NVIDIA A100 SXM 80 GB rented from the cloud GPU catalog.
+- **Client:** Claude Code, talking to the workload's `/v1/messages` endpoint.
+
+For the background story behind the video, read the article [An 80B coding model on one rented A100, driven by Claude Code](https://inferencekey.com/news/deploy-coding-assistant-single-gpu).
+
+## Before you start
+
+You need:
+
+- An InferenceKey account. Open the [dashboard](https://cloud.inferencekey.com).
+- Balance or billing set up if you rent a cloud GPU. Cloud GPUs are charged per hour while the worker runs. See [Stop the cloud GPU](#stop-the-cloud-gpu) for how to release it.
+- [Claude Code](https://code.claude.com/docs) installed on the developer machine, plus `curl` for the checks below.
+
+<Steps>
+
+1. ### Create a project
+
+   Video: [0:13](https://www.youtube.com/watch?v=do5-e8-Y7lk&t=13s)
+
+   A project groups workloads, workers and keys. Open **Create a new project**, type a name, and click **Create project**. The slug is generated from the name; you use it later in the endpoint URL. The video names the project `Code Assistant`, which gives the slug `code-assistant`.
+
+2. ### Create the vLLM workload
+
+   Video: [0:24](https://www.youtube.com/watch?v=do5-e8-Y7lk&t=24s) (the full command is readable at [0:44](https://www.youtube.com/watch?v=do5-e8-Y7lk&t=44s))
+
+   In the project, open the **Workloads** tab and click **Create workload**. Then:
+
+   - **Backend:** `vLLM`.
+   - **Workload name:** auto-filled from model and backend. The video keeps `Qwen3 Coder Next AWQ 4bit · vLLM`, which gives the workload slug `qwen3-coder-next-awq-4bit-vllm`. The slug is part of the endpoint URL and is also the model name clients send.
+   - **vLLM runtime version:** `0.15.0` in the video. The worker installs this exact version.
+   - **vLLM command:** paste the full command. It runs as-is on the worker.
+
+   ```bash title="vLLM command"
+   vllm serve cyankiwi/Qwen3-Coder-Next-AWQ-4bit --enable-expert-parallel --kv-cache-dtype fp8_e4m3 --max-model-len 262144 --gpu-memory-utilization 0.90 --max-num-seqs 2 --enable-auto-tool-choice --tool-call-parser qwen3_coder
+   ```
+
+   | Flag | What it does here |
+   | --- | --- |
+   | `cyankiwi/Qwen3-Coder-Next-AWQ-4bit` | The Hugging Face model the worker downloads and serves. |
+   | `--enable-expert-parallel` | Uses expert parallelism for the mixture-of-experts layers. It only changes placement when the model spans several GPUs. |
+   | `--kv-cache-dtype fp8_e4m3` | Stores the KV cache in FP8, which roughly halves its memory and leaves room for long contexts. |
+   | `--max-model-len 262144` | Maximum context length per request, in tokens (prompt plus output). |
+   | `--gpu-memory-utilization 0.90` | Fraction of GPU memory vLLM may use for weights, activations and KV cache. |
+   | `--max-num-seqs 2` | At most 2 sequences run at the same time on the GPU. Further requests are queued until a slot frees up. |
+   | `--enable-auto-tool-choice` | Lets the model decide when to call a tool. Required for coding assistants. |
+   | `--tool-call-parser qwen3_coder` | Parses this model's tool-call format into structured tool calls. |
+
+   <Aside type="note" title="Field rules">
+   The form states them under the command field: prepend environment variables as `KEY=VALUE` or `export KEY=VALUE` lines; the worker forces `--port 8000` for health checks; `--chat-template` paths must live under `/opt/inferencekey/vllm/examples/`.
+   </Aside>
+
+   <Aside type="caution" title="Keep the two tool flags">
+   Claude Code sends tool definitions with almost every request. Without `--enable-auto-tool-choice` and `--tool-call-parser`, vLLM rejects those requests and the endpoint returns `400`. See [Troubleshooting](#troubleshooting).
+   </Aside>
+
+   After saving, the workload exists but nothing runs it yet: the Workloads tab shows it with no workers assigned and no capacity.
+
+3. ### Add a worker with a cloud GPU
+
+   Video: [0:45](https://www.youtube.com/watch?v=do5-e8-Y7lk&t=45s) (dialog at [0:56](https://www.youtube.com/watch?v=do5-e8-Y7lk&t=56s))
+
+   You can run the workload on your own server (**Pick existing worker**) or rent a GPU. The video rents one. In the workload row, click **Add worker** and open the **Deploy new cloud GPU** tab of the **Add worker to workload** dialog:
+
+   | Field | Value in the video | Notes |
+   | --- | --- | --- |
+   | **GPUs per node** | 1 | Options are 1, 2, 4 or 8 GPUs of the same model. |
+   | **Required CUDA driver** | 13.0 | Filters the catalog to hosts with that CUDA version. Leave it empty to list every host. |
+   | **GPU model** | A100 SXM · 80GB | The catalog listed it at **$1.79/h** at recording time. |
+   | **Secure cloud** | Checked | Higher reliability, slightly higher price. Uncheck for community cloud pricing. |
+   | **Worker name** | `A100-SXM-80GB-CUDA130-01` | Auto-generated from GPU model, VRAM and CUDA. You can override it. |
+   | **Concurrent requests** | 20 (default) | Initial concurrency for this worker on this workload. The video keeps 20 while vLLM runs 2 sequences at a time (`--max-num-seqs 2`), so extra requests are queued. |
+
+   <Aside type="note" title="Prices change">
+   Catalog prices come from the cloud provider and move with availability. The $1.79/h figure is what the catalog showed when the video was recorded. Check the price in the dialog before you deploy; the current panel may quote it in a different currency.
+   </Aside>
+
+   Click **Deploy & assign**. The pod is created, the worker registers, and it is assigned to the workload automatically. The worker installs vLLM and its dependencies, downloads the model and starts the server. No SSH or manual setup is needed.
+
+4. ### Follow the logs and test the model
+
+   Video: logs at [1:34](https://www.youtube.com/watch?v=do5-e8-Y7lk&t=94s), test at [1:47](https://www.youtube.com/watch?v=do5-e8-Y7lk&t=107s)
+
+   Open the worker (Platform Management → **Workers**, or the worker in the **Live Flow** tab) and click **view logs** to follow the vLLM output while the weights download and load. The worker drawer shows the startup steps up to **Model ready**.
+
+   When the model is ready, open the workload in **Live Flow** and click **Test endpoint**. The **Chat** tab sends a test message and reports **First token** (time to first token), **Total time**, **Tokens/s** and **Total tokens**. The **Load test** tab sends concurrent requests.
+
+5. ### Create an API key scoped to the endpoint
+
+   Video: [1:56](https://www.youtube.com/watch?v=do5-e8-Y7lk&t=116s)
+
+   Open Platform Management → **API Keys** and click **+ New API Key**. In **Create API Key**:
+
+   - **Name:** something that identifies the user or team.
+   - **Access scope:** **Specific endpoints** (the least-privilege choice) or **Entire project**.
+   - **Allowed endpoints:** tick only `code-assistant/qwen3-coder-next-awq-4bit-vllm`.
+
+   Click **Create key** and copy the `ik_live_` key. The full secret is shown only once. Usage recorded against the key lets you track who consumes what. See [Authentication](/en/guides/authentication/) for how data keys are scoped.
+
+6. ### Connect Claude Code
+
+   Video: [2:09](https://www.youtube.com/watch?v=do5-e8-Y7lk&t=129s)
+
+   The workload exposes an Anthropic-compatible Messages endpoint:
+
+   ```text
+   POST https://api.inferencekey.com/endpoint/<project_slug>/<workload_slug>/v1/messages
+   ```
+
+   Claude Code appends `/v1/messages` to `ANTHROPIC_BASE_URL`, so the base URL stops at the workload slug. To get the URL from the panel, open the row actions menu of the workload in the **Workloads** tab and click **Copy URL**. It copies the OpenAI-compatible base, which ends in `/v1`; remove that `/v1` for `ANTHROPIC_BASE_URL`. The default public host is `api.inferencekey.com`.
+
+   Claude Code asks for Claude model names (for example a Haiku-class model for background tasks). The endpoint only accepts the workload slug, the workload's model name or `default`, so set every model variable to the workload slug.
+
+   ```bash title="Shell, before running claude"
+   export ANTHROPIC_BASE_URL="https://api.inferencekey.com/endpoint/code-assistant/qwen3-coder-next-awq-4bit-vllm"
+   export ANTHROPIC_AUTH_TOKEN="ik_live_xxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+   export ANTHROPIC_MODEL="qwen3-coder-next-awq-4bit-vllm"
+   export ANTHROPIC_DEFAULT_OPUS_MODEL="qwen3-coder-next-awq-4bit-vllm"
+   export ANTHROPIC_DEFAULT_SONNET_MODEL="qwen3-coder-next-awq-4bit-vllm"
+   export ANTHROPIC_DEFAULT_HAIKU_MODEL="qwen3-coder-next-awq-4bit-vllm"
+   export CLAUDE_CODE_SUBAGENT_MODEL="qwen3-coder-next-awq-4bit-vllm"
+   claude
+   ```
+
+   | Variable | Why |
+   | --- | --- |
+   | `ANTHROPIC_BASE_URL` | Sends Claude Code's requests to your workload instead of Anthropic. |
+   | `ANTHROPIC_AUTH_TOKEN` | Sent as `Authorization: Bearer <key>`, the header the endpoint checks first. |
+   | `ANTHROPIC_MODEL` | The model of the main session. |
+   | `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL` | What the `opus`, `sonnet` and `haiku` aliases resolve to. The Haiku one is also used for background tasks. |
+   | `CLAUDE_CODE_SUBAGENT_MODEL` | Default model for subagents. |
+
+   Variable names are from the [Claude Code environment variables reference](https://code.claude.com/docs/en/env-vars).
+
+   <Aside type="tip" title="ANTHROPIC_API_KEY also works">
+   The endpoint also accepts the key in the `x-api-key` header, which is what `ANTHROPIC_API_KEY` sends. Use one variable, not both: if both headers arrive with different values, the request fails with HTTP `401` and error type `authentication_error`.
+   </Aside>
+
+   Check the endpoint with `curl` before starting Claude Code:
+
+   ```bash title="Plain request"
+   curl -sS "$ANTHROPIC_BASE_URL/v1/messages" \
+     -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "model": "qwen3-coder-next-awq-4bit-vllm",
+       "max_tokens": 256,
+       "messages": [{"role": "user", "content": "Write a Python function that reverses a string."}]
+     }'
+   ```
+
+   ```bash title="Request with a tool (checks the tool flags)"
+   curl -sS "$ANTHROPIC_BASE_URL/v1/messages" \
+     -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "model": "qwen3-coder-next-awq-4bit-vllm",
+       "max_tokens": 256,
+       "tools": [{
+         "name": "read_file",
+         "description": "Read a file from the repository",
+         "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+       }],
+       "messages": [{"role": "user", "content": "Open README.md"}]
+     }'
+   ```
+
+   A working endpoint answers both with a Messages response (`"type": "message"`); the second one usually contains a `tool_use` block. Errors come back in the Anthropic error shape (`"type": "error"`).
+
+7. ### Watch the live view and GPU telemetry
+
+   Video: [2:28](https://www.youtube.com/watch?v=do5-e8-Y7lk&t=148s), telemetry at [2:35](https://www.youtube.com/watch?v=do5-e8-Y7lk&t=155s)
+
+   The project's **Live Flow** tab shows requests travelling from the workload to the worker in real time. Click the workload to open its drawer: **Backlog**, **Requests Total**, **p95 Latency**, a backlog vs throughput chart, and **Token Usage** for the last 30 days, broken down by API key.
+
+   Click the worker to open its drawer. **GPU Telemetry** reports per GPU: **GPU Utilization**, **Memory Utilization**, **Memory Used**, **Temperature** and **Power Draw**. **Driver health** confirms that the vLLM version is compatible with the host's CUDA runtime.
+
+</Steps>
+
+## Scale to more workers or GPUs
+
+Video: [2:48](https://www.youtube.com/watch?v=do5-e8-Y7lk&t=168s)
+
+The video runs on one GPU. The platform supports these ways to add capacity:
+
+- **More workers on the same workload.** Click **Add worker** again (or **Assign workers**) to attach another cloud GPU or one of your own servers. All workers assigned to a workload pull from the same queue, so each request is taken by one worker that has a free slot.
+- **Concurrent requests per worker.** Each worker-to-workload assignment has a **Concurrent requests** limit (1 to 1000, default 20): the maximum number of requests that worker processes at the same time for that workload. Keep it in line with the vLLM `--max-num-seqs` value; requests above vLLM's limit are queued.
+- **More GPUs per node.** **GPUs per node** accepts 1, 2, 4 or 8 GPUs of the same model. Tensor parallelism splits one model across them. When the command has no tensor parallel flag, the worker adds `--tensor-parallel-size` with the number of GPUs it can use; an explicit `--tensor-parallel-size` in your command always wins. Automatic tensor parallelism needs an up-to-date worker, so setting `--tensor-parallel-size` explicitly (for example `--tensor-parallel-size 2` on 2 GPUs) is the safe choice. For a mixture-of-experts model like this one, keep `--enable-expert-parallel`.
+
+For schedule- or demand-driven capacity, see the execution policies in [Backends & policies](/en/reference/backends-and-policies/).
+
+## Stop the cloud GPU
+
+A rented GPU is billed while its pod exists, whether or not it serves requests. To release it, delete the worker:
+
+1. Open Platform Management → **Workers**.
+2. On the worker's card, click **Delete**, then confirm with **Delete** in the **Delete worker** dialog.
+
+For a cloud worker, the platform terminates the pod at the cloud provider, closes the billing of that deployment, and then removes the worker. If the provider does not confirm the termination, the worker is not deleted: an error explains why, the termination is retried automatically, and the card shows **Pod termination pending** with the pod id. While that label is shown, the pod may still be billed.
+
+<Aside type="caution" title="Unassigning does not stop the pod">
+Unassigning the worker from the workload (the **Unassign worker** cross on its chip in the **Workloads** tab) only stops it from serving that workload; the pod keeps running and billing. Deleting the workload does not stop it either when the workload uses the `fixed` execution policy, the default and the one used in this guide. Delete the worker to release the GPU.
+</Aside>
+
+## Limits
+
+- **Model names.** The endpoint accepts only the workload slug, the workload's model name (`cyankiwi/Qwen3-Coder-Next-AWQ-4bit` here), `default`, or no model. Any other name, including Claude model ids, returns HTTP `400` with error type `invalid_request_error` and the message "Model '…' is not available on this endpoint" (internally `model_not_available`).
+- **Local GPU workloads only.** `/v1/messages` serves workloads that run on your workers. A workload that forwards to an external AI provider returns HTTP `501` (error type `api_error`) on this route.
+- **Chat endpoint toggle.** `/v1/messages` shares the chat endpoint toggle with `/v1/chat/completions`. If chat is disabled for the workload (Endpoint column of the Workloads tab), requests return HTTP `409` (error type `invalid_request_error`).
+- **Context and parallelism come from the command.** With the command above, a request can hold up to 262,144 tokens, and the GPU runs 2 sequences at a time. Change `--max-model-len` and `--max-num-seqs` to trade context length for parallel requests.
+- **Model quality.** Claude Code is designed around Claude models. An open-weight model behind the same interface handles tool calls and long sessions differently; evaluate it on your own tasks.
+
+## Troubleshooting
+
+### `400` `invalid_request_error`: "Model '…' is not available on this endpoint"
+
+```json
+{"type": "error", "error": {"type": "invalid_request_error", "message": "Model 'claude-…' is not available on this endpoint. This endpoint is bound to queue 'qwen3-coder-next-awq-4bit-vllm'. Use model 'default'."}}
+```
+
+- **Symptom:** HTTP `400` with error type `invalid_request_error` and the message above (internally `model_not_available`).
+- **Cause:** Claude Code sent a model name the endpoint does not serve, usually a Claude id from an alias or a background task.
+- **Fix:** set `ANTHROPIC_MODEL`, the three `ANTHROPIC_DEFAULT_*_MODEL` variables and `CLAUDE_CODE_SUBAGENT_MODEL` to the workload slug, as in [Connect Claude Code](#connect-claude-code), and restart `claude`.
+
+### `400` on requests with tools
+
+- **Symptom:** plain prompts work, but Claude Code (or the tool `curl` above) gets a `400` (error type `invalid_request_error`) whose message comes from vLLM and mentions `--enable-auto-tool-choice` and `--tool-call-parser`.
+- **Cause:** the vLLM command lacks the tool flags. The endpoint passes vLLM's `400` and its message through to the client.
+- **Fix:** add `--enable-auto-tool-choice --tool-call-parser qwen3_coder` (or the parser that matches your model) to the vLLM command and save the workload.
+
+### `401` or `403`
+
+- `401` (error type `authentication_error`): the key is missing or invalid. Check `ANTHROPIC_AUTH_TOKEN` holds an `ik_live_` key, and that `ANTHROPIC_API_KEY` is unset or holds the same key.
+- `403` (error type `permission_error`): the key is valid but not allowed on this endpoint. Edit the key's allowed endpoints, or check the project and workload slugs in `ANTHROPIC_BASE_URL`.
+
+For other errors, see [Common errors](/en/reference/common-errors/).
+
+## Next steps
+
+<CardGrid>
+  <LinkCard title="Authentication" href="/en/guides/authentication/" description="How ik_live_ data keys are scoped per endpoint or per project." />
+  <LinkCard title="Backends & policies" href="/en/reference/backends-and-policies/" description="vLLM, SGLang, Ollama, llama.cpp and the fixed, scheduled and autoscaling policies." />
+  <LinkCard title="Tutorial" href="/en/quickstart/tutorial/" description="Provision a workload from code with ensure() instead of the dashboard." />
+  <LinkCard title="Common errors" href="/en/reference/common-errors/" description="Every error code the endpoints and the SDK return, with fixes." />
+</CardGrid>
+
+---
+
+New to InferenceKey? [Create an account or open the dashboard](https://cloud.inferencekey.com) · Read the article behind the video: [An 80B coding model on one rented A100, driven by Claude Code](https://inferencekey.com/news/deploy-coding-assistant-single-gpu).

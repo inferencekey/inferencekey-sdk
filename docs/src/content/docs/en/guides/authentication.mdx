@@ -138,6 +138,8 @@ The defaults exist so that `mgmt.ensure(...)` works end to end: it needs `worklo
 Scopes (capabilities like `workload:write`) are a property of the **`ik_sdk_` control token only**. An `ik_live_` data token is instead gated by **which endpoints it may call**, enforced by the data-plane route `/endpoint/:projectSlug/:workloadSlug/v1/...`. Its reach is whichever endpoints it was granted: one or more specific `projectSlug/workloadSlug` (per workload — the common, least-privilege case), or a `projectSlug/*` wildcard that grants **every workload in that project, including ones created later**. The project-wide form is convenient (one key, no per-workload reassignment) but has a wider blast radius — prefer per-workload keys unless a caller genuinely needs the whole project.
 </Aside>
 
+For a worked example, [Deploy your own code assistant](/en/guides/deploy-your-own-code-assistant/) creates an `ik_live_` key limited to one endpoint and hands it to Claude Code.
+
 ## Resolution precedence
 
 Both clients resolve their token and project from two sources, in this order. **Explicit argument wins, then environment variable.**

@@ -1,0 +1,43 @@
+---
+// Privacy-friendly YouTube embed: youtube-nocookie.com host, lazy loaded,
+// never autoplays, responsive 16:9 box.
+interface Props {
+  /** YouTube video id, e.g. "do5-e8-Y7lk". */
+  id: string;
+  /** Accessible title for the iframe. */
+  title: string;
+}
+
+const { id, title } = Astro.props;
+const src = `https://www.youtube-nocookie.com/embed/${encodeURIComponent(id)}`;
+---
+
+<div class="ik-youtube">
+  <iframe
+    src={src}
+    title={title}
+    loading="lazy"
+    referrerpolicy="strict-origin-when-cross-origin"
+    allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+    allowfullscreen
+  ></iframe>
+</div>
+
+<style>
+  .ik-youtube {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    margin-block: 1.5rem;
+    border-radius: 0.5rem;
+    overflow: hidden;
+    background: var(--sl-color-black);
+  }
+  .ik-youtube iframe {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    border: 0;
+  }
+</style>
