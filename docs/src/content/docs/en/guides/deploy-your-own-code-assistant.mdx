@@ -59,7 +59,7 @@ You need:
    | `--kv-cache-dtype fp8_e4m3` | Stores the KV cache in FP8, which roughly halves its memory and leaves room for long contexts. |
    | `--max-model-len 262144` | Maximum context length per request, in tokens (prompt plus output). |
    | `--gpu-memory-utilization 0.90` | Fraction of GPU memory vLLM may use for weights, activations and KV cache. |
-   | `--max-num-seqs 2` | At most 2 sequences run at the same time on the GPU. Further requests wait in the vLLM queue. |
+   | `--max-num-seqs 2` | At most 2 sequences run at the same time on the GPU. Further requests are queued until a slot frees up. |
    | `--enable-auto-tool-choice` | Lets the model decide when to call a tool. Required for coding assistants. |
    | `--tool-call-parser qwen3_coder` | Parses this model's tool-call format into structured tool calls. |
 
@@ -86,7 +86,7 @@ You need:
    | **GPU model** | A100 SXM · 80GB | The catalog listed it at **$1.79/h** at recording time. |
    | **Secure cloud** | Checked | Higher reliability, slightly higher price. Uncheck for community cloud pricing. |
    | **Worker name** | `A100-SXM-80GB-CUDA130-01` | Auto-generated from GPU model, VRAM and CUDA. You can override it. |
-   | **Concurrent requests** | 20 (default) | Initial concurrency for this worker on this workload. |
+   | **Concurrent requests** | 20 (default) | Initial concurrency for this worker on this workload. The video keeps 20 while vLLM runs 2 sequences at a time (`--max-num-seqs 2`), so extra requests are queued. |
 
    <Aside type="note" title="Prices change">
    Catalog prices come from the cloud provider and move with availability. The $1.79/h figure is what the catalog showed when the video was recorded. Check the price in the dialog before you deploy; the current panel may quote it in a different currency.
@@ -150,7 +150,7 @@ You need:
    Variable names are from the [Claude Code environment variables reference](https://code.claude.com/docs/en/env-vars).
 
    <Aside type="tip" title="ANTHROPIC_API_KEY also works">
-   The endpoint also accepts the key in the `x-api-key` header, which is what `ANTHROPIC_API_KEY` sends. Use one variable, not both: if both headers arrive with different values, the request fails with `invalid_api_key`.
+   The endpoint also accepts the key in the `x-api-key` header, which is what `ANTHROPIC_API_KEY` sends. Use one variable, not both: if both headers arrive with different values, the request fails with HTTP `401` and error type `authentication_error`.
    </Aside>
 
    Check the endpoint with `curl` before starting Claude Code:
@@ -186,7 +186,7 @@ You need:
 
 7. ### Watch the live view and GPU telemetry
 
-   Video: [2:20](https://www.youtube.com/watch?v=do5-e8-Y7lk&t=140s), telemetry at [2:30](https://www.youtube.com/watch?v=do5-e8-Y7lk&t=150s)
+   Video: [2:28](https://www.youtube.com/watch?v=do5-e8-Y7lk&t=148s), telemetry at [2:35](https://www.youtube.com/watch?v=do5-e8-Y7lk&t=155s)
 
    The project's **Live Flow** tab shows requests travelling from the workload to the worker in real time. Click the workload to open its drawer: **Backlog**, **Requests Total**, **p95 Latency**, a backlog vs throughput chart, and **Token Usage** for the last 30 days, broken down by API key.
 
@@ -200,41 +200,42 @@ Video: [2:48](https://www.youtube.com/watch?v=do5-e8-Y7lk&t=168s)
 
 The video runs on one GPU. The platform supports these ways to add capacity:
 
-- **More workers on the same workload.** Click **Add worker** again (or **Assign workers**) to attach another cloud GPU or one of your own servers. All workers assigned to a workload pull from the same queue, so each request is taken by one worker that has a free slot. No load balancer to configure.
-- **Concurrent requests per worker.** Each worker-to-workload assignment has a **Concurrent requests** limit (1 to 1000, default 20): the maximum number of requests that worker processes at the same time for that workload. Keep it in line with the vLLM `--max-num-seqs` value; requests above vLLM's limit wait in vLLM's own queue.
-- **More GPUs per node.** **GPUs per node** accepts 1, 2, 4 or 8 GPUs of the same model. Tensor parallelism splits one model across them. When the command has no tensor parallel flag, the worker adds `--tensor-parallel-size` with the number of GPUs it can use; an explicit `--tensor-parallel-size` in your command always wins. For a mixture-of-experts model like this one, keep `--enable-expert-parallel`.
+- **More workers on the same workload.** Click **Add worker** again (or **Assign workers**) to attach another cloud GPU or one of your own servers. All workers assigned to a workload pull from the same queue, so each request is taken by one worker that has a free slot.
+- **Concurrent requests per worker.** Each worker-to-workload assignment has a **Concurrent requests** limit (1 to 1000, default 20): the maximum number of requests that worker processes at the same time for that workload. Keep it in line with the vLLM `--max-num-seqs` value; requests above vLLM's limit are queued.
+- **More GPUs per node.** **GPUs per node** accepts 1, 2, 4 or 8 GPUs of the same model. Tensor parallelism splits one model across them. When the command has no tensor parallel flag, the worker adds `--tensor-parallel-size` with the number of GPUs it can use; an explicit `--tensor-parallel-size` in your command always wins. Automatic tensor parallelism needs an up-to-date worker, so setting `--tensor-parallel-size` explicitly (for example `--tensor-parallel-size 2` on 2 GPUs) is the safe choice. For a mixture-of-experts model like this one, keep `--enable-expert-parallel`.
 
 For schedule- or demand-driven capacity, see the execution policies in [Backends & policies](/en/reference/backends-and-policies/).
 
 ## Limits
 
-- **Model names.** The endpoint accepts only the workload slug, the workload's model name (`cyankiwi/Qwen3-Coder-Next-AWQ-4bit` here), `default`, or no model. Any other name, including Claude model ids, returns `model_not_available`.
-- **Local GPU workloads only.** `/v1/messages` serves workloads that run on your workers. A workload that forwards to an external AI provider returns `501` on this route.
-- **Chat endpoint toggle.** `/v1/messages` shares the chat endpoint toggle with `/v1/chat/completions`. If chat is disabled for the workload (Endpoint column of the Workloads tab), requests return `409`.
+- **Model names.** The endpoint accepts only the workload slug, the workload's model name (`cyankiwi/Qwen3-Coder-Next-AWQ-4bit` here), `default`, or no model. Any other name, including Claude model ids, returns HTTP `400` with error type `invalid_request_error` and the message "Model '…' is not available on this endpoint" (internally `model_not_available`).
+- **Local GPU workloads only.** `/v1/messages` serves workloads that run on your workers. A workload that forwards to an external AI provider returns HTTP `501` (error type `api_error`) on this route.
+- **Chat endpoint toggle.** `/v1/messages` shares the chat endpoint toggle with `/v1/chat/completions`. If chat is disabled for the workload (Endpoint column of the Workloads tab), requests return HTTP `409` (error type `invalid_request_error`).
 - **Context and parallelism come from the command.** With the command above, a request can hold up to 262,144 tokens, and the GPU runs 2 sequences at a time. Change `--max-model-len` and `--max-num-seqs` to trade context length for parallel requests.
 - **Model quality.** Claude Code is designed around Claude models. An open-weight model behind the same interface handles tool calls and long sessions differently; evaluate it on your own tasks.
 
 ## Troubleshooting
 
-### `model_not_available`
+### `400` `invalid_request_error`: "Model '…' is not available on this endpoint"
 
 ```json
 {"type": "error", "error": {"type": "invalid_request_error", "message": "Model 'claude-…' is not available on this endpoint. This endpoint is bound to queue 'qwen3-coder-next-awq-4bit-vllm'. Use model 'default'."}}
 ```
 
+- **Symptom:** HTTP `400` with error type `invalid_request_error` and the message above (internally `model_not_available`).
 - **Cause:** Claude Code sent a model name the endpoint does not serve, usually a Claude id from an alias or a background task.
 - **Fix:** set `ANTHROPIC_MODEL`, the three `ANTHROPIC_DEFAULT_*_MODEL` variables and `CLAUDE_CODE_SUBAGENT_MODEL` to the workload slug, as in [Connect Claude Code](#connect-claude-code), and restart `claude`.
 
 ### `400` on requests with tools
 
-- **Symptom:** plain prompts work, but Claude Code (or the tool `curl` above) gets a `400` whose message comes from vLLM and mentions `--enable-auto-tool-choice` and `--tool-call-parser`.
+- **Symptom:** plain prompts work, but Claude Code (or the tool `curl` above) gets a `400` (error type `invalid_request_error`) whose message comes from vLLM and mentions `--enable-auto-tool-choice` and `--tool-call-parser`.
 - **Cause:** the vLLM command lacks the tool flags. The endpoint passes vLLM's `400` and its message through to the client.
 - **Fix:** add `--enable-auto-tool-choice --tool-call-parser qwen3_coder` (or the parser that matches your model) to the vLLM command and save the workload.
 
 ### `401` or `403`
 
-- `401`: the key is missing or invalid. Check `ANTHROPIC_AUTH_TOKEN` holds an `ik_live_` key, and that `ANTHROPIC_API_KEY` is unset or holds the same key.
-- `403`: the key is valid but not allowed on this endpoint. Edit the key's allowed endpoints, or check the project and workload slugs in `ANTHROPIC_BASE_URL`.
+- `401` (error type `authentication_error`): the key is missing or invalid. Check `ANTHROPIC_AUTH_TOKEN` holds an `ik_live_` key, and that `ANTHROPIC_API_KEY` is unset or holds the same key.
+- `403` (error type `permission_error`): the key is valid but not allowed on this endpoint. Edit the key's allowed endpoints, or check the project and workload slugs in `ANTHROPIC_BASE_URL`.
 
 For other errors, see [Common errors](/en/reference/common-errors/).
 
