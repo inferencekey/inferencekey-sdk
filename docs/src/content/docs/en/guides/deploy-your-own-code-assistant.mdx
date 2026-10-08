@@ -19,14 +19,14 @@ What the video sets up:
 - **Hardware:** one NVIDIA A100 SXM 80 GB rented from the cloud GPU catalog.
 - **Client:** Claude Code, talking to the workload's `/v1/messages` endpoint.
 
-For the background story behind the video, read the article [Deploy a coding assistant on a single GPU](https://inferencekey.com/news/deploy-coding-assistant-single-gpu).
+For the background story behind the video, read the article [An 80B coding model on one rented A100, driven by Claude Code](https://inferencekey.com/news/deploy-coding-assistant-single-gpu).
 
 ## Before you start
 
 You need:
 
 - An InferenceKey account. Open the [dashboard](https://cloud.inferencekey.com).
-- Balance or billing set up if you rent a cloud GPU. Cloud GPUs are charged per hour while the worker runs.
+- Balance or billing set up if you rent a cloud GPU. Cloud GPUs are charged per hour while the worker runs. See [Stop the cloud GPU](#stop-the-cloud-gpu) for how to release it.
 - [Claude Code](https://code.claude.com/docs) installed on the developer machine, plus `curl` for the checks below.
 
 <Steps>
@@ -124,7 +124,7 @@ You need:
    POST https://api.inferencekey.com/endpoint/<project_slug>/<workload_slug>/v1/messages
    ```
 
-   Claude Code appends `/v1/messages` to `ANTHROPIC_BASE_URL`, so the base URL stops at the workload slug. Use the public host your dashboard shows for endpoints; `api.inferencekey.com` is the default.
+   Claude Code appends `/v1/messages` to `ANTHROPIC_BASE_URL`, so the base URL stops at the workload slug. To get the URL from the panel, open the row actions menu of the workload in the **Workloads** tab and click **Copy URL**. It copies the OpenAI-compatible base, which ends in `/v1`; remove that `/v1` for `ANTHROPIC_BASE_URL`. The default public host is `api.inferencekey.com`.
 
    Claude Code asks for Claude model names (for example a Haiku-class model for background tasks). The endpoint only accepts the workload slug, the workload's model name or `default`, so set every model variable to the workload slug.
 
@@ -206,6 +206,19 @@ The video runs on one GPU. The platform supports these ways to add capacity:
 
 For schedule- or demand-driven capacity, see the execution policies in [Backends & policies](/en/reference/backends-and-policies/).
 
+## Stop the cloud GPU
+
+A rented GPU is billed while its pod exists, whether or not it serves requests. To release it, delete the worker:
+
+1. Open Platform Management → **Workers**.
+2. On the worker's card, click **Delete**, then confirm with **Delete** in the **Delete worker** dialog.
+
+For a cloud worker, the platform terminates the pod at the cloud provider, closes the billing of that deployment, and then removes the worker. If the provider does not confirm the termination, the worker is not deleted: an error explains why, the termination is retried automatically, and the card shows **Pod termination pending** with the pod id. While that label is shown, the pod may still be billed.
+
+<Aside type="caution" title="Unassigning does not stop the pod">
+Unassigning the worker from the workload (the **Unassign worker** cross on its chip in the **Workloads** tab) only stops it from serving that workload; the pod keeps running and billing. Deleting the workload does not stop it either when the workload uses the `fixed` execution policy, the default and the one used in this guide. Delete the worker to release the GPU.
+</Aside>
+
 ## Limits
 
 - **Model names.** The endpoint accepts only the workload slug, the workload's model name (`cyankiwi/Qwen3-Coder-Next-AWQ-4bit` here), `default`, or no model. Any other name, including Claude model ids, returns HTTP `400` with error type `invalid_request_error` and the message "Model '…' is not available on this endpoint" (internally `model_not_available`).
@@ -250,4 +263,4 @@ For other errors, see [Common errors](/en/reference/common-errors/).
 
 ---
 
-New to InferenceKey? [Create an account or open the dashboard](https://cloud.inferencekey.com) · Read the article behind the video at [inferencekey.com](https://inferencekey.com/news/deploy-coding-assistant-single-gpu).
+New to InferenceKey? [Create an account or open the dashboard](https://cloud.inferencekey.com) · Read the article behind the video: [An 80B coding model on one rented A100, driven by Claude Code](https://inferencekey.com/news/deploy-coding-assistant-single-gpu).
