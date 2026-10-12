@@ -1,0 +1,17 @@
+# Requirements of the CUSTOM BACKEND (installed by the worker into the
+# backend's own venv). The client side (main.py) only needs the local SDK
+# build and `requests`, see README.
+
+# InferenceKey SDK runtime: provides `python -m inferencekey.backend.serve`.
+inferencekey
+
+# Iris-3B inference path (the same set the authors' Turbo demo installs).
+# torch from PyPI is the CUDA build on NVIDIA nodes.
+torch>=2.7.1
+# Qwen3-VL text encoder needs native Qwen3-VL support.
+transformers>=4.57.0
+omegaconf>=2.3
+safetensors>=0.4
+huggingface_hub>=0.26
+pillow>=10.0
+numpy>=1.26
