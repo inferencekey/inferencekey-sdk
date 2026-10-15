@@ -1,0 +1,18 @@
+{
+  "_note": "Illustrative excerpts written for this example (not quotes from real papers). Replace them with what your own retrieval step returns: one object per excerpt, with any unique id.",
+  "query": "How can a small team cut the cost of serving a large language model?",
+  "references": [
+    {"id": "ex-1", "author": "Example", "year": 2025, "citations": 12,
+     "quote": "Storing weights in 4-bit instead of 16-bit cut GPU memory by about 70 percent in our tests, so the same model fit on a single 24 GB card instead of two. Answer quality dropped slightly on math tasks and was unchanged on summarisation."},
+    {"id": "ex-2", "author": "Sample", "year": 2024, "citations": 140,
+     "quote": "Continuous batching lets the server add new requests to a running batch as soon as others finish. Throughput rose 3 to 8 times compared with static batching at the same latency target."},
+    {"id": "ex-3", "author": "Demo", "year": 2025, "citations": 35,
+     "quote": "Speculative decoding uses a small draft model to propose several tokens that the large model checks in one pass. The output is identical to normal decoding, and generation was 1.8 to 2.5 times faster when the draft model agreed with the large model often."},
+    {"id": "ex-4", "author": "Placeholder", "year": 2023, "citations": 8,
+     "quote": "Most of the cost of a chat service came from idle GPUs at night. Scaling replicas to zero outside office hours reduced the monthly bill by 41 percent, at the price of a cold start of about one minute for the first request of the day."},
+    {"id": "ex-5", "author": "Mock", "year": 2025, "citations": 3,
+     "quote": "Reusing the KV cache of a shared system prompt across requests (prefix caching) reduced time to first token by 60 percent for prompts longer than 4,000 tokens."},
+    {"id": "ex-6", "author": "Sketch", "year": 2024, "citations": 21,
+     "quote": "A fine-tuned 8B model matched a general-purpose 70B model on a narrow extraction task while costing one eighth as much per request to serve."}
+  ]
+}
