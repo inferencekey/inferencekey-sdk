@@ -1,0 +1,16 @@
+# Requirements of the CUSTOM BACKEND (installed by the worker with uv into the
+# backend's own venv). The client side (main.py) only needs the local SDK build
+# and `requests`, see README.
+
+# InferenceKey SDK runtime: provides `python -m inferencekey.backend.serve`.
+inferencekey
+
+# Model download from Hugging Face; hf_xet makes the 6 GB pull parallel.
+huggingface_hub[hf_xet]
+
+# CUDA 12 runtime for Prism ML's prebuilt llama-server (CUDA 12.8 build). The
+# tarball links libcudart.so.12 and libcublas.so.12 but does not ship them;
+# these wheels do, so the backend runs whatever CUDA toolkit the image has.
+# Needs an NVIDIA driver for CUDA 12.8 or newer (570+).
+nvidia-cuda-runtime-cu12==12.8.*
+nvidia-cublas-cu12==12.8.*
