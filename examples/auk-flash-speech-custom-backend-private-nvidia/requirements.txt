@@ -1,0 +1,28 @@
+# Requirements of the CUSTOM BACKEND (installed by the worker with uv into the
+# backend's own venv). The client side (main.py) only needs the local SDK build
+# and `requests`, see README.
+
+# InferenceKey SDK runtime: provides `python -m inferencekey.backend.serve`.
+inferencekey
+
+# AuK's inference dependencies (its pyproject.toml at the pinned commit). The
+# AuK source itself is fetched by backend.py, it is not on PyPI.
+# torch from PyPI is the CUDA 12.6 build: needs an NVIDIA driver for CUDA 12.6+.
+torch>=2.7,<2.8
+torchaudio>=2.7,<2.8
+torchvision>=0.22,<0.23
+# Qwen2.5-Omni support landed in 4.52; AuK was validated on 4.57.
+transformers>=4.57,<4.58
+qwen-omni-utils>=0.0.9
+# qwen-omni-utils imports audioread, which librosa 1.0 no longer pulls in.
+audioread
+omegaconf>=2.3.0
+torchdiffeq
+x_transformers>=1.31.14
+safetensors
+accelerate>=0.33.0
+soundfile
+numpy
+
+# Weights download; hf_xet makes the 19 GB pull parallel.
+huggingface_hub[hf_xet]
