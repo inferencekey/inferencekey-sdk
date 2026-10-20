@@ -1,0 +1,17 @@
+# Requirements of the CUSTOM BACKEND (installed by the worker into the backend's
+# own venv). The client side (main.py) only needs the SDK and `requests`.
+
+# InferenceKey SDK runtime: provides `python -m inferencekey.backend.serve`.
+inferencekey
+
+# OmniVoice and what backend.py imports directly. On an AMD node the worker
+# installs a ROCm torch/torchaudio first and pins them (gfx120x wheels exist
+# for torch >= 2.7); on NVIDIA they come from PyPI (CUDA). Tested with torch
+# 2.8.0, transformers 5.20 and omnivoice 0.2.1.
+omnivoice>=0.2.1,<0.3
+torch>=2.7
+torchaudio>=2.7
+huggingface_hub
+numpy
+# libsndfile >= 1.1 (bundled in the wheels) writes MP3 as well as WAV/FLAC.
+soundfile>=0.12
