@@ -45,7 +45,8 @@ machines:
 | Pack download (309 GiB) | 2.5 to 7.4 min |
 | Load to ready | 4.5 to 18 min, depending on the machine |
 
-That adds up to well over half an hour on a slow machine, so `main.py` waits up
+That adds up to about 12 min on the fastest measured machine and well over half
+an hour on a slow one, so `main.py` waits up
 to **3600 s** by default. Override it with `IK_READY_TIMEOUT` (seconds).
 
 ## Run
@@ -74,8 +75,10 @@ delete the workload later.
   `command="vllm serve diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000
   --revision a1cf1bd227a754aa7e2ca5c21652bfaf256ee8a5 --served-model-name
   deepseek-v4.1-flash"`, `task_type="text2text"`) pinned to your worker via
-  `worker_id`, `fixed` policy with 1 replica. The command is the one the Manager
-  UI prefills; the worker adds the recipe defaults and pins the stack, so there
+  `worker_id`, `fixed` policy (one pinned worker = one replica). The spec sets no
+  `execution_policy_config`: the platform stores no replica count for a fixed
+  policy, so passing one would make every `ensure()` re-PATCH the workload. The
+  command is the one the Manager UI prefills; the worker adds the recipe defaults and pins the stack, so there
   is no `vllm_version` (this backend's config holds only the command).
   Idempotent by `slug`.
 - **wait_until_ready()**: blocks through the cold start above, up to

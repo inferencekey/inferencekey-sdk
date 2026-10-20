@@ -88,25 +88,28 @@ def main() -> int:
         worker_id=worker_id,
         # Private + fixed: one always-on replica. It stays reserved (and billing)
         # until delete() runs, see "Cost & cleanup" in the README.
+        # No execution_policy_config: the platform stores no replica count for a
+        # fixed policy (one pinned worker = one replica), so passing one would
+        # make every ensure() re-PATCH the workload.
         execution_policy=ExecutionPolicy.FIXED,
-        execution_policy_config={"replicas": 1},
     )
 
     base = os.environ.get("INFERENCEKEY_BASE_URL", "https://cloud.inferencekey.com")
     project = os.environ["INFERENCEKEY_PROJECT"]
     endpoint_base = f"{base}/endpoint/{project}/{SLUG}/v1"
 
+    ref = None
     try:
         # 1) Provision / reconcile. Idempotent by slug.
         ref = mgmt.ensure(spec)
         print(f"ensured {ref.project_slug}/{ref.workload_slug}")
 
         # 2) Wait for the cold worker to install the pinned stack, download the
-        #    309 GiB pack and load it. On a fresh node this takes from about 15
+        #    309 GiB pack and load it. On a fresh node this takes from about 12
         #    minutes to well over half an hour, hence the long timeout.
         print(
             "waiting for the worker to become ready (cold start: install, 309 GiB "
-            f"download and load, from about 15 to over 30 min; timeout {READY_TIMEOUT} s)..."
+            f"download and load, from about 12 min to over 30 min; timeout {READY_TIMEOUT} s)..."
         )
         mgmt.wait_until_ready(ref.workload_slug, timeout=READY_TIMEOUT)
 
@@ -131,7 +134,11 @@ def main() -> int:
         # 4) Tear down so the reserved GPUs stop billing, unless asked to keep
         #    the endpoint alive. Idempotent and safe: runs on success, error,
         #    and Ctrl-C.
-        if os.environ.get("IK_KEEP_ALIVE") == "1":
+        keep_alive = os.environ.get("IK_KEEP_ALIVE") == "1"
+        if keep_alive and ref is None:
+            # ensure() failed, so there is no workload to keep or point at.
+            print("ensure() did not complete, nothing was created to keep (IK_KEEP_ALIVE=1)")
+        elif keep_alive:
             print(f"kept workload {SLUG} (IK_KEEP_ALIVE=1); it keeps billing until deleted")
             print(f"endpoint: {endpoint_base} (model \"default\")")
             print(
