@@ -1,0 +1,229 @@
+---
+title: DeepSeek-V4.1-Flash on one 96 GB GPU
+description: "Serve DeepSeek-V4.1-Flash (763B MoE, Q2_K) from one RTX PRO 6000 on your own worker with the deepseek-one-gpu custom backend: publish it with the SDK, ensure() a fixed workload, and call it with the openai client."
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from "@astrojs/starlight/components";
+import YouTube from "../../../../components/YouTube.astro";
+
+This guide runs **DeepSeek-V4.1-Flash**, a 763-billion-parameter mixture-of-experts model, on a private worker with **one NVIDIA RTX PRO 6000 Blackwell (96 GB)** and the server's RAM. The engine is the open source [deepseek-one-gpu](https://github.com/inferencekey/deepseek-one-gpu) (MIT, built on [Strata](https://github.com/Niko1221/Strata)). It runs on InferenceKey as a **custom backend**: you publish it once with the SDK, pin a workload to your worker, and call it from anywhere through an OpenAI-compatible endpoint behind your API keys. The model and its weights never leave your machine.
+
+<YouTube id="uwF0NuOObqs" title="How to run DeepSeek-V4.1-Flash (763B) on one 96 GB GPU" />
+
+What you get, measured on an RTX PRO 6000 Blackwell Server Edition ([results](https://github.com/inferencekey/deepseek-one-gpu/blob/main/docs/RESULTS.md)):
+
+| Users at once | Total tokens/s | Per user |
+| --- | --- | --- |
+| 1 | 63.11 | 63.11 |
+| 4 | 127.58 | 31.87 for the slowest |
+| 8 | 152.53 | about 19 |
+
+## How it fits on one card
+
+The model is 264.5 GB even at 2 bits (Q2_K), and the card has 96 GB. For every token, each layer picks 6 of its 384 experts, and some experts are picked far more than others. The engine keeps the attention, the dense layers and the **5,825 most used experts (69.5 GiB) in VRAM**; the other **9,535 experts (113.9 GiB) stay in pinned RAM**, where CPU threads compute them while the GPU works. In the measured runs about 9 in 10 expert picks were already on the GPU, and the hot set follows the traffic. Video: [0:55](https://www.youtube.com/watch?v=uwF0NuOObqs&t=55s).
+
+## Before you start
+
+Video: [1:35](https://www.youtube.com/watch?v=uwF0NuOObqs&t=95s)
+
+The **worker** (the GPU box registered in your InferenceKey project) needs:
+
+| | |
+| --- | --- |
+| **GPU** | One NVIDIA RTX PRO 6000 Blackwell, 96 GB. NVIDIA driver 580.65 or newer (CUDA 13). The engine bundles its CUDA runtime. |
+| **RAM** | About 280 GB. The backend's placement step refuses a host that cannot hold the minimum layout. |
+| **Disk** | About 300 GB free for the model, under the worker user's `~/.cache/deepseek-one-gpu` (or `DSV41_CACHE_DIR`). |
+| **Software** | CPython 3.11 to 3.13 for the backend environment, and `numactl` (else `taskset`) to bind the engine to the GPU's NUMA node. |
+
+Your **laptop** needs Python 3.10+ and `pip install inferencekey openai`. No GPU.
+
+From the dashboard you need:
+
+- An **SDK token** with the scopes `workload:read` and `workload:write`. The token wizard does not tick `workload:read` by default: tick it. See [Tokens](/en/quickstart/tokens/).
+- An **API key** for calling the endpoint (created in step 5).
+- Your **project slug** and your **worker id** (Workers page).
+
+<Aside type="caution" title="Raise the worker's readiness timeout">
+A worker waits 300 s for a custom backend to become ready. The first start of this one downloads 264.5 GB and then loads the model, so set `INFERENCEKEY_CUSTOM_BACKEND_READY_TIMEOUT_SECS=7200` in the worker's environment and restart it. Or download the seven `DeepSeek-V4.1-Flash-Q2_K-*.gguf` files beforehand and set `DSV41_MODEL_DIR` to their folder.
+</Aside>
+
+<Steps>
+
+1. ### Get the integration
+
+   ```bash
+   git clone https://github.com/inferencekey/deepseek-one-gpu.git
+   cd deepseek-one-gpu/integrations/inferencekey
+   pip install inferencekey openai
+   cp .env.example .env
+   ```
+
+   Fill in `.env`:
+
+   ```bash title=".env"
+   INFERENCEKEY_SDK_TOKEN=ik_sdk_...      # control plane: workload:read + workload:write
+   INFERENCEKEY_API_KEY=ik_live_...       # data plane: the key that calls the endpoint
+   INFERENCEKEY_PROJECT=your-project-slug
+   IK_WORKER_ID=...                       # the worker with the RTX PRO 6000
+   ```
+
+   What is in the folder:
+
+   - `backend.py`: the custom backend `DeepSeekOneGpuBackend`.
+   - `publish.py`: packages `backend.py` with the engine's Python side (server, placement tool, two data files; about 300 KB, no weights, no binary) and publishes it to your tenant.
+   - `main.py`: `ensure()` a fixed workload on your worker, wait until ready, ask one question, and `delete()` unless `IK_KEEP_ALIVE=1`.
+   - `requirements.txt`: what the worker installs in the backend's isolated environment.
+
+2. ### Publish the custom backend
+
+   Video: [4:36](https://www.youtube.com/watch?v=uwF0NuOObqs&t=276s)
+
+   ```bash
+   python publish.py
+   ```
+
+   It publishes the slug `deepseek-v41-flash-one-gpu`, task type `text2text`. You do this once per version. It shows up under **Platform Management, Custom backends**:
+
+   ![Custom backends page: deepseek-v41-flash-one-gpu, version 0.1.0, text2text, 290.3 KiB](/guides/deepseek-one-gpu/01-custom-backend.png)
+
+   If you prefer the dashboard, `publish.py` also leaves the package in `dist/`; drag that `.tar.gz` into the Custom backends page. Both paths publish the same thing. See [Custom backends](/en/guides/custom-backends/) for the contract.
+
+3. ### Pin a workload to your worker
+
+   ```bash
+   IK_KEEP_ALIVE=1 python main.py
+   ```
+
+   `main.py` declares the workload and lets the platform reconcile it:
+
+   ```python title="main.py (the part that matters)"
+   import os
+   from inferencekey import ExecutionPolicy, ManagementClient, WorkloadSpec
+
+   mgmt = ManagementClient.from_env()
+   spec = WorkloadSpec(
+       name="DeepSeek-V4.1-Flash on one RTX PRO 6000",
+       slug="deepseek-v41-flash",
+       model="vcruz305/DeepSeek-V4.1-Flash-GGUF",
+       backend="deepseek-v41-flash-one-gpu",   # the custom backend slug
+       task_type="text2text",
+       worker_id=os.environ["IK_WORKER_ID"],   # private worker
+       execution_policy=ExecutionPolicy.FIXED, # one always-on replica on your GPU
+   )
+   mgmt.ensure(spec)
+   ```
+
+   It then waits up to `IK_READY_TIMEOUT` seconds (default 7200) for the first start. `IK_KEEP_ALIVE=1` keeps the workload after the script ends, which is what you want for a service. The same workload from the **Create workload** form:
+
+   ![Create workload: Text to Text, backend deepseek-v41-flash-one-gpu 0.1.0, model vcruz305/DeepSeek-V4.1-Flash-GGUF, worker rtx-pro-6000-01](/guides/deepseek-one-gpu/02-create-workload.png)
+
+4. ### Watch the worker start the engine
+
+   Video: [1:56](https://www.youtube.com/watch?v=uwF0NuOObqs&t=116s) shows the same steps by hand with `run.sh`.
+
+   On the worker, the backend's `setup()`:
+
+   1. checks the GPU and the driver;
+   2. downloads the prebuilt engine from release [v0.1.0](https://github.com/inferencekey/deepseek-one-gpu/releases/tag/v0.1.0) and checks its sha256, and downloads the GGUF at a pinned revision, both in parallel;
+   3. plans which experts go to VRAM from your VRAM and RAM;
+   4. starts the server on a loopback port, bound to the GPU's NUMA node;
+   5. waits for `/health`.
+
+   The worker's drawer follows it to **Model ready**:
+
+   ![Worker drawer: 1 GPU, 96 GB, online, Model ready, 64 CPU cores, 282 GB of RAM, NVIDIA RTX PRO 6000 Blackwell Server Edition](/guides/deepseek-one-gpu/05-worker-drawer.png)
+
+   <Aside type="tip" title="The NUMA binding matters">
+   The CPU half of the work reads expert weights from RAM, so its threads must run on the socket that owns the GPU. On the same build, binding took one user from about 53 to 63 tokens/s. Inside containers that refuse `numactl --preferred`, the backend falls back to CPU-only binding, then `taskset`.
+   </Aside>
+
+5. ### Give an API key access
+
+   On the **Workloads** page, open the workload's **Access** column, tick (or create) the API key and save. The dialog shows the endpoint:
+
+   ![Edit OpenAI endpoint access: endpoint https://cloud.inferencekey.com/endpoint/private-gpu/deepseek-v41-flash/v1, API key deepseek-app enabled](/guides/deepseek-one-gpu/06-endpoint-access.png)
+
+   The workload answers chat completions (and Anthropic messages):
+
+   ![Endpoints of the workload: chat completions on, /v1/chat/completions and /v1/messages](/guides/deepseek-one-gpu/07-endpoints.png)
+
+6. ### Call it with the openai client
+
+   The endpoint is `https://cloud.inferencekey.com/endpoint/<project>/deepseek-v41-flash/v1` and the model name is `default`:
+
+   ```python title="call.py"
+   import json
+   from openai import OpenAI
+
+   client = OpenAI(
+       base_url="https://cloud.inferencekey.com/endpoint/<project>/deepseek-v41-flash/v1",
+       api_key="ik_live_...",
+   )
+   completion = client.chat.completions.create(
+       model="default",
+       messages=[{"role": "user", "content": "Explain mixture-of-experts models in two sentences."}],
+       max_tokens=400,
+   )
+   out = json.loads(completion.choices[0].message.content)  # the backend's own object
+   print(out["text"])
+   print(out["usage"], out["timings"])
+   ```
+
+   A custom backend answers with its own JSON object as the message content: `{text, reasoning, finish_reason, usage, timings}`. The real token counts and speeds are inside it.
+
+7. ### Serve 4 users at once
+
+   Video: [3:19](https://www.youtube.com/watch?v=uwF0NuOObqs&t=199s)
+
+   The engine decodes up to 8 requests in the same step, but a workload pinned with `ensure()` starts with **concurrency 1**: InferenceKey sends the worker one request at a time. On the Workloads page, click the worker's `CONC. 1` pill, set **Concurrent requests** to 4 and save:
+
+   ![Concurrent requests popover set to 4 for rtx-pro-6000-01](/guides/deepseek-one-gpu/04-concurrency.png)
+
+   ![Workloads page: the workload on rtx-pro-6000-01 with concurrency 4, Fixed policy, Healthy; capacity 4 concurrent requests](/guides/deepseek-one-gpu/03-workloads-ready.png)
+
+   With 4 at once the engine measured 127.58 tokens/s in total, 31.87 for the slowest user.
+
+</Steps>
+
+## Settings
+
+Every class attribute of `DeepSeekOneGpuBackend` can be overridden with a `DSV41_<NAME>` variable in the **worker's** environment (custom backends do not receive the workload's config). The ones you are most likely to touch:
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `DSV41_MODEL_DIR` | (download) | Folder with the seven Q2_K GGUF files; skips the 264.5 GB download. |
+| `DSV41_CACHE_DIR` | `~/.cache/deepseek-one-gpu` | Where the engine and the model are downloaded. |
+| `DSV41_DEFAULT_MAX_TOKENS` | `4096` | `max_tokens` for requests that do not set it. |
+| `DSV41_SERVER_ENGINE` | `strata` | `mock` starts a scripted engine, to check the wiring on a machine without the GPU. |
+
+## Quality and cost
+
+On fixed-seed subsets the engine scores GSM8K 0.927, IFEval 0.800 and HumanEval 0.890, against 0.960, 0.853 and 0.982 for the full model on DeepSeek's API. The stock llama.cpp fork on the same Q2_K file scores 0.878 on HumanEval, so the gap is the 2-bit quantization. Per token, DeepSeek's API is cheaper than a rented RTX PRO 6000 ([cost comparison](https://github.com/inferencekey/deepseek-one-gpu/blob/main/docs/COST.md)); this setup is for data that must stay on your machine and capacity you do not share. Video: [3:48](https://www.youtube.com/watch?v=uwF0NuOObqs&t=228s).
+
+## Limits
+
+- **No streaming** for custom backends yet (`"stream": true`).
+- **300 s per request** on the worker. When a request sets no `max_tokens`, the backend uses 4,096 (about 215 s at the 19 tokens/s of a user among 8). Ask for less when 8 users share the card.
+- **No tool calls.** A request with `tools` is refused with 400.
+- The response's own `usage` is zero; use the `usage` inside the decoded content.
+- Non-OpenAI fields (`reasoning_effort`, `strata_reproducible`, ...) go in an `extra_body` object of the request JSON. The OpenAI Python client's `extra_body=` merges them into the top level instead, so send those requests as raw JSON.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `ensure()` fails with `scope_insufficient` | The SDK token lacks `workload:read`. | Create a token with `workload:read` and `workload:write`. |
+| The workload never leaves "Preparing backend" and the worker logs a readiness timeout | The first start (download and load) takes longer than the default 300 s. | Set `INFERENCEKEY_CUSTOM_BACKEND_READY_TIMEOUT_SECS=7200` on the worker, or pre-download and set `DSV41_MODEL_DIR`. |
+| Setup stops at the placement step | Not enough RAM for the minimum layout. | Use a host with about 280 GB of RAM. |
+| One user gets far less than 63 tokens/s | The engine is not on the GPU's NUMA node, or the host's RAM is slow. | Check `nvidia-smi topo -m` and that `numactl` is installed; compare hosts. |
+| Replies stop at 4,096 tokens | The request set no `max_tokens`, so the backend's default applied. | Send `max_tokens`, or change `DSV41_DEFAULT_MAX_TOKENS`; keep each reply under the worker's 300 s per request. |
+
+## Next steps
+
+<CardGrid>
+  <LinkCard title="deepseek-one-gpu on GitHub" description="The engine, run.sh, the measured results and the integration." href="https://github.com/inferencekey/deepseek-one-gpu" />
+  <LinkCard title="Custom backends" description="The setup() / process() contract, packaging and publishing." href="/en/guides/custom-backends/" />
+  <LinkCard title="Workloads by policy, worker and modality" description="Fixed vs other policies, private workers." href="/en/guides/workloads-by-policy-worker-modality/" />
+</CardGrid>
+
+Credits: the offload method and the server come from [Strata](https://github.com/Niko1221/Strata) by Niko1221 and contributors, on top of llama.cpp and ggml, with vcruz305's DeepSeek-V4.1 fork and [Q2_K GGUF](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF), and DeepSeek's open weights.
