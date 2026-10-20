@@ -30,6 +30,7 @@ export const Backend = {
   Ollama: "ollama",
   Vllm: "vllm",
   VllmOmni: "vllm-omni",
+  VllmExl3: "vllm-exl3",
   Sglang: "sglang",
   Llamacpp: "llamacpp",
   StableDiffusionCpp: "stablediffusioncpp",

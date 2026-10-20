@@ -10,9 +10,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// Inference backend. The serialized form is the `backend` wire string.
 ///
 /// The native variants carry no data and serialize to their fixed wire strings
-/// (`ollama`, `vllm`, `vllm-omni`, `sglang`, `llamacpp`). Any other wire string
-/// deserializes to [`Backend::Custom`] carrying the slug verbatim, so a
-/// `WorkloadResponse` naming a custom (SDK-published) backend never fails to
+/// (`ollama`, `vllm`, `vllm-omni`, `vllm-exl3`, `sglang`, `llamacpp`). Any other
+/// wire string deserializes to [`Backend::Custom`] carrying the slug verbatim, so
+/// a `WorkloadResponse` naming a custom (SDK-published) backend never fails to
 /// parse. `Custom` re-serializes to that same slug.
 ///
 /// Carrying a `String` means `Backend` is **not** `Copy`; clone it where a value
@@ -22,6 +22,9 @@ pub enum Backend {
     Ollama,
     Vllm,
     VllmOmni,
+    /// vLLM with ExLlamaV3 (EXL3 quantized weights) and host-memory MoE expert
+    /// offload. `text2text` only; the config holds only the `vllm serve` command.
+    VllmExl3,
     Sglang,
     /// llama.cpp: prebuilt `llama-server` (GGUF, OpenAI-compatible). The worker
     /// resolves the install path per node hardware (ROCm/Metal tarball, or apt
@@ -46,6 +49,7 @@ impl Backend {
             Backend::Ollama => Cow::Borrowed("ollama"),
             Backend::Vllm => Cow::Borrowed("vllm"),
             Backend::VllmOmni => Cow::Borrowed("vllm-omni"),
+            Backend::VllmExl3 => Cow::Borrowed("vllm-exl3"),
             Backend::Sglang => Cow::Borrowed("sglang"),
             Backend::Llamacpp => Cow::Borrowed("llamacpp"),
             Backend::StableDiffusionCpp => Cow::Borrowed("stablediffusioncpp"),
@@ -61,6 +65,7 @@ impl Backend {
             "ollama" => Some(Backend::Ollama),
             "vllm" => Some(Backend::Vllm),
             "vllm-omni" => Some(Backend::VllmOmni),
+            "vllm-exl3" => Some(Backend::VllmExl3),
             "sglang" => Some(Backend::Sglang),
             "llamacpp" => Some(Backend::Llamacpp),
             "stablediffusioncpp" => Some(Backend::StableDiffusionCpp),
@@ -193,6 +198,7 @@ mod tests {
             Backend::Ollama,
             Backend::Vllm,
             Backend::VllmOmni,
+            Backend::VllmExl3,
             Backend::Sglang,
             Backend::Llamacpp,
             Backend::StableDiffusionCpp,
@@ -204,6 +210,7 @@ mod tests {
             Backend::from_str_opt("stablediffusioncpp"),
             Some(Backend::StableDiffusionCpp)
         );
+        assert_eq!(Backend::from_str_opt("vllm-exl3"), Some(Backend::VllmExl3));
         assert_eq!(Backend::from_str_opt("nope"), None);
     }
 
@@ -216,6 +223,8 @@ mod tests {
     fn backend_serializes_as_kebab_wire_string() {
         let json = serde_json::to_string(&Backend::VllmOmni).expect("serialize");
         assert_eq!(json, "\"vllm-omni\"");
+        let json = serde_json::to_string(&Backend::VllmExl3).expect("serialize");
+        assert_eq!(json, "\"vllm-exl3\"");
     }
 
     #[test]
@@ -224,6 +233,7 @@ mod tests {
             (Backend::Ollama, "\"ollama\""),
             (Backend::Vllm, "\"vllm\""),
             (Backend::VllmOmni, "\"vllm-omni\""),
+            (Backend::VllmExl3, "\"vllm-exl3\""),
             (Backend::Sglang, "\"sglang\""),
             (Backend::Llamacpp, "\"llamacpp\""),
             (Backend::StableDiffusionCpp, "\"stablediffusioncpp\""),
@@ -254,6 +264,7 @@ mod tests {
         );
         // Native strings still map to native variants, never to Custom.
         assert_eq!(Backend::from_wire("vllm"), Backend::Vllm);
+        assert_eq!(Backend::from_wire("vllm-exl3"), Backend::VllmExl3);
     }
 
     #[test]

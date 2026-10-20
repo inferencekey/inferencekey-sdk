@@ -113,8 +113,10 @@ pub struct FieldDiff {
 }
 
 /// Backend-specific `config`. For vllm / vllm-omni this is `{ command,
-/// vllm_version? }`; absent for backends that take no launch command. Returns
-/// `None` when the spec declares nothing to put in `config`.
+/// vllm_version? }`. For vllm-exl3 the platform accepts only the command, so a
+/// spec that leaves `vllm_version` unset builds exactly `{ command }`. Absent
+/// for backends that take no launch command. Returns `None` when the spec
+/// declares nothing to put in `config`.
 pub fn build_config(spec: &WorkloadSpec) -> Option<Value> {
     let command = spec.command.as_ref()?;
     let mut map = serde_json::Map::new();
@@ -410,6 +412,27 @@ mod tests {
             };
             assert_eq!(build_config(&spec), expected);
         }
+    }
+
+    #[test]
+    fn vllm_exl3_spec_builds_command_only_config() {
+        // The platform rejects any vllm-exl3 config key other than `command`, so
+        // an unset vllm_version must not leave a `vllm_version` key behind.
+        let command = "vllm serve diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000";
+        let spec = WorkloadSpec {
+            backend: Backend::VllmExl3,
+            model: "diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000".to_string(),
+            command: Some(command.to_string()),
+            vllm_version: None,
+            task_type: Some(TaskType::Text2Text),
+            ..base_spec()
+        };
+        assert_eq!(build_config(&spec), Some(json!({ "command": command })));
+        let value = serde_json::to_value(to_create_request(&spec)).expect("serialize");
+        let obj = value.as_object().expect("object");
+        assert_eq!(obj.get("backend"), Some(&json!("vllm-exl3")));
+        assert_eq!(obj.get("task_type"), Some(&json!("text2text")));
+        assert_eq!(obj.get("config"), Some(&json!({ "command": command })));
     }
 
     #[test]

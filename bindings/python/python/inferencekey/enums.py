@@ -16,6 +16,7 @@ class Backend(_Str):
     OLLAMA = "ollama"
     VLLM = "vllm"
     VLLM_OMNI = "vllm-omni"
+    VLLM_EXL3 = "vllm-exl3"
     SGLANG = "sglang"
     LLAMACPP = "llamacpp"
     STABLE_DIFFUSION_CPP = "stablediffusioncpp"
