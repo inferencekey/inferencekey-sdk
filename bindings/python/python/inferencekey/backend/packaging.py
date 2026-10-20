@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..errors import PackagingError
-from .base import TASK_TYPES
+from .base import API_OPENAI_CHAT, APIS, TASK_TYPES
 
 __all__ = [
     "BackendPackage",
@@ -143,6 +143,7 @@ def package_backend(
     requires_python: Optional[str] = None,
     description: Optional[str] = None,
     cpu_only: bool = False,
+    api: Optional[str] = None,
 ) -> BackendPackage:
     """Bundle a custom backend into ``<out_dir>/<name>-<version>.tar.gz``.
 
@@ -169,6 +170,9 @@ def package_backend(
         raise PackagingError(f"src does not exist: {src!r}")
 
     _parse_entrypoint(entrypoint)
+
+    if api is not None and api not in APIS:
+        raise PackagingError(f"unknown api {api!r}; expected one of {APIS}")
 
     if task_type is not None and task_type not in TASK_TYPES:
         raise PackagingError(
@@ -200,6 +204,10 @@ def package_backend(
     # to before (the worker defaults the field to false).
     if cpu_only:
         manifest["cpu_only"] = True
+    # Same for api: only an OpenAI-chat backend carries it, and the worker
+    # defaults a missing field to the /process protocol.
+    if api == API_OPENAI_CHAT:
+        manifest["api"] = API_OPENAI_CHAT
     if description is not None:
         manifest["description"] = description
 

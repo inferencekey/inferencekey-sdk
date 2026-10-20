@@ -167,6 +167,7 @@ def test_manifest_reads_declared_class_attributes() -> None:
         "task_type": "embedding",
         "requirements": "requirements.txt",
         "requires_python": ">=3.9,<3.12",
+        "api": "process",
     }
     assert m.task_type in TASK_TYPES
 

@@ -263,6 +263,7 @@ def test_meta_returns_declared_metadata() -> None:
             "task_type": "classification",
             "requirements": "requirements.txt",
             "requires_python": ">=3.9,<3.12",
+            "api": "process",
         }
     finally:
         httpd.shutdown()
@@ -281,6 +282,7 @@ def test_meta_falls_back_to_class_name_without_metadata() -> None:
             "task_type": "",
             "requirements": "",
             "requires_python": "",
+            "api": "process",
         }
     finally:
         httpd.shutdown()

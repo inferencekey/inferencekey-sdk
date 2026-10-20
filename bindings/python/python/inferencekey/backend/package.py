@@ -76,6 +76,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional human-readable description.",
     )
+    parser.add_argument(
+        "--api",
+        default=None,
+        choices=["process", "openai-chat"],
+        help="Protocol the worker uses: 'process' (default) or 'openai-chat' "
+        "for a backend that implements chat() (OpenAI /v1/chat/completions, "
+        "streaming and tool calls).",
+    )
     return parser
 
 
@@ -94,6 +102,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             requires_python=args.requires_python,
             out_dir=args.out_dir,
             description=args.description,
+            api=args.api,
         )
     except PackagingError as exc:
         print(f"packaging failed: {exc}", file=sys.stderr, flush=True)
