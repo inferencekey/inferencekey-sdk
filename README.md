@@ -197,6 +197,7 @@ a `WorkloadSpec` has no `provider` and no `min_vram_gb`.
 | `OLLAMA` / `Ollama` | `ollama` | Quick local-style serving and broad GGUF coverage. Simplest to stand up. |
 | `VLLM` / `Vllm` | `vllm` | High-throughput production text generation. You control the launch command. |
 | `VLLM_OMNI` / `VllmOmni` | `vllm-omni` | vLLM for multimodal / omni models. Same command-driven config. |
+| `VLLM_EXL3` / `VllmExl3` | `vllm-exl3` | vLLM + ExLlamaV3 (EXL3 quantized weights) with host-memory MoE expert offload, for DeepSeek-V4.1-Flash on 2x RTX PRO 6000. `text2text` only; the config is only the `vllm serve` command. |
 | `SGLANG` / `Sglang` | `sglang` | Structured / programmatic generation on the SGLang runtime. |
 | `LLAMACPP` / `Llamacpp` | `llamacpp` | Prebuilt `llama-server` for **GGUF** models. Strong on AMD/ROCm and Apple Silicon. |
 

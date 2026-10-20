@@ -1,0 +1,6 @@
+# local, unpublished build: see README, `maturin develop` from ../../bindings/python
+# inferencekey>=0.1.0   # uncomment once published to PyPI
+
+# The chat goes through the gateway's OpenAI-compatible endpoint with the
+# official OpenAI client.
+openai>=1.0
