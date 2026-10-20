@@ -20,6 +20,11 @@ VRAM stay pinned in host RAM and are read in place over PCIe).
   `INFERENCEKEY_SDK_TOKEN`, `INFERENCEKEY_API_KEY`, `INFERENCEKEY_PROJECT`,
   and the **private-worker** id `IK_WORKER_ID` (the worker's UUID: Manager UI ->
   Workers -> copy the id).
+- The SDK token (`INFERENCEKEY_SDK_TOKEN`) needs the scopes **`workload:read`**
+  and **`workload:write`**: `ensure()` lists the project's workloads and
+  `wait_until_ready()` reads the readiness events. The token wizard in the
+  Manager does not tick `workload:read` by default, so tick it when you mint the
+  token.
 - Python >= 3.9.
 - A **registered NVIDIA worker** with:
   - **GPUs:** 2x RTX PRO 6000 96 GB (Blackwell, compute capability 12.0,
@@ -46,8 +51,8 @@ machines:
 | Load to ready | 4.5 to 18 min, depending on the machine |
 
 That adds up to about 12 min on the fastest measured machine and well over half
-an hour on a slow one, so `main.py` waits up
-to **3600 s** by default. Override it with `IK_READY_TIMEOUT` (seconds).
+an hour on a slow one, so `main.py` waits up to **3600 s** by default. Override
+it with `IK_READY_TIMEOUT` (seconds).
 
 ## Run
 ```bash
@@ -78,9 +83,9 @@ delete the workload later.
   `worker_id`, `fixed` policy (one pinned worker = one replica). The spec sets no
   `execution_policy_config`: the platform stores no replica count for a fixed
   policy, so passing one would make every `ensure()` re-PATCH the workload. The
-  command is the one the Manager UI prefills; the worker adds the recipe defaults and pins the stack, so there
-  is no `vllm_version` (this backend's config holds only the command).
-  Idempotent by `slug`.
+  command is the one the Manager UI prefills; the worker adds the recipe
+  defaults and pins the stack, so there is no `vllm_version` (this backend's
+  config holds only the command). Idempotent by `slug`.
 - **wait_until_ready()**: blocks through the cold start above, up to
   `IK_READY_TIMEOUT` seconds (3600 by default).
 - **call**: one chat completion with the official `openai` client against
@@ -89,6 +94,12 @@ delete the workload later.
   workload's model name) and refuses any other name; the `--served-model-name`
   is only seen on the pod. The script prints the answer.
 - **delete()**: tears the workload down on exit, unless `IK_KEEP_ALIVE=1`.
+
+## Using the same workload from the panel and from code
+If you also create the workload in the Manager panel, give it the slug
+`deepseek-v41-flash` (or change `SLUG` in `main.py` to the panel's slug), so
+`ensure()` adopts it instead of creating a second one. `ensure()` then aligns
+the fields that drifted from the spec (for example the name) with a PATCH.
 
 ## Cost & cleanup
 This is a **private worker with a `fixed` policy**: one replica stays **always on
@@ -102,6 +113,11 @@ it yourself: re-run the example without `IK_KEEP_ALIVE`, or call
 use it.
 
 ## Troubleshooting
+- **`PermissionDenied: permission denied [forbidden]: scope_insufficient: this
+  ik_sdk_ token is missing the 'workload:read' scope`**: the SDK token was
+  minted with the wizard defaults, which leave out `workload:read`. Mint a new
+  SDK token with `workload:read` and `workload:write` and put it in
+  `INFERENCEKEY_SDK_TOKEN`.
 - **`KeyError: 'IK_WORKER_ID'`**: you didn't set the worker id. Copy
   `.env.example` to `.env` and fill it from Manager UI -> Workers (copy the id).
 - **`worker_id must belong to the same project`**: the worker isn't assigned to
@@ -113,6 +129,10 @@ use it.
 - **Readiness times out**: the install, the 309 GiB download and the load are
   slow on some machines (narrow network, GPUs on two sockets). Raise
   `IK_READY_TIMEOUT`.
+- **`failed to become ready: bootstrap step failed`**: the reason is in the
+  worker drawer and the worker log in the Manager UI. The usual causes are the
+  worker refusing the node (not two GPUs of compute capability 12.x with 90 GiB
+  each) or a failed install.
 - **`model_not_available`**: send `model="default"` (or the workload's model
   name), not the `--served-model-name`.
 

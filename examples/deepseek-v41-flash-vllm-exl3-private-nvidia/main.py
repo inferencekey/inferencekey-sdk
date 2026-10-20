@@ -130,6 +130,13 @@ def main() -> int:
     except openai.APIError as e:
         print(f"chat request failed: {e.message}", file=sys.stderr)
         return 1
+    except TimeoutError as e:
+        # wait_until_ready() gave up before the worker reported ready.
+        print(
+            f"error: {e}; raise IK_READY_TIMEOUT or check the worker in the Manager UI",
+            file=sys.stderr,
+        )
+        return 1
     finally:
         # 4) Tear down so the reserved GPUs stop billing, unless asked to keep
         #    the endpoint alive. Idempotent and safe: runs on success, error,
