@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 
 class InvalidInput(ValueError):
@@ -70,6 +70,15 @@ TASK_TYPES = (
     "forecast",
 )
 
+#: The backend speaks the SDK's own ``/process`` schema (the default).
+API_PROCESS = "process"
+#: The backend implements :meth:`CustomBackend.chat`: the runtime serves an
+#: OpenAI-compatible ``/v1/chat/completions`` (with SSE streaming and tool
+#: calls) and the worker routes chat jobs there instead of ``/process``.
+API_OPENAI_CHAT = "openai-chat"
+#: Every value :attr:`CustomBackend.api` and the packaging ``api`` accept.
+APIS = (API_PROCESS, API_OPENAI_CHAT)
+
 #: Default quantile levels a forecast reports when the request omits them: a
 #: symmetric 80% interval around the median.
 DEFAULT_QUANTILE_LEVELS = (0.1, 0.5, 0.9)
@@ -93,6 +102,11 @@ class BackendManifest:
     #: or an exact ``"3.11"``). Empty means no constraint. The worker feeds this
     #: to ``uv`` so the venv gets the pinned Python regardless of the node's.
     requires_python: str = ""
+    #: Which protocol the platform uses to talk to the backend: ``"process"``
+    #: (the SDK's own ``/process`` schema) or ``"openai-chat"`` (the backend
+    #: implements :meth:`CustomBackend.chat` and the runtime serves an
+    #: OpenAI-compatible ``/v1/chat/completions``, streaming included).
+    api: str = API_PROCESS
 
     def to_wire(self) -> Dict[str, Any]:
         """Render to the JSON-serializable dict returned by ``GET /meta``."""
@@ -102,6 +116,7 @@ class BackendManifest:
             "task_type": self.task_type,
             "requirements": self.requirements,
             "requires_python": self.requires_python,
+            "api": self.api,
         }
 
 
@@ -583,6 +598,17 @@ class CustomBackend(ABC):
     #: sane default Python. Declare this when a pinned dep only ships wheels for
     #: certain Python versions so the worker provisions the right interpreter.
     requires_python: str = ""
+    #: One of :data:`APIS`. Empty means "infer it": ``"openai-chat"`` when the
+    #: subclass overrides :meth:`chat`, ``"process"`` otherwise.
+    api: str = ""
+
+    def resolved_api(self) -> str:
+        """The protocol this backend speaks (see :attr:`api`)."""
+        if self.api:
+            return self.api
+        if type(self).chat is not CustomBackend.chat:
+            return API_OPENAI_CHAT
+        return API_PROCESS
 
     def manifest(self) -> BackendManifest:
         """Return this backend's declarative metadata for ``GET /meta``.
@@ -597,6 +623,7 @@ class CustomBackend(ABC):
             task_type=self.task_type,
             requirements=self.requirements,
             requires_python=self.requires_python,
+            api=self.resolved_api(),
         )
 
     @abstractmethod
@@ -641,3 +668,116 @@ class CustomBackend(ABC):
                 return ForecastResult(median=[last] * request.horizon)
         """
         raise NotImplementedError("backend does not support forecast")
+
+    def chat(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Answer one OpenAI chat completion request (optional capability).
+
+        Opt-in, like :meth:`forecast`. A backend that overrides it declares
+        ``api = "openai-chat"`` (inferred automatically) and the runtime serves
+        ``POST /v1/chat/completions``. ``request`` is the OpenAI request body as
+        sent by the platform: ``messages``, and when the caller sent them
+        ``tools``, ``tool_choice``, ``max_tokens``, ``temperature``, ``stream``
+        and the other sampling fields. Return an OpenAI ``chat.completion``
+        object; :func:`chat_completion` builds one, tool calls and usage
+        included.
+
+        Raise :class:`InvalidInput` for a malformed request (400). Any other
+        exception is a 500 for this request while the server stays alive.
+        """
+        raise NotImplementedError("backend does not support chat")
+
+    def chat_stream(self, request: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+        """Stream one chat completion as OpenAI ``chat.completion.chunk`` dicts.
+
+        Called instead of :meth:`chat` when the request has ``"stream": true``.
+        The default runs :meth:`chat` and replays its result as chunks with
+        :func:`completion_to_chunks`, so a backend that cannot stream token by
+        token still works with streaming clients such as Claude Code. Override
+        it to yield chunks as the model produces them.
+        """
+        yield from completion_to_chunks(self.chat(request))
+
+
+def chat_completion(
+    content: Optional[str] = None,
+    *,
+    model: str = "",
+    tool_calls: Optional[List[Dict[str, Any]]] = None,
+    finish_reason: Optional[str] = None,
+    prompt_tokens: Optional[int] = None,
+    completion_tokens: Optional[int] = None,
+    reasoning_content: Optional[str] = None,
+    completion_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build an OpenAI ``chat.completion`` object for :meth:`CustomBackend.chat`.
+
+    ``tool_calls`` uses the OpenAI shape
+    ``[{"id", "type": "function", "function": {"name", "arguments"}}]``
+    (``arguments`` is a JSON string). ``finish_reason`` defaults to
+    ``"tool_calls"`` when there are tool calls and ``"stop"`` otherwise. Usage is
+    included when both token counts are given.
+    """
+    import time
+    import uuid
+
+    message: Dict[str, Any] = {"role": "assistant", "content": content}
+    if reasoning_content:
+        message["reasoning_content"] = reasoning_content
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    completion: Dict[str, Any] = {
+        "id": completion_id or f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason
+                or ("tool_calls" if tool_calls else "stop"),
+            }
+        ],
+    }
+    if prompt_tokens is not None and completion_tokens is not None:
+        completion["usage"] = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+    return completion
+
+
+def completion_to_chunks(completion: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+    """Replay a ``chat.completion`` object as ``chat.completion.chunk`` dicts.
+
+    Yields a role chunk, one content chunk (if any), one chunk per tool call
+    (if any), a chunk carrying ``finish_reason`` and, when the completion has
+    usage, a last chunk with empty ``choices`` and the ``usage`` block: the
+    sequence an OpenAI-compatible server streams for the same answer.
+    """
+    base = {
+        "id": completion.get("id", ""),
+        "object": "chat.completion.chunk",
+        "created": completion.get("created", 0),
+        "model": completion.get("model", ""),
+    }
+    choices = completion.get("choices") or [{}]
+    choice = choices[0] or {}
+    message = choice.get("message") or {}
+
+    def chunk(delta: Dict[str, Any], finish: Optional[str] = None) -> Dict[str, Any]:
+        return {**base, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+
+    yield chunk({"role": "assistant", "content": ""})
+    if message.get("reasoning_content"):
+        yield chunk({"reasoning_content": message["reasoning_content"]})
+    if message.get("content"):
+        yield chunk({"content": message["content"]})
+    for index, call in enumerate(message.get("tool_calls") or []):
+        yield chunk({"tool_calls": [{"index": index, **call}]})
+    yield chunk({}, choice.get("finish_reason") or "stop")
+    if completion.get("usage"):
+        # Like OpenAI with stream_options.include_usage: usage travels in a
+        # last chunk of its own, with empty choices.
+        yield {**base, "choices": [], "usage": completion["usage"]}

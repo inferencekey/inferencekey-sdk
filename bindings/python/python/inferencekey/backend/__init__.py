@@ -21,6 +21,9 @@ For a quick start from code (a script or REPL) instead of the CLI, use
 from __future__ import annotations
 
 from .base import (
+    API_OPENAI_CHAT,
+    API_PROCESS,
+    APIS,
     TASK_TYPES,
     BackendContext,
     BackendManifest,
@@ -30,6 +33,8 @@ from .base import (
     InvalidInput,
     Job,
     Result,
+    chat_completion,
+    completion_to_chunks,
 )
 from .device import pick_device
 from .packaging import (
@@ -49,6 +54,11 @@ __all__ = [
     "BackendContext",
     "BackendManifest",
     "TASK_TYPES",
+    "APIS",
+    "API_PROCESS",
+    "API_OPENAI_CHAT",
+    "chat_completion",
+    "completion_to_chunks",
     "pick_device",
     "serve_backend",
     "package_backend",

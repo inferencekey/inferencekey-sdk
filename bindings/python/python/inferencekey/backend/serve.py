@@ -29,6 +29,13 @@ Endpoints (a minimal, SDK-owned schema — **not** OpenAI-compatible):
   alive. If the backend does not implement ``forecast()`` it answers ``501``
   ``{"error": "backend does not support forecast"}`` — the capability is
   optional, so ``process``-only backends keep working unchanged.
+* ``POST /v1/chat/completions``: an OpenAI chat completion request, served by
+  :meth:`~inferencekey.backend.CustomBackend.chat` (or ``chat_stream`` when the
+  body has ``"stream": true``, answered as server-sent events ending in
+  ``data: [DONE]``). Only for backends that implement ``chat()`` (``api`` is
+  ``"openai-chat"`` in ``/meta``); the others answer ``501``. Errors use the
+  OpenAI shape ``{"error": {"message", "type"}}``.
+* ``GET /v1/models``: the one model this backend serves, OpenAI-shaped.
 
 To start a backend from code instead of the CLI, use :func:`serve_backend`.
 
@@ -49,7 +56,7 @@ import sys
 import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, Optional, Tuple, Union
 
 from ..errors import BackendEntrypointError, BackendSetupError
 from .base import (
@@ -134,6 +141,12 @@ class _BackendState:
     def forecast(self, request: ForecastRequest) -> ForecastResult:
         return self._backend.forecast(request)
 
+    def chat(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        return self._backend.chat(request)
+
+    def chat_stream(self, request: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+        return self._backend.chat_stream(request)
+
     def manifest(self) -> Dict[str, Any]:
         """The backend's declarative metadata, as a JSON-serializable dict."""
         return self._backend.manifest().to_wire()
@@ -168,6 +181,16 @@ def _make_handler(state: _BackendState) -> type:
                 # operator can introspect the backend while the model loads.
                 self._send_json(200, state.manifest())
                 return
+            if path == "/v1/models":
+                model_id = state.manifest().get("name", "")
+                self._send_json(
+                    200,
+                    {
+                        "object": "list",
+                        "data": [{"id": model_id, "object": "model", "owned_by": "custom"}],
+                    },
+                )
+                return
             self._send_json(404, {"error": "not found"})
 
         def _read_json_body(self) -> "Optional[Dict[str, Any]]":
@@ -200,6 +223,8 @@ def _make_handler(state: _BackendState) -> type:
                 self._handle_process()
             elif path == "/forecast":
                 self._handle_forecast()
+            elif path == "/v1/chat/completions":
+                self._handle_chat()
             else:
                 self._send_json(404, {"error": "not found"})
 
@@ -294,6 +319,110 @@ def _make_handler(state: _BackendState) -> type:
                 )
                 return
             self._send_json(200, result.to_wire())
+
+        def _send_openai_error(self, status: int, message: str, kind: str) -> None:
+            self._send_json(status, {"error": {"message": message, "type": kind}})
+
+        def _handle_chat(self) -> None:
+            if not state.ready:
+                self._send_openai_error(503, "backend not ready", "server_error")
+                return
+
+            data = self._read_json_body()
+            if data is None:
+                return
+            if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
+                self._send_openai_error(
+                    400, "request must be a JSON object with a 'messages' list",
+                    "invalid_request_error",
+                )
+                return
+
+            if data.get("stream"):
+                self._stream_chat(data)
+                return
+
+            try:
+                completion = state.chat(data)
+            except NotImplementedError:
+                self._send_openai_error(
+                    501, "backend does not support chat", "invalid_request_error"
+                )
+                return
+            except InvalidInput as exc:
+                self._send_openai_error(400, str(exc), "invalid_request_error")
+                return
+            except Exception as exc:  # noqa: BLE001 (keep the server alive)
+                _log_err("chat failed:")
+                traceback.print_exc(file=sys.stderr)
+                self._send_openai_error(500, str(exc), "server_error")
+                return
+            if not isinstance(completion, dict):
+                self._send_openai_error(
+                    500,
+                    "chat() must return a chat.completion dict; build it with "
+                    "inferencekey.backend.chat_completion(...)",
+                    "server_error",
+                )
+                return
+            self._send_json(200, completion)
+
+        def _stream_chat(self, data: Dict[str, Any]) -> None:
+            """Answer a streaming chat request as server-sent events.
+
+            The first chunk is pulled before the headers go out, so a backend
+            that refuses the request (not implemented, invalid input) still gets
+            a proper status code instead of a 200 stream carrying an error.
+            """
+            try:
+                chunks = iter(state.chat_stream(data))
+                first = next(chunks, None)
+            except NotImplementedError:
+                self._send_openai_error(
+                    501, "backend does not support chat", "invalid_request_error"
+                )
+                return
+            except InvalidInput as exc:
+                self._send_openai_error(400, str(exc), "invalid_request_error")
+                return
+            except Exception as exc:  # noqa: BLE001 (keep the server alive)
+                _log_err("chat stream failed before the first chunk:")
+                traceback.print_exc(file=sys.stderr)
+                self._send_openai_error(500, str(exc), "server_error")
+                return
+
+            # No Content-Length: the response ends when the connection closes
+            # (HTTP/1.0 semantics of BaseHTTPRequestHandler).
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+
+            def emit(payload: Any) -> None:
+                self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                self.wfile.flush()
+
+            try:
+                if first is not None:
+                    emit(json.dumps(first))
+                for chunk in chunks:
+                    emit(json.dumps(chunk))
+            except (BrokenPipeError, ConnectionResetError):
+                # The client went away; nothing left to tell it.
+                return
+            except Exception as exc:  # noqa: BLE001 (keep the server alive)
+                _log_err("chat stream failed mid-way:")
+                traceback.print_exc(file=sys.stderr)
+                try:
+                    emit(json.dumps({"error": {"message": str(exc), "type": "server_error"}}))
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+            try:
+                emit("[DONE]")
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
     return _Handler
 
