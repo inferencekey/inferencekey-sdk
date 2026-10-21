@@ -213,8 +213,59 @@ ref = mgmt.ensure(WorkloadSpec(
 
 From the dashboard you get the same outcome: on the **New workload** form, the backend selector lists your tenant's custom backends alongside the built-ins; pick one and create the workload.
 
+## 6. Serve an LLM: OpenAI chat, streaming and tool calls
+
+For a language model, implement `chat()` as well. The runtime then serves an OpenAI-compatible `POST /v1/chat/completions`, and the platform routes chat to it exactly like it routes chat to vLLM: streaming, tool calls, finish reason and token usage reach the caller, and the workload's Anthropic `/v1/messages` endpoint works for Claude Code.
+
+```python title="chat_backend.py"
+from inferencekey.backend import BackendContext, CustomBackend, Job, Result, chat_completion
+
+
+class MyLLMBackend(CustomBackend):
+    name = "my-llm"
+    version = "0.1.0"
+    task_type = "text2text"
+
+    def setup(self, ctx: BackendContext) -> None:
+        self.engine = load_my_engine(ctx.config)          # your engine, loaded once
+
+    def process(self, job: Job) -> Result:                # still required
+        return Result(output={"text": self.engine.generate(job.messages())})
+
+    def chat(self, request: dict) -> dict:
+        # `request` is the OpenAI body: messages, tools, tool_choice, max_tokens...
+        out = self.engine.chat(request["messages"], tools=request.get("tools"))
+        return chat_completion(
+            out.text,
+            model=self.name,
+            tool_calls=out.tool_calls,                    # OpenAI shape, or None
+            prompt_tokens=out.prompt_tokens,
+            completion_tokens=out.completion_tokens,
+        )
+```
+
+- **`chat()`** returns an OpenAI `chat.completion` dict; `chat_completion(...)` builds one, with `tool_calls` (`[{"id", "type": "function", "function": {"name", "arguments"}}]`) and usage.
+- **Streaming.** A request with `"stream": true` calls `chat_stream()`. The default replays `chat()` as `chat.completion.chunk` events, so streaming clients work from day one. Override `chat_stream()` and yield chunks as your engine produces tokens.
+- **Package it with `api="openai-chat"`** (`--api openai-chat` in the CLI). It is inferred from `chat()` for `GET /meta`, and the manifest field lets the worker know before the first request.
+- Raise `InvalidInput` for a bad request (400). Any other exception is a 500 for that request; the server stays alive.
+
+A complete, dependency-free example is in [`examples/custom-backend-openai-chat`](https://github.com/inferencekey/inferencekey-sdk/tree/main/examples/custom-backend-openai-chat): it either forwards to an upstream OpenAI-compatible server, the place to plug your engine, or runs a scripted mode that lets Claude Code read and edit a file through the whole chain without a model.
+
+### Workload config your backend receives
+
+The workload's `config` reaches your process:
+
+| Key | Effect |
+| --- | --- |
+| *(the whole config)* | Passed to `setup()` as `ctx.config` (environment variable `IK_BACKEND_CONFIG`). |
+| `env` | String values become environment variables of the backend process, for example `{"CUDA_VISIBLE_DEVICES": "0,1,2,3"}` or the path to your weights. `PYTHONPATH` is reserved. |
+| `ready_timeout_secs` | How long the worker waits for `setup()` to finish (default 300 s, or the worker's `INFERENCEKEY_CUSTOM_BACKEND_READY_TIMEOUT_SECS`). Raise it for models that take minutes to load. |
+| `request_timeout_secs` | Longest time one request may take, a whole streamed answer included (default 300 s for `/process` and streaming). Raise it for long agent turns. |
+
+Two workloads of the same custom backend share one process only when their configs are equal.
+
 ## What happens after that
 
-You declared the workload; the platform reconciles it. When a worker is assigned, it pulls your published package, verifies it, installs your `requirements.txt` in an isolated environment, starts your backend **once** (your `setup()` runs, the model loads), and then forwards each incoming job to `process()`. You never manage the process, the download, or the placement.
+You declared the workload; the platform reconciles it. When a worker is assigned, it pulls your published package, verifies it, installs your `requirements.txt` in an isolated environment, starts your backend **once** (your `setup()` runs, the model loads), and then forwards each incoming job to `process()`, or chat to `chat()` when your backend implements it. You never manage the process, the download, or the placement.
 
 <LinkCard title="Backends & policies" href="/en/reference/backends-and-policies/" description="The built-in backends, the task-type modalities, and execution policies." />
