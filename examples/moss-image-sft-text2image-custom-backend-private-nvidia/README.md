@@ -24,8 +24,10 @@ model answers two kinds of request:
 - SDK: local build in this repo (see [CONTRIBUTING](../CONTRIBUTING.md#4-depending-on-the-sdk))
 - Language: Python >= 3.9 for the client scripts; the backend runs on Python
   >= 3.10 (the worker provisions it with `uv`)
-- Placement: private (NVIDIA, CUDA 13 driver, about 30 GB of VRAM: a 40 GB or
-  48 GB card)
+- Placement: private (NVIDIA, CUDA 13 driver). With everything on the GPU it
+  takes about 30 GB of VRAM (a 40 or 48 GB card); the backend switches to an
+  offloaded mode on smaller cards and stayed under 12 GB in our test, see
+  [Smaller GPUs](#smaller-gpus-measured)
 - Backend: custom (`moss-image-text2image`)   Policy: `fixed`
 
 ## Prerequisites
@@ -97,6 +99,46 @@ right on the menu, the Chinese note and the layouts, but wrote "OPEN WEIGHT /
 WEIGHTS DAY" for "OPEN WEIGHTS DAY" and "PNG bock" for "PNG back"; at 4 steps
 the text fell apart.
 
+## Smaller GPUs (measured)
+
+`setup()` reads how much VRAM is free and picks a memory mode (log line
+`memory mode ...`):
+
+| Free VRAM | Mode | What stays on the GPU |
+| --- | --- | --- |
+| 33 GiB or more | `gpu` | everything |
+| 14.5 to 33 GiB | `lowvram` | transformer and VAE; the 16.8 GB text encoder stays in CPU RAM and streams to the GPU layer by layer for each prompt |
+| less | `minimal` | as `lowvram`, but only the transformer blocks that fit stay resident (the rest stream at every step) and the VAE decodes in tiles |
+
+We measured the modes on one A40 48 GB, capping the process with
+`torch.cuda.set_per_process_memory_fraction` (`MOSS_VRAM_LIMIT_GIB`) to
+behave like a smaller card. Poster prompt, seed 42, 1024x1024
+(2026-10-21):
+
+| Card it emulates | Mode | Peak VRAM (`nvidia-smi`) | SFT, 50 steps | Turbo, 8 steps | Host RAM (max RSS) |
+| --- | --- | --- | --- | --- | --- |
+| none (48 GB) | `gpu` | 30,359 MiB | 79.6 s | 8.8 s | 7.3 GB |
+| 24 GB, cap 23 GiB | `component` (diffusers model CPU offload) | 16,403 MiB | 104.5 s | 41.2 s | 31.5 GB |
+| 16 GB, cap 15 GiB | `lowvram` | 14,433 MiB | 86.2 s | 13.2 s | 16.8 GB |
+| 12 GB, cap 11 GiB | `minimal` (31 of 42 blocks resident) | 11,427 MiB | 160.4 s | 17.8 s | 21.6 GB |
+
+Every image in that table is pixel for pixel the same as the one from the
+all-on-GPU run (the noise is drawn on the CPU from the seed and the offload
+does not change the math), so the text is as right as before. These are
+emulated caps, not real 24/16/12 GB cards: we tried to rent an RTX 5080,
+an RTX 4090 and an RTX 3080 Ti, and none of those pods exposed the direct SSH
+port the worker install needs. Not tried: below 11 GiB, sizes above 1 MP in
+the offloaded modes, quantized weights. `component` is listed for comparison
+(it is the authors' "Component" mode); `auto` never picks it, `lowvram` is
+faster and smaller.
+
+The offloaded modes keep the text encoder (and in `minimal` part of the
+transformer) in system RAM: plan for about 32 GB of RAM in the machine.
+`MOSS_MEMORY_MODE` (`auto`, `gpu`, `component`, `lowvram`, `minimal`),
+`MOSS_VRAM_LIMIT_GIB` and `MOSS_ACTIVATION_RESERVE_GIB` are environment
+variables of the backend process, for running it by hand; a workload on
+InferenceKey uses `auto`.
+
 ## Cost & cleanup
 `fixed` keeps one replica on your worker until you delete the workload. The
 script deletes it on exit (also on error and Ctrl-C). With `IK_KEEP_ALIVE=1` it
@@ -110,8 +152,13 @@ pod, also stop the pod: deleting the workload does not.
   took over the worker's 300 s custom backend timeout. Raise
   `INFERENCEKEY_CUSTOM_BACKEND_READY_TIMEOUT_SECS` on the worker; later starts
   reuse the Hugging Face cache.
-- **Out of memory on a 24 or 32 GB card**: the text encoder alone is 16.8 GB
-  in bf16. Use a 40 GB+ card.
+- **Out of memory on a small card**: something else holds VRAM (a desktop, a
+  second process) after `setup()` measured the free memory. Free the card, or
+  run the backend by hand with `MOSS_VRAM_LIMIT_GIB` set below what is really
+  free.
+- **The process is killed while loading in an offloaded mode**: system RAM,
+  not VRAM. The text encoder lives in RAM in those modes; give the machine
+  about 32 GB.
 - **"The fast path is not available" in the backend log**: the Qwen3.5 text
   encoder falls back to the PyTorch path without `flash-linear-attention`; it
   works, prompts are short, so we did not add it.

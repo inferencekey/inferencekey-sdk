@@ -38,6 +38,13 @@ Contract shape, accepts BOTH callers:
   ...}]}`` plus ``width``/``height``/``seed``/``steps``/``mode``/``seconds``
   (GPU time of the generation) and ``vram_peak_gib``.
 
+Memory: on a 40/48 GB card everything stays on the GPU (about 30 GB). On a
+smaller card ``setup()`` picks an offloaded mode by the free VRAM (see
+``_place``): the text encoder streams from CPU RAM, and below 14.5 GiB only
+part of the transformer stays resident. Measured under an emulated cap, the
+12 GB mode peaked at 11.4 GB and gave the same pixels, about 2x slower at
+50 steps.
+
 Nothing heavy ships in the package: ``setup()`` downloads the pinned model
 revision (about 27 GB: bf16 transformer 10.2 GB, Qwen3.5-9B text encoder
 16.8 GB, VAE 0.25 GB) and the 1.2 GB LoRA into the Hugging Face cache.
@@ -86,6 +93,10 @@ _DEFAULTS = {
 #: The user guide recommends 1 to 2 megapixels and allows 0.25 to 4.
 _MIN_SIDE, _MAX_SIDE, _MAX_PIXELS, _ALIGN = 256, 2048, 4 * 1024 * 1024, 16
 _MAX_N = 4
+#: Memory mode thresholds (GiB the process may use), see ``_place``.
+_GPU_MIN_GIB = 33.0
+_LOWVRAM_MIN_GIB = 14.5
+_ACTIVATION_RESERVE_GIB = 3.0
 _FORMATS = {"png": "PNG", "jpeg": "JPEG", "jpg": "JPEG", "webp": "WEBP"}
 
 
@@ -98,7 +109,7 @@ class MossImageText2ImageBackend(CustomBackend):
     """MOSS-Image-SFT text-to-image backend (prompt or JSON layout in, image out)."""
 
     name = "moss-image-text2image"
-    version = "0.2.0"
+    version = "0.3.1"
     task_type = "text2image"
     requirements = "requirements.txt"
     requires_python = ">=3.10"
@@ -116,6 +127,7 @@ class MossImageText2ImageBackend(CustomBackend):
         self.torch = torch
         self.lock = threading.Lock()
         self.device = torch.device(pick_device(str(ctx.config.get("device", "auto"))))
+        budget_gib = self._vram_budget_gib()
 
         local = snapshot_download(
             _MODEL_REPO,
@@ -196,7 +208,8 @@ class MossImageText2ImageBackend(CustomBackend):
             self.LoRALinear = LoRALinear
             self.lora_layers = len(names)
 
-        self.pipe = pipe.to(self.device)
+        self.memory_mode, detail = self._place(pipe, budget_gib)
+        self.pipe = pipe
         if self.device.type == "cuda":
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
@@ -207,9 +220,100 @@ class MossImageText2ImageBackend(CustomBackend):
         print(
             f"moss-image ready on {self.device}: download {t_download - t0:.1f}s, "
             f"load {t_ready - t_download:.1f}s, lora layers {self.lora_layers}, "
+            f"memory mode {self.memory_mode} ({detail}), "
             f"weights in VRAM {loaded_gib:.1f} GiB",
             file=sys.stderr,
             flush=True,
+        )
+
+    def _vram_budget_gib(self) -> float:
+        """GiB this process may use on the GPU (``MOSS_VRAM_LIMIT_GIB`` caps it)."""
+        torch = self.torch
+        if self.device.type != "cuda":
+            return 0.0
+        index = self.device.index if self.device.index is not None else torch.cuda.current_device()
+        free, total = torch.cuda.mem_get_info(index)
+        limit = float(os.environ.get("MOSS_VRAM_LIMIT_GIB") or 0)
+        if limit > 0:
+            # Behave like a smaller card: the allocator refuses to go past it.
+            torch.cuda.set_per_process_memory_fraction(min(1.0, limit * 2**30 / total), index)
+            return min(limit, free / 2**30)
+        # Leave some room for the CUDA libraries and anything else on the card.
+        return free / 2**30 - 0.5
+
+    def _place(self, pipe, budget_gib: float):
+        """Put the pipeline on the GPU in the mode that fits the card.
+
+        ``MOSS_MEMORY_MODE`` = ``auto`` (default), ``gpu``, ``component``,
+        ``lowvram`` or ``minimal``:
+
+        * ``gpu``: everything resident, about 29 GiB at 1 MP (40/48 GB cards).
+        * ``component``: diffusers model CPU offload, the authors' "Component"
+          mode; the 16.8 GB text encoder and the transformer take turns on the GPU.
+        * ``lowvram``: the text encoder stays in CPU RAM and streams to the GPU
+          layer by layer for each prompt; transformer and VAE stay resident.
+        * ``minimal``: as ``lowvram``, plus only as many transformer blocks as
+          fit stay resident (the rest stream from CPU RAM at every step) and the
+          VAE decodes in tiles.
+
+        The offloaded modes need about 30 GB of free system RAM.
+        """
+        torch = self.torch
+        mode = (os.environ.get("MOSS_MEMORY_MODE") or "auto").lower()
+        if self.device.type != "cuda":
+            return "cpu", "no GPU"
+        if mode == "auto":
+            if budget_gib >= _GPU_MIN_GIB:
+                mode = "gpu"
+            elif budget_gib >= _LOWVRAM_MIN_GIB:
+                mode = "lowvram"
+            else:
+                mode = "minimal"
+        if mode == "gpu":
+            pipe.to(self.device)
+            return mode, f"budget {budget_gib:.1f} GiB"
+        if mode == "component":
+            pipe.enable_model_cpu_offload(device=self.device)
+            return mode, f"budget {budget_gib:.1f} GiB"
+        if mode not in ("lowvram", "minimal"):
+            raise ValueError(f"MOSS_MEMORY_MODE must be auto, gpu, component, lowvram or minimal, got {mode!r}")
+
+        from accelerate import cpu_offload
+
+        device = self.device
+        cpu_offload(pipe.text_encoder, execution_device=device)
+        # The pipeline asks its first component for the device; pin it to the GPU.
+        type(pipe)._execution_device = property(lambda _self: device)
+        pipe.vae.to(device)
+        transformer = pipe.transformer
+        if mode == "lowvram":
+            transformer.to(device)
+            return mode, f"budget {budget_gib:.1f} GiB, text encoder streamed"
+
+        if hasattr(pipe.vae, "enable_tiling"):
+            pipe.vae.enable_tiling()
+        layers = list(transformer.layers)
+        block_gib = sum(p.numel() * p.element_size() for p in layers[0].parameters()) / 2**30
+        block_gib += sum(b.numel() * b.element_size() for b in layers[0].buffers()) / 2**30
+        fixed_gib = sum(
+            p.numel() * p.element_size()
+            for name, p in transformer.named_parameters()
+            if not name.startswith("layers.")
+        ) / 2**30
+        reserve = float(os.environ.get("MOSS_ACTIVATION_RESERVE_GIB") or _ACTIVATION_RESERVE_GIB)
+        resident = int((budget_gib - reserve - fixed_gib - 0.4) / block_gib)
+        resident = max(0, min(len(layers), resident))
+        for index, layer in enumerate(layers):
+            if index < resident:
+                layer.to(device)
+            else:
+                cpu_offload(layer, execution_device=device)
+        for name, module in transformer.named_children():
+            if name != "layers":
+                module.to(device)
+        return mode, (
+            f"budget {budget_gib:.1f} GiB, text encoder streamed, "
+            f"{resident}/{len(layers)} transformer blocks resident, VAE tiling"
         )
 
     def process(self, job: Job) -> Result:
