@@ -1,0 +1,18 @@
+# Requirements of the CUSTOM BACKEND (installed by the worker into the
+# backend's own venv). The client side (main.py) only needs the SDK and
+# `requests`, see README.
+
+# InferenceKey SDK runtime: provides `python -m inferencekey.backend.serve`.
+inferencekey
+
+# MOSS-Image inference path, as on the model card (torch 2.9 or newer).
+# torch from PyPI is the CUDA 13 build: the GPU driver must support CUDA 13.
+torch>=2.9
+# The custom pipeline was written against diffusers 0.38 and transformers 5.3
+# (Qwen3.5 text encoder); these are the ranges we ran.
+diffusers>=0.38,<0.39
+transformers>=5.3,<5.4
+accelerate>=1.10
+safetensors>=0.6
+huggingface_hub>=0.34
+pillow>=10.0
