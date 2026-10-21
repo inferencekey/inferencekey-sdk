@@ -162,3 +162,29 @@ def test_served_over_the_runtime_with_sse() -> None:
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_deepinfer_venv_extends_path_and_sets_rank_interpreter(tmp_path, monkeypatch) -> None:
+    import deepinfer_engines as de
+
+    minor = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    site = tmp_path / "lib" / minor / "site-packages"
+    site.mkdir(parents=True)
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "python").write_text("")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+
+    class Ctx:
+        executable = None
+
+        def set_executable(self, path: str) -> None:
+            self.executable = path
+
+    ctx = Ctx()
+    de.use_deepinfer_venv(str(tmp_path), ctx)
+    assert sys.path[-1] == str(site)
+    assert ctx.executable == str(tmp_path / "bin" / "python")
+
+    de.use_deepinfer_venv(None, ctx)  # no venv configured: nothing changes
+    with pytest.raises(FileNotFoundError):
+        de.use_deepinfer_venv(str(tmp_path / "missing"), Ctx())

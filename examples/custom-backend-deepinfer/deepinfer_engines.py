@@ -41,10 +41,12 @@ in the README.
 
 from __future__ import annotations
 
+import glob
 import itertools
 import json
 import os
 import queue
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -267,6 +269,33 @@ class _Stream:
     prompt_tokens: int = 0
 
 
+def use_deepinfer_venv(venv: Optional[str], ctx: Any) -> None:
+    """Run DeepInfer from a prebuilt venv instead of the backend's own.
+
+    DeepInfer is compiled in place by its ``build.sh`` (no installable wheel)
+    and pulls torch, its vendored CUDA kernels and transformers. The worker
+    gives every custom backend a fresh venv, so the heavy one is built once on
+    the node (``deepinfer_venv``, e.g. ``/workspace/di-venv`` on a network
+    volume) and used from here: its site-packages go at the END of
+    ``sys.path`` (the backend's own packages keep precedence) and the rank
+    processes start with its interpreter. Both venvs must use the same Python
+    minor version. No-op when ``venv`` is empty.
+    """
+    if not venv:
+        return
+    python = os.path.join(venv, "bin", "python")
+    if not os.path.exists(python):
+        raise FileNotFoundError(f"deepinfer_venv {venv!r} has no bin/python")
+    want = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    sites = sorted(glob.glob(os.path.join(venv, "lib", want, "site-packages")))
+    if not sites:
+        raise FileNotFoundError(f"deepinfer_venv {venv!r} has no lib/{want}/site-packages (Python mismatch?)")
+    for site in sites:
+        if site not in sys.path:
+            sys.path.append(site)
+    ctx.set_executable(python)
+
+
 class DeepInferEngine(Engine):
     """DeepInfer with one process per data-parallel rank and a least-loaded router.
 
@@ -278,6 +307,8 @@ class DeepInferEngine(Engine):
     def __init__(self, config: Dict[str, Any]) -> None:
         import multiprocessing as mp  # noqa: PLC0415
 
+        ctx = mp.get_context("spawn")
+        use_deepinfer_venv(config.get("deepinfer_venv"), ctx)
         from transformers import AutoTokenizer  # type: ignore[import-not-found]  # noqa: PLC0415
 
         ep = int(config.get("ep", 4))
@@ -330,7 +361,6 @@ class DeepInferEngine(Engine):
         }
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        ctx = mp.get_context("spawn")
         self._results = ctx.Queue()
         self._requests = [ctx.Queue() for _ in range(dp)]
         self._procs = [

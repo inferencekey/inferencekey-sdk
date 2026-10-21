@@ -38,14 +38,14 @@ to the rank with the fewest requests in flight.
 
 ### Getting DeepInfer into the backend's environment
 
-The worker creates a fresh venv for each custom backend (Python from
-`requires_python`, here 3.12) and installs `requirements.txt` into it, so DeepInfer
-has to be installable from there. The plan we have not run yet: on the worker
-node, build DeepInfer once, build a wheel from that tree, and reference it in
-`requirements.txt` as `deepinfer @ file:///opt/deepinfer/dist/<wheel>.whl`
-(plus `deep_cluster` if it ships separately). Whether `build.sh` leaves an
-installable wheel, and which extra packages it needs, is unverified. Until then,
-`requirements.txt` stays empty and only the fake engine works.
+DeepInfer's `build.sh` compiles in place (no installable wheel) and installs
+torch, its vendored CUDA kernels and transformers into the active Python. The
+worker gives every custom backend a fresh venv, so DeepInfer is built once into
+its own venv on the node (for example `/workspace/di-venv` on a network volume,
+with a `.pth` file pointing at the DeepInfer checkout) and the backend uses it
+through `deepinfer_venv`: its site-packages are appended to `sys.path` and the
+rank processes start with its interpreter. Both venvs must use the same Python
+minor version (3.12). `requirements.txt` stays empty.
 
 ## Workload config
 
@@ -60,6 +60,7 @@ installable wheel, and which extra packages it needs, is unverified. Until then,
 | `swa_bounded_replay`, `swa_keep_tokens` | `true`, `140` | SWA bounded replay (`DEEPINFER_YOCO_PREFILL_*`). |
 | `eplb`, `extra_experts` | `true`, `32` | Expert load balancing and redundant experts. |
 | `max_model_len`, `max_num_seqs`, `max_num_batched_tokens`, `gpu_memory_utilization` | `262144`, `64`, `32768`, `0.85` | Engine limits. Untuned. |
+| `deepinfer_venv` | none | Prebuilt venv with DeepInfer (see above), e.g. `/workspace/di-venv`. |
 | `deepinfer_env`, `llm_kwargs` | none | Extra DeepInfer environment variables and `LLM(...)` arguments. |
 | `thinking_mode`, `reasoning_effort` | `thinking`, `high` | Prompt mode (`thinking` or `chat`) and effort (1 to 100, or `low` / `high` / `max`). |
 | `temperature`, `top_p`, `default_max_tokens` | `0.6`, `1.0`, `8192` | Sampling defaults when the request has none. |
