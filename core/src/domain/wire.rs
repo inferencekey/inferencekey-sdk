@@ -118,13 +118,24 @@ pub struct FieldDiff {
 /// for backends that take no launch command. Returns `None` when the spec
 /// declares nothing to put in `config`.
 pub fn build_config(spec: &WorkloadSpec) -> Option<Value> {
-    let command = spec.command.as_ref()?;
-    let mut map = serde_json::Map::new();
-    map.insert("command".into(), Value::String(command.clone()));
-    if let Some(version) = spec.vllm_version.as_ref() {
-        map.insert("vllm_version".into(), Value::String(version.clone()));
+    // The spec's free-form `config` (a custom backend's settings, for example)
+    // is the base; the dedicated `command` / `vllm_version` fields win over a
+    // key of the same name inside it. Before, `config` was dropped entirely.
+    let mut map = match spec.config.as_ref() {
+        Some(Value::Object(obj)) => obj.clone(),
+        _ => serde_json::Map::new(),
+    };
+    if let Some(command) = spec.command.as_ref() {
+        map.insert("command".into(), Value::String(command.clone()));
+        if let Some(version) = spec.vllm_version.as_ref() {
+            map.insert("vllm_version".into(), Value::String(version.clone()));
+        }
     }
-    Some(Value::Object(map))
+    if map.is_empty() {
+        None
+    } else {
+        Some(Value::Object(map))
+    }
 }
 
 /// Build the create body from a spec. `task_type` carries the spec value (the
@@ -412,6 +423,37 @@ mod tests {
             };
             assert_eq!(build_config(&spec), expected);
         }
+    }
+
+    #[test]
+    fn build_config_keeps_the_spec_config_and_lets_command_win() {
+        let spec = WorkloadSpec {
+            config: Some(json!({
+                "engine": "deepinfer",
+                "env": { "CUDA_VISIBLE_DEVICES": "0,1,2,3" },
+                "command": "ignored"
+            })),
+            command: None,
+            vllm_version: None,
+            ..base_spec()
+        };
+        assert_eq!(
+            build_config(&spec),
+            Some(json!({
+                "engine": "deepinfer",
+                "env": { "CUDA_VISIBLE_DEVICES": "0,1,2,3" },
+                "command": "ignored"
+            }))
+        );
+        let with_command = WorkloadSpec {
+            command: Some("vllm serve x".into()),
+            ..spec.clone()
+        };
+        assert_eq!(
+            build_config(&with_command).unwrap()["command"],
+            json!("vllm serve x")
+        );
+        assert_eq!(build_config(&with_command).unwrap()["engine"], json!("deepinfer"));
     }
 
     #[test]
