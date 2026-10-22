@@ -46,6 +46,7 @@ import itertools
 import json
 import os
 import queue
+import site
 import sys
 import threading
 import time
@@ -188,6 +189,7 @@ def _rank_main(
 
     import numpy as np  # noqa: PLC0415 (DeepInfer must be imported after the env is set)
 
+    import torch  # noqa: F401,PLC0415 (loads libc10 before deepinfer._C)
     from deepinfer._C.engine import RequestOutput  # type: ignore[import-not-found]
     from deepinfer.entrypoints.llm import LLM  # type: ignore[import-not-found]
     from deepinfer.sampling_params import SamplingParams  # type: ignore[import-not-found]
@@ -290,9 +292,11 @@ def use_deepinfer_venv(venv: Optional[str], ctx: Any) -> None:
     sites = sorted(glob.glob(os.path.join(venv, "lib", want, "site-packages")))
     if not sites:
         raise FileNotFoundError(f"deepinfer_venv {venv!r} has no lib/{want}/site-packages (Python mismatch?)")
-    for site in sites:
-        if site not in sys.path:
-            sys.path.append(site)
+    for site_dir in sites:
+        if site_dir not in sys.path:
+            # addsitedir also runs the venv's .pth files (DeepInfer's build
+            # makes its source tree importable through one).
+            site.addsitedir(site_dir)
     ctx.set_executable(python)
 
 
@@ -364,7 +368,7 @@ class DeepInferEngine(Engine):
         self._results = ctx.Queue()
         self._requests = [ctx.Queue() for _ in range(dp)]
         self._procs = [
-            ctx.Process(target=_rank_main, args=(r, settings, self._requests[r], self._results), daemon=True)
+            ctx.Process(target=_rank_main, args=(r, settings, self._requests[r], self._results), daemon=False)
             for r in range(dp)
         ]
         for proc in self._procs:
