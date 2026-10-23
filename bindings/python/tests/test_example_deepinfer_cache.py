@@ -255,25 +255,36 @@ def _router(dp: int = 4):
     engine._sessions = de.OrderedDict()
     engine._max_sessions = 3
     engine._migrate_at = 2
-    engine._used_blocks = [0] * dp
-    engine._assigned = [0] * dp
+    engine._session_idle = 1800.0
+    engine._weights, engine._weights_at = [0.0] * dp, 0.0
     engine.migrations = 0
     return engine
 
 
-def test_router_keeps_a_session_on_its_rank_and_balances_new_ones_by_kv() -> None:
+def test_router_keeps_a_session_on_its_rank_and_balances_new_ones_by_session_tokens() -> None:
     engine = _router()
-    engine._used_blocks = [500, 100, 300, 900]
-    req = de.GenRequest(prompt="p" * 3000, session_key="alpha")
-    rank = engine._route(req)
-    assert rank == 1
-    engine._used_blocks[1] = 10_000  # even when its rank fills up, the session stays
+    engine._max_sessions = 10
+    now = time.monotonic()
+    # Active sessions per rank: 3,000 / 1,000 / 2,000 / 9,000 tokens; an idle one on rank 1 does not count.
+    for key, rank, tokens, seen in (("a", 0, 3000, now), ("b", 1, 1000, now), ("c", 2, 2000, now),
+                                    ("d", 3, 9000, now), ("old", 1, 50000, now - 4000)):
+        engine._sessions[key] = [rank, tokens, seen]
+    req = de.GenRequest(prompt="p" * 3000, session_key="alpha")  # about 1,000 tokens
     assert engine._route(req) == 1
-    # Busy past session_migrate_inflight: the session moves (one cold turn).
+    # Its next turn stays there even if that rank gets busy, up to session_migrate_inflight.
+    engine._in_flight[1] = 1
+    assert engine._route(req) == 1
     engine._in_flight[1] = 2
     assert engine._route(req) != 1 and engine.migrations == 1
-    # The session table is an LRU with a cap.
-    for key in ("b", "c", "d"):
+    # Within the same second, the router counts what it just assigned.
+    engine._weights_at = time.monotonic()
+    picks = [engine._route(de.GenRequest(prompt="p" * 30000, session_key=f"n{i}")) for i in range(3)]
+    assert len(set(picks)) == 3  # three 10,000-token sessions spread over three ranks
+
+
+def test_router_session_table_is_an_lru_with_a_cap() -> None:
+    engine = _router()
+    for key in ("alpha", "b", "c", "d"):
         engine._route(de.GenRequest(prompt="p", session_key=key))
     assert "alpha" not in engine._sessions and len(engine._sessions) == 3
 
@@ -387,7 +398,8 @@ def test_a_rank_dies_with_its_backend_process(tmp_path) -> None:
 def test_rank_stats_log_line(capsys) -> None:
     engine = _router(dp=2)
     engine._lock = threading.Lock()
-    engine._sessions.update({"a": 0, "b": 1, "c": 1})
+    now = time.monotonic()
+    engine._sessions.update({"a": [0, 10, now], "b": [1, 10, now], "c": [1, 10, now]})
     engine.rank_stats = [{"rank": 0, "total_blocks": 100, "free_blocks": 40, "cached_blocks": 30, "hits": 3,
                           "lookups": 4, "hit_tokens": 3000, "evicted": 2}, {}]
     engine._log_rank_stats()
