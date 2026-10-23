@@ -1,0 +1,28 @@
+# Requirements of the CUSTOM BACKEND (installed by the worker into the
+# backend's own venv, Python 3.11). The client side (main.py) only needs the
+# SDK and `requests`, see README.
+
+# InferenceKey SDK runtime: provides `python -m inferencekey.backend.serve`.
+inferencekey
+
+# The exact set the Ming-Image authors validated end to end (their
+# requirements.txt, 2026-09-16), minus transformer-engine, which is optional
+# (the vision tower falls back to a native RMSNorm) and needs flash-attn.
+# torch 2.4.0 (the authors pin) fails at the first request with diffusers
+# 0.36.0: its attention dispatch passes `enable_gqa` to
+# scaled_dot_product_attention, which torch only accepts from 2.5.
+torch==2.5.1
+torchvision==0.20.1
+transformers==4.57.1
+diffusers==0.36.0
+accelerate==1.13.0
+safetensors==0.7.0
+tokenizers==0.22.2
+huggingface-hub==0.34.0
+# numpy 1.23.1 (the authors pin) has no Python 3.11 wheel and would build from
+# source; 1.26.4 is the last 1.x and works with torch 2.4.
+numpy==1.26.4
+Pillow==10.4.0
+requests==2.32.3
+tqdm==4.67.1
+typing-extensions==4.15.0
