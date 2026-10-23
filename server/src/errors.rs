@@ -31,7 +31,7 @@ pub(crate) const HEALTH_LOADING: &[u8] = b"{\"status\": \"loading\"}";
 /// The 500 body when the application itself fails (a panic, or a stream
 /// handler that returned without answering), in the route's error shape:
 /// the OpenAI shape on chat, the plain shape elsewhere.
-pub(crate) fn internal_error(route: Route, message: &str) -> Bytes {
+pub fn internal_error(route: Route, message: &str) -> Bytes {
     match route {
         Route::Chat => Bytes::from(error_event(message)),
         Route::Process | Route::Forecast => plain_error(message),

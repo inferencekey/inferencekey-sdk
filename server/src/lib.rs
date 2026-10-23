@@ -49,6 +49,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::{watch, Semaphore};
 
 pub use app::{AppHandler, JsonReply, Route};
+pub use errors::internal_error;
 pub use sse::{PendingFrame, SendOutcome, StreamSink, CHANNEL_CAPACITY, COALESCE_CAP};
 
 use conn::Stopped;

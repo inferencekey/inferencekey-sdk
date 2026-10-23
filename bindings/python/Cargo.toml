@@ -18,6 +18,14 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }
+# Native HTTP/SSE transport for custom backends (`inferencekey.backend.serve`).
+inferencekey-backend-server = { path = "../../server", optional = true }
+bytes = { workspace = true, optional = true }
 # abi3-py39: build against the stable ABI so a single wheel works on every
 # CPython >= 3.9 (and sidesteps probing the exact local interpreter version).
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+
+[features]
+# maturin builds default features, so wheels always carry the native server.
+default = ["backend-server"]
+backend-server = ["dep:inferencekey-backend-server", "dep:bytes"]

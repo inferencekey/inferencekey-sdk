@@ -480,7 +480,9 @@ dependencies = [
 name = "inferencekey-python"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures-util",
+ "inferencekey-backend-server",
  "inferencekey-core",
  "pyo3",
  "serde",
