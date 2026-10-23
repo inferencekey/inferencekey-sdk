@@ -697,6 +697,10 @@ class CustomBackend(ABC):
         yield ``None`` when it has had nothing to send for a while: the runtime
         writes an SSE keepalive comment, and a client that left makes that write
         fail, which closes the generator so the backend can stop the work.
+        Put that work in a ``try``/``finally`` around the ``yield``: the
+        generator is closed whenever the client leaves. A hot path may yield a
+        ``str`` or ``bytes`` holding an already-serialized chunk object instead
+        of a dict; the runtime writes it as is, without ``json.dumps``.
         """
         yield from completion_to_chunks(self.chat(request))
 
