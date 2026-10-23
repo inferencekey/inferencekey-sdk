@@ -394,3 +394,24 @@ def test_rank_stats_log_line(capsys) -> None:
     err = capsys.readouterr().err
     assert "deepinfer rank 0: 1 sessions, 0 in flight, KV 60% used (30 cached blocks), hits 3/4" in err
     assert "rank 1" not in err  # no stats from it yet
+
+
+def test_queued_cache_hits_do_not_empty_the_cache() -> None:
+    """Many queued turns that hit the cache need only their new blocks: tick()
+    must not evict other sessions' cached prefixes for their whole prompts."""
+    engine = _sim(kv_blocks=1000)
+    settings = {"prefix_cache_free_fraction": 0.0}
+    cache = de._RankCache(0, engine, settings)
+    bm = engine.block_manager
+    # Five idle sessions of 100 blocks each in the cache (the index holds the only pin).
+    for i in range(5):
+        blocks = bm.allocate(100)
+        cache.index.insert(pc.block_hashes([i] * 100 * pc.BLOCK), blocks)
+        bm.unpin_blocks(blocks)
+    assert bm.get_num_free_blocks() == 500
+    # Forty queued turns, each a hit needing 3 new blocks (prompts of 100 blocks).
+    for r in range(40):
+        cache.live[f"q{r}"] = ([], 100 * pc.BLOCK, [], 3)
+    cache.tick([f"q{r}" for r in range(40)])
+    # 120 new blocks + the 10 % watermark fit in the 500 free: nothing evicted.
+    assert cache.index.evicted == 0 and len(cache.index) == 500
