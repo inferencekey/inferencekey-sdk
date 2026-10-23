@@ -34,6 +34,10 @@ What :class:`DeepInferEngine` relies on, as read from the DeepInfer source on
 * ``has_unfinished_requests()`` all-reduces across the data-parallel group, so
   every rank must call it, and ``step()``, in lockstep. The rank loop below does
   exactly that, also when a rank has nothing to do.
+* ``llm.llm_engine.abort_request(request_id)`` (``scheduler.abort_sequence``,
+  local to the rank) to drop the request of a client that disconnected.
+* ``llm.get_tokenizer()``: the checkpoint's Hugging Face tokenizer, used in the
+  rank to tokenize prompts and to detokenize completions.
 
 What has NOT been checked on hardware is marked ``UNVERIFIED`` below and listed
 in the README.
@@ -41,6 +45,7 @@ in the README.
 
 from __future__ import annotations
 
+import codecs
 import glob
 import itertools
 import json
@@ -50,8 +55,10 @@ import site
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Any, Callable, Deque, Dict, Iterator, List, Optional
 
 
 @dataclass
@@ -162,6 +169,153 @@ class FakeEngine(Engine):
 
 
 # --------------------------------------------------------------------------
+# Incremental detokenization (runs in the rank processes)
+# --------------------------------------------------------------------------
+
+
+class IncrementalDetokenizer:
+    """Turns the token ids of one completion into text, a few tokens at a time.
+
+    ``feed`` returns the text that the new tokens make final; text that could
+    still change (the first bytes of a multi-byte character split across tokens)
+    is held back. ``flush`` returns what is left at the end. The concatenation of
+    every ``feed`` and the final ``flush`` equals ``tokenizer.decode(all_ids,
+    skip_special_tokens=False)``.
+    """
+
+    def feed(self, token_ids: List[int]) -> str:
+        raise NotImplementedError
+
+    def flush(self) -> str:
+        raise NotImplementedError
+
+
+def _byte_level_alphabet() -> Dict[str, int]:
+    """The byte each character of a byte-level BPE vocabulary stands for (GPT-2's
+    ``bytes_to_unicode``, inverted)."""
+    printable = [*range(ord("!"), ord("~") + 1), *range(ord("¡"), ord("¬") + 1), *range(ord("®"), ord("ÿ") + 1)]
+    alphabet = {chr(b): b for b in printable}
+    shifted = 0
+    for b in range(256):
+        if b not in alphabet.values():
+            alphabet[chr(256 + shifted)] = b
+            shifted += 1
+    return alphabet
+
+
+_TABLE_CHECK_TEXT = "Hello, ¿qué tal? 你好世界 🎉 naïve </think>\n\n\tdef f(x):  return x"
+
+
+def byte_level_table(tokenizer: Any) -> Optional[List[bytes]]:
+    """The bytes of every token id, when decoding is just "join the bytes, then UTF-8".
+
+    That holds for a Hugging Face fast tokenizer with a ``ByteLevel`` decoder and
+    no ``clean_up_tokenization_spaces`` (DeepSeek-V4.1's): the decoder maps each
+    token's characters back to bytes (a token with a character outside the
+    byte alphabet, like an added special token, contributes its UTF-8), drops
+    unknown ids, and decodes the whole with replacement characters. The table is
+    checked against the tokenizer's own ``decode`` for every single id and for a
+    multilingual sample; any difference, or any other tokenizer, returns
+    ``None`` and the caller falls back to :class:`WindowDetokenizer`.
+    """
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is None or getattr(tokenizer, "clean_up_tokenization_spaces", False):
+        return None
+    try:
+        decoder = json.loads(backend.to_str()).get("decoder") or {}
+        if decoder.get("type") != "ByteLevel":
+            return None
+        alphabet = _byte_level_alphabet()
+        size = backend.get_vocab_size(with_added_tokens=True)
+        table: List[bytes] = []
+        for token_id in range(size):
+            token = backend.id_to_token(token_id)
+            if token is None:
+                table.append(b"")
+                continue
+            try:
+                table.append(bytes(alphabet[c] for c in token))
+            except KeyError:
+                table.append(token.encode("utf-8"))
+        singles = backend.decode_batch([[i] for i in range(size)], skip_special_tokens=False)
+        if any(piece.decode("utf-8", "replace") != text for piece, text in zip(table, singles)):
+            return None
+        sample = list(backend.encode(_TABLE_CHECK_TEXT).ids)
+        joined = b"".join(table[i] for i in sample).decode("utf-8", "replace")
+        if joined != backend.decode(sample, skip_special_tokens=False):
+            return None
+    except Exception:  # noqa: BLE001 (any surprise: use the generic path)
+        return None
+    return table
+
+
+class ByteLevelDetokenizer(IncrementalDetokenizer):
+    """Table lookups plus an incremental UTF-8 decoder: about a microsecond per token."""
+
+    __slots__ = ("_table", "_size", "_utf8")
+
+    def __init__(self, table: List[bytes]) -> None:
+        self._table = table
+        self._size = len(table)
+        self._utf8 = codecs.getincrementaldecoder("utf-8")("replace")
+
+    def feed(self, token_ids: List[int]) -> str:
+        table, size = self._table, self._size
+        data = b"".join(table[t] for t in token_ids if 0 <= t < size)
+        return self._utf8.decode(data)
+
+    def flush(self) -> str:
+        # An unfinished multi-byte character at the very end becomes U+FFFD, as in decode().
+        return self._utf8.decode(b"", True)
+
+
+class WindowDetokenizer(IncrementalDetokenizer):
+    """Generic incremental decoding for any tokenizer with ``decode``.
+
+    The prefix and read offsets of vLLM and TGI: decode a short window that
+    ends at the last emitted token and the same window with the new tokens, and
+    emit the difference, unless it ends in U+FFFD (a multi-byte character still
+    incomplete) or did not grow (tokens that merge with the next ones). Two
+    small decodes per feed, never the whole completion.
+    """
+
+    __slots__ = ("_decode", "_ids", "_read")
+
+    def __init__(self, tokenizer: Any) -> None:
+        self._decode = tokenizer.decode
+        self._ids: List[int] = []  # the window: context tokens, then tokens not yet emitted
+        self._read = 0  # how many tokens of the window were emitted already
+
+    def feed(self, token_ids: List[int]) -> str:
+        self._ids.extend(token_ids)
+        return self._advance(final=False)
+
+    def flush(self) -> str:
+        return self._advance(final=True)
+
+    def _advance(self, final: bool) -> str:
+        ids = self._ids
+        if self._read == len(ids):
+            return ""
+        before = self._decode(ids[: self._read], skip_special_tokens=False) if self._read else ""
+        after = self._decode(ids, skip_special_tokens=False)
+        if not final and (len(after) <= len(before) or after.endswith("�")):
+            return ""
+        # Slide: the tokens just emitted become the context of the next window.
+        self._ids = ids[self._read :]
+        self._read = len(self._ids)
+        return after[len(before) :]
+
+
+def detokenizer_factory(tokenizer: Any) -> Callable[[], IncrementalDetokenizer]:
+    """A constructor of per-request detokenizers: the byte table when it is exact, else windows."""
+    table = byte_level_table(tokenizer)
+    if table is not None:
+        return lambda: ByteLevelDetokenizer(table)
+    return lambda: WindowDetokenizer(tokenizer)
+
+
+# --------------------------------------------------------------------------
 # DeepInfer engine
 # --------------------------------------------------------------------------
 
@@ -209,66 +363,211 @@ def _rank_main(
         **settings["llm_kwargs"],
     )
     engine = llm.llm_engine
-    tokenizer = llm.get_tokenizer()
     needs_mm = engine.multi_modal_processor is not None
+    try:
+        _rank_loop(
+            rank,
+            engine,
+            llm.get_tokenizer(),
+            requests,
+            results,
+            settings,
+            clone=RequestOutput.clone,
+            sampling_params=SamplingParams,
+            token_array=lambda ids: np.asarray(ids, dtype=np.int32),
+            multi_modal_data=lambda: dict(image_bytes=[], image_sizes=[]) if needs_mm else None,
+        )
+    finally:
+        llm.close()
+
+
+class _Live:
+    """A request this rank has handed to the engine."""
+
+    __slots__ = ("detokenizer", "tokens")
+
+    def __init__(self, detokenizer: IncrementalDetokenizer) -> None:
+        self.detokenizer = detokenizer
+        self.tokens = 0
+
+
+def _rank_loop(
+    rank: int,
+    engine: Any,
+    tokenizer: Any,
+    requests: Any,
+    results: Any,
+    settings: Dict[str, Any],
+    *,
+    clone: Callable[[Any], Any],
+    sampling_params: Callable[..., Any],
+    token_array: Callable[[List[int]], Any],
+    multi_modal_data: Callable[[], Any],
+) -> None:
+    """The rank's serving loop, apart from building the engine (so tests can drive it).
+
+    Messages in (``requests``): ``("add", request_id, prompt, params)``,
+    ``("abort", request_id)`` and ``None`` (stop). Messages out (``results``):
+    ``("ready", rank, None)`` once, then at most one ``("out", rank, items)``
+    per engine step, ``items`` being one tuple per request that advanced:
+    ``(request_id, text, completion_tokens, prompt_tokens, finished, error)``,
+    with the text these tokens made final and the totals so far.
+
+    The parent never sees a token id: prompts are tokenized here, on a few
+    threads (the Hugging Face fast tokenizer releases the GIL while it encodes,
+    so a 137K-token prompt does not stall the lockstep loop), and completions
+    are detokenized here, incrementally, per request.
+    """
+    new_detokenizer = detokenizer_factory(tokenizer)
+    idle_sleep = float(settings["idle_poll_seconds"])
+    abort_on_disconnect = bool(settings.get("abort_on_disconnect", True))
+    pool = ThreadPoolExecutor(
+        max_workers=max(1, int(settings.get("tokenizer_threads", 2))),
+        thread_name_prefix=f"deepinfer-rank{rank}-tokenize",
+    )
+    tokenized: "Deque[tuple]" = deque()  # filled by the pool, drained by the loop
+    tokenizing: Dict[str, bool] = {}  # request id -> aborted while tokenizing
+    live: Dict[str, _Live] = {}
+
+    def tokenize(request_id: str, prompt: str, params: Dict[str, Any]) -> None:
+        try:
+            tokenized.append((request_id, token_array(tokenizer.encode(prompt)), params, None))
+        except Exception as exc:  # noqa: BLE001 (report it on the request)
+            tokenized.append((request_id, None, params, f"tokenization failed: {exc}"))
+
     results.put(("ready", rank, None))
-
-    idle_sleep = settings["idle_poll_seconds"]
     pending_flush = False
-    while True:
-        # Take every request routed to this rank since the last iteration.
+    try:
         while True:
-            try:
-                item = requests.get_nowait()
-            except queue.Empty:
-                break
-            if item is None:
-                llm.close()
-                return
-            request_id, prompt, params = item
-            try:
-                token_ids = np.asarray(tokenizer.encode(prompt), dtype=np.int32)
-                # UNVERIFIED: adding requests between steps while others are in flight
-                # (the offline example adds them all before the first step).
-                engine.add_request(
-                    user_id="0",
-                    request_id=request_id,
-                    sampling_params=SamplingParams(**params),
-                    prompt_token_ids=token_ids,
-                    multi_modal_data=dict(image_bytes=[], image_sizes=[]) if needs_mm else None,
-                )
-            except Exception as exc:  # noqa: BLE001 (report and keep the rank alive)
-                results.put(("error", request_id, str(exc)))
+            items: List[tuple] = []
+            # Messages from the parent since the last iteration.
+            while True:
+                try:
+                    message = requests.get_nowait()
+                except queue.Empty:
+                    break
+                if message is None:
+                    return
+                if message[0] == "add":
+                    _, request_id, prompt, params = message
+                    tokenizing[request_id] = False
+                    pool.submit(tokenize, request_id, prompt, params)
+                elif message[0] == "abort":
+                    request_id = message[1]
+                    if request_id in tokenizing:
+                        tokenizing[request_id] = True
+                    elif live.pop(request_id, None) is not None and abort_on_disconnect:
+                        try:
+                            # UNVERIFIED: aborting between steps while other requests run.
+                            engine.abort_request(request_id)
+                        except Exception as exc:  # noqa: BLE001 (keep the rank alive)
+                            print(f"deepinfer rank {rank}: abort of {request_id} failed: {exc}",
+                                  file=sys.stderr, flush=True)
 
-        # Collective across the data-parallel group: every rank calls it.
-        # UNVERIFIED: that idle ranks may keep calling it (and step() with an
-        # empty local batch) indefinitely, as a long-lived server needs.
-        unfinished = engine.has_unfinished_requests()
-        if unfinished:
-            outputs = engine.step()
-            pending_flush = True
-        elif pending_flush:
-            # Same value on every rank (they all stepped), so the flush stays in lockstep.
-            outputs = engine.flush_inflight_reqs()
-            pending_flush = False
-        else:
-            time.sleep(idle_sleep)
-            continue
+            # Prompts tokenized since the last iteration go to the engine.
+            while tokenized:
+                request_id, token_ids, params, error = tokenized.popleft()
+                if tokenizing.pop(request_id, False):
+                    continue  # the client left while its prompt was being tokenized
+                if error is None:
+                    try:
+                        # UNVERIFIED: adding requests between steps while others are in flight
+                        # (the offline example adds them all before the first step).
+                        engine.add_request(
+                            user_id="0",
+                            request_id=request_id,
+                            sampling_params=sampling_params(**params),
+                            prompt_token_ids=token_ids,
+                            multi_modal_data=multi_modal_data(),
+                        )
+                    except Exception as exc:  # noqa: BLE001 (report and keep the rank alive)
+                        error = str(exc)
+                if error is None:
+                    live[request_id] = _Live(new_detokenizer())
+                else:
+                    items.append((request_id, "", 0, 0, True, error))
 
-        tokens = []
-        for raw in outputs:
-            out = RequestOutput.clone(raw)
-            tokens.append((out.request_id, int(out.token_id), bool(out.finished), int(out.prompt_len)))
-        if tokens:
-            results.put(("tokens", rank, tokens))
+            # Collective across the data-parallel group: every rank calls it.
+            # UNVERIFIED: that idle ranks may keep calling it (and step() with an
+            # empty local batch) indefinitely, as a long-lived server needs.
+            unfinished = engine.has_unfinished_requests()
+            if unfinished:
+                outputs = engine.step()
+                pending_flush = True
+            elif pending_flush:
+                # Same value on every rank (they all stepped), so the flush stays in lockstep.
+                outputs = engine.flush_inflight_reqs()
+                pending_flush = False
+            else:
+                if items:
+                    results.put(("out", rank, items))
+                time.sleep(idle_sleep)
+                continue
+
+            if outputs:
+                _collect_step(outputs, clone, live, items)
+            if items:
+                results.put(("out", rank, items))
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
-@dataclass
+def _collect_step(outputs: Any, clone: Callable[[Any], Any], live: Dict[str, _Live], items: List[tuple]) -> None:
+    """Group one step's outputs by request, detokenize them and append one item per request."""
+    step: Dict[str, list] = {}
+    for raw in outputs:
+        # clone: the step's outputs are released by the next step.
+        out = clone(raw)
+        entry = step.get(out.request_id)
+        if entry is None:
+            entry = step[out.request_id] = [[], False, 0]
+        entry[0].append(int(out.token_id))
+        entry[1] = entry[1] or bool(out.finished)
+        entry[2] = int(out.prompt_len)
+    for request_id, (token_ids, finished, prompt_len) in step.items():
+        state = live.get(request_id)
+        if state is None:
+            continue  # aborted
+        state.tokens += len(token_ids)
+        text = state.detokenizer.feed(token_ids)
+        if finished:
+            text += state.detokenizer.flush()
+            del live[request_id]
+        elif not text:
+            continue  # nothing final yet (half a character); the totals ride on the next item
+        items.append((request_id, text, state.tokens, prompt_len, finished, None))
+
+
 class _Stream:
-    events: "queue.Queue[GenEvent]" = field(default_factory=queue.Queue)
-    token_ids: List[int] = field(default_factory=list)
-    text: str = ""
-    prompt_tokens: int = 0
+    """Parent-side mailbox of one request: the reader appends, the request's thread drains."""
+
+    __slots__ = ("items", "wake", "done")
+
+    def __init__(self) -> None:
+        self.items: "Deque[tuple]" = deque()
+        self.wake = threading.Event()  # items arrived
+        self.done = threading.Event()  # the last item arrived
+
+    def drain(self) -> List[tuple]:
+        items = []
+        try:
+            while True:
+                items.append(self.items.popleft())
+        except IndexError:
+            return items
+
+
+def _merge(items: List[tuple]) -> GenEvent:
+    """Everything a request received since its thread last ran, as one event."""
+    last = items[-1]
+    error = next((item[5] for item in items if item[5]), None)
+    return GenEvent(
+        text=last[1] if len(items) == 1 else "".join(item[1] for item in items),
+        finished=bool(last[4]) or error is not None,
+        prompt_tokens=last[3],
+        completion_tokens=last[2],
+        error=error,
+    )
 
 
 def use_deepinfer_venv(venv: Optional[str], ctx: Any) -> None:
@@ -305,7 +604,15 @@ class DeepInferEngine(Engine):
 
     The open release of DeepInfer ships no load balancer across data-parallel
     replicas; this router (fewest requests in flight wins) is ours and simple on
-    purpose. Text is decoded in this process with the checkpoint's tokenizer.
+    purpose.
+
+    The work is split so this process (one GIL for every HTTP stream) stays
+    cheap: the ranks tokenize prompts, detokenize completions incrementally and
+    send one message per engine step with the new text of every request that
+    advanced. Here a reader thread hands each item to its request's mailbox,
+    and the request's thread takes everything that arrived since it last ran as
+    one event, so a busy server sends fewer, larger SSE chunks instead of
+    falling behind.
     """
 
     def __init__(self, config: Dict[str, Any]) -> None:
@@ -313,7 +620,6 @@ class DeepInferEngine(Engine):
 
         ctx = mp.get_context("spawn")
         use_deepinfer_venv(config.get("deepinfer_venv"), ctx)
-        from transformers import AutoTokenizer  # type: ignore[import-not-found]  # noqa: PLC0415
 
         ep = int(config.get("ep", 4))
         cp = int(config.get("cp", 1))
@@ -353,6 +659,8 @@ class DeepInferEngine(Engine):
             "devices": [_rank_devices(visible, r, cp) for r in range(dp)],
             "env": env,
             "idle_poll_seconds": float(config.get("idle_poll_seconds", 0.005)),
+            "tokenizer_threads": int(config.get("tokenizer_threads", 2)),
+            "abort_on_disconnect": bool(config.get("abort_on_disconnect", True)),
             "llm_kwargs": {
                 "max_model_len": max_model_len,
                 "max_num_seqs": int(config.get("max_num_seqs", 64)),
@@ -364,7 +672,6 @@ class DeepInferEngine(Engine):
             },
         }
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self._results = ctx.Queue()
         self._requests = [ctx.Queue() for _ in range(dp)]
         self._procs = [
@@ -394,6 +701,8 @@ class DeepInferEngine(Engine):
         self._in_flight = [0] * dp
         self._lock = threading.Lock()
         self._ids = itertools.count()
+        self._closed = False
+        self._stream_interval = float(config.get("stream_interval_ms", 50)) / 1000.0
         self._reader = threading.Thread(target=self._read_results, name="deepinfer-results", daemon=True)
         self._reader.start()
 
@@ -412,56 +721,93 @@ class DeepInferEngine(Engine):
             self._in_flight[rank] += 1
             self._streams[request_id] = stream
             self._owner[request_id] = rank
-        self._requests[rank].put((request_id, request.prompt, params))
-        while True:
-            event = stream.events.get()
-            yield event
-            if event.finished:
-                return
+        self._requests[rank].put(("add", request_id, request.prompt, params))
+        finished = False
+        interval = self._stream_interval
+        try:
+            while not finished:
+                stream.wake.wait()
+                stream.wake.clear()
+                items = stream.drain()
+                if not items:
+                    continue
+                event = _merge(items)
+                finished = event.finished
+                yield event
+                if interval and not finished:
+                    # Let a few steps pile up: one wake-up and one SSE write per
+                    # interval instead of per step keeps this process cheap. The
+                    # last item cuts the wait short, so a request never ends late.
+                    stream.done.wait(interval)
+        finally:
+            if not finished:
+                # The consumer stopped early (client disconnected): free the slot.
+                self._cancel(request_id)
 
     def _read_results(self) -> None:
+        streams = self._streams
         while True:
-            kind, who, payload = self._results.get()
-            if kind == "error":
-                self._finish(who, GenEvent(finished=True, error=payload))
+            try:
+                message = self._results.get(timeout=1.0)
+            except queue.Empty:
+                self._check_ranks()
                 continue
-            if kind != "tokens":
+            if message is None:
+                return
+            kind, _rank, items = message
+            if kind != "out":
                 continue
-            for request_id, token_id, finished, prompt_len in payload:
+            for item in items:
+                stream = streams.get(item[0])
+                if stream is None:
+                    continue  # cancelled
+                stream.items.append(item)
+                if item[4]:
+                    self._release(item[0])
+                    stream.done.set()
+                if not stream.wake.is_set():  # a set() per item would cost a lock each
+                    stream.wake.set()
+
+    def _check_ranks(self) -> None:
+        """Fail the requests of a rank that died, so their clients get an error instead of hanging."""
+        if self._closed:
+            return
+        for rank, proc in enumerate(self._procs):
+            if proc.is_alive():
+                continue
+            with self._lock:
+                dead = [rid for rid, owner in self._owner.items() if owner == rank]
+            for request_id in dead:
                 stream = self._streams.get(request_id)
                 if stream is None:
                     continue
-                stream.token_ids.append(token_id)
-                stream.prompt_tokens = prompt_len
-                # Decode the whole completion and emit what is new: simple and
-                # correct for multi-byte characters split across tokens.
-                text = self.tokenizer.decode(stream.token_ids, skip_special_tokens=False)
-                delta, stream.text = text[len(stream.text) :], text
-                event = GenEvent(
-                    text=delta,
-                    finished=finished,
-                    prompt_tokens=prompt_len,
-                    completion_tokens=len(stream.token_ids),
-                )
-                if finished:
-                    self._finish(request_id, event)
-                else:
-                    stream.events.put(event)
+                self._release(request_id)
+                message = f"DeepInfer rank {rank} exited (code {proc.exitcode}); see its log"
+                stream.items.append((request_id, "", 0, 0, True, message))
+                stream.done.set()
+                stream.wake.set()
 
-    def _finish(self, request_id: str, event: GenEvent) -> None:
+    def _release(self, request_id: str) -> Optional[int]:
+        """Forget a request; returns the rank it was on, or None if it was already gone."""
         with self._lock:
-            stream = self._streams.pop(request_id, None)
+            self._streams.pop(request_id, None)
             rank = self._owner.pop(request_id, None)
             if rank is not None:
                 self._in_flight[rank] -= 1
-        if stream is not None:
-            stream.events.put(event)
+        return rank
+
+    def _cancel(self, request_id: str) -> None:
+        rank = self._release(request_id)
+        if rank is not None and not self._closed:
+            self._requests[rank].put(("abort", request_id))
 
     def close(self) -> None:
+        self._closed = True
         for q in self._requests:
             q.put(None)
         for proc in self._procs:
             proc.join(timeout=30)
+        self._results.put(None)
 
 
 def resolve_model_path(config: Dict[str, Any]) -> str:

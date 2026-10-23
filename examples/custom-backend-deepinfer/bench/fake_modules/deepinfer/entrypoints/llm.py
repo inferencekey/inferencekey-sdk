@@ -153,6 +153,14 @@ class SimEngine:
     def flush_inflight_reqs(self) -> List[RequestOutput]:
         return []
 
+    def abort_request(self, request_id: Any) -> tuple:
+        ids = {request_id} if isinstance(request_id, str) else set(request_id)
+        before = len(self.waiting) + len(self.prefilling) + len(self.running)
+        self.waiting = deque(s for s in self.waiting if s.request_id not in ids)
+        self.prefilling = [s for s in self.prefilling if s.request_id not in ids]
+        self.running = [s for s in self.running if s.request_id not in ids]
+        return before - len(self.waiting) - len(self.prefilling) - len(self.running), 0
+
     # --- helpers --------------------------------------------------------------
 
     def _emit(self, seq: _Seq, outputs: List[RequestOutput], first: bool = False) -> bool:
