@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "capi", "bindings/python", "bindings/node"]
+members = ["core", "capi", "bindings/python", "bindings/node", "server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -18,6 +18,14 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 futures-util = "0.3"
 tracing = "0.1"
+# Native HTTP/SSE transport for custom backends. Only the `server` crate (and,
+# through it, the Python binding) depends on these, so capi and node never
+# compile the hyper server. All of them were already in Cargo.lock as reqwest
+# transitives.
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-graceful", "http1"] }
+http-body-util = "0.1"
+bytes = "1"
 
 [profile.release]
 lto = true
