@@ -16,15 +16,19 @@ bottleneck), probes ``/healthz`` on the side like the worker does (every
   of the per-second token counts in the middle 80 % of the run);
 * per-stream tok/s (completion tokens / time from first to last token), TTFT
   (from the moment that stream connects) and the gap between consecutive
-  content chunks;
+  content chunks; with the null backend, the TTFT the runtime adds over the
+  backend's own first-yield latency (``added_ttft_ms``, from wall-clock stamps
+  the backend puts in its first token);
 * errors by kind (reset, timeout, refused, eof before ``[DONE]``, status);
 * ``/healthz`` latency and misses (no answer within 3 s) from two side probers:
   the worker-like one (every 500 ms) and a dense one (every 50 ms) whose
   samples make p99 meaningful in a short level; misses count at 3 s;
 * CPU of the parent process, of its busiest thread, of each rank process and of
   the clients, and the parent's peak RSS, sampled from /proc twice a second;
-* with py-spy (``--py-spy``, on by default when it is installed), the fraction
-  of time some parent thread held the GIL and where it was (innermost frame);
+* the exact fraction of time some parent thread held the GIL (``gil_exact``:
+  the GIL's ``locked`` flag read from the parent's memory, see gil_sampler.py);
+* with py-spy (``--py-spy``, on by default when it is installed), an upper
+  bound of the same fraction and where the time went (innermost frame);
 * the native transport's ``/debug/stats`` frames-to-chunks ratio, when served;
 * what the simulated ranks produced (their own counters): tokens per second
   while they were busy, their step rate and when they finished, against when the
@@ -59,6 +63,8 @@ import threading
 import time
 import urllib.request
 from typing import Any, Dict, List, Optional
+
+import gil_sampler
 
 HERE = pathlib.Path(__file__).resolve().parent
 CLK_TCK = os.sysconf("SC_CLK_TCK")
@@ -126,7 +132,7 @@ def _error_kind(exc: BaseException) -> str:
 async def _stream(user: int, port: int, body: bytes, t0: float, buckets: Dict[int, float],
                   timeout: float) -> Dict[str, Any]:
     rec: Dict[str, Any] = {"user": user, "ok": False, "chunks": 0, "completion_tokens": 0,
-                           "prompt_tokens": 0, "first": None, "last": None, "error": "",
+                           "prompt_tokens": 0, "first": None, "last": None, "bench_t": None, "error": "",
                            "error_kind": "", "gaps": []}
     writer = None
     chars: Dict[int, int] = {}
@@ -172,6 +178,8 @@ async def _stream(user: int, port: int, body: bytes, t0: float, buckets: Dict[in
                         if rec["last"] is not None:
                             rec["gaps"].append(now - t0 - rec["last"])
                         rec["chunks"] += 1
+                        if rec["first"] is None and "bench_t" in obj:
+                            rec["bench_t"] = [obj["bench_t"][0] - t0, obj["bench_t"][1] - t0]
                         rec["first"] = rec["first"] or now - t0
                         rec["last"] = now - t0
                         key = int((now - t0) / BUCKET_S)
@@ -197,7 +205,9 @@ async def _stream(user: int, port: int, body: bytes, t0: float, buckets: Dict[in
 
 
 def _client_main(users: List[int], n: int, port: int, prompt_chars: int, max_tokens: int, t0: float,
-                 ramp_s: float, timeout: float, out: Any) -> None:
+                 ramp_s: float, timeout: float, out: Any, cpus: Optional[List[int]] = None) -> None:
+    if cpus:
+        os.sched_setaffinity(0, cpus)
     bodies = {u: request_body(u, prompt_chars, max_tokens) for u in users}
 
     async def run() -> Dict[str, Any]:
@@ -433,12 +443,23 @@ def server_command(args: argparse.Namespace, port: int, stats_path: str) -> List
     return cmd
 
 
+def parse_cpus(spec: str) -> Optional[List[int]]:
+    """``"0-7,10"`` -> [0, ..., 7, 10]; '' -> None (no pinning)."""
+    cpus: List[int] = []
+    for part in (p.strip() for p in spec.split(",") if p.strip()):
+        lo, _, hi = part.partition("-")
+        cpus.extend(range(int(lo), int(hi or lo) + 1))
+    return cpus or None
+
+
 def start_server(args: argparse.Namespace, port: int, stats_path: str) -> subprocess.Popen:
     env = dict(os.environ, IK_BACKEND_HTTP=args.transport)
     env["PYTHONPATH"] = os.pathsep.join(x for x in (str(HERE), env.get("PYTHONPATH", "")) if x)
     log = open(stats_path + ".server.log", "w", encoding="utf-8")  # noqa: SIM115
+    cpus = parse_cpus(args.server_cpus)
     proc = subprocess.Popen(server_command(args, port, stats_path), stdout=log, stderr=subprocess.STDOUT,
-                            start_new_session=True, cwd=str(HERE), env=env)
+                            start_new_session=True, cwd=str(HERE), env=env,
+                            preexec_fn=(lambda: os.sched_setaffinity(0, cpus)) if cpus else None)
     deadline = time.time() + 120
     while time.time() < deadline:
         if proc.poll() is not None:
@@ -474,11 +495,12 @@ class GilProfile:
     SERVING_FILES = ("socketserver.py", "http/server.py", "inferencekey/backend/serve.py",
                      "json/encoder.py", "json/__init__.py", "socket.py")
 
-    def __init__(self, binary: str, pid: int, out_path: str, rate: int) -> None:
+    def __init__(self, binary: str, pid: int, out_path: str, rate: int, blocking: bool = False) -> None:
         self.out_path, self.rate = out_path, rate
         self.log = open(out_path + ".log", "w", encoding="utf-8")  # noqa: SIM115
         self.started = time.monotonic()
-        self.proc = subprocess.Popen([binary, "record", "--gil", "--nonblocking", "-r", str(rate), "-p", str(pid),
+        mode = [] if blocking else ["--nonblocking"]
+        self.proc = subprocess.Popen([binary, "record", "--gil", *mode, "-r", str(rate), "-p", str(pid),
                                       "-f", "raw", "-o", out_path], stdout=self.log, stderr=subprocess.STDOUT)
 
     def finish(self) -> Dict[str, Any]:
@@ -513,6 +535,8 @@ class GilProfile:
             "samples": samples,
             "seconds": round(elapsed, 1),
             "serving_leaf_share": round(serving / samples, 3) if samples else 0.0,
+            # Cores spent in serving-layer frames with the GIL held.
+            "serving_cores": round(serving / max(self.rate * elapsed, 1e-9), 3),
             "top_leaves": [[leaf, round(n / samples, 3)] for leaf, n in top] if samples else [],
         }
 
@@ -599,7 +623,7 @@ def run_level(args: argparse.Namespace, n: int, prompt_chars: int) -> Dict[str, 
         clients = [
             ctx.Process(target=_client_main,
                         args=(list(range(i, n, n_clients)), n, port, prompt_chars, args.max_tokens, t0,
-                              args.ramp_s, args.timeout, out))
+                              args.ramp_s, args.timeout, out, parse_cpus(args.client_cpus)))
             for i in range(n_clients)
         ]
         for c in clients:
@@ -611,9 +635,16 @@ def run_level(args: argparse.Namespace, n: int, prompt_chars: int) -> Dict[str, 
         dense = HealthProber(port, interval=0.05)
         prober.start()
         dense.start()
+        gil_stop, gil_out = ctx.Event(), ctx.Queue()
+        gil_proc = ctx.Process(target=gil_sampler.sample_into, args=(server.pid, gil_stop, gil_out))
+        gil_proc.start()
         if args.py_spy:
-            profile = GilProfile(args.py_spy, server.pid, stats_path + ".pyspy.txt", args.py_spy_rate)
+            profile = GilProfile(args.py_spy, server.pid, stats_path + ".pyspy.txt", args.py_spy_rate,
+                                 blocking=args.py_spy_blocking)
         parts = [out.get() for _ in clients]
+        gil_stop.set()
+        gil_buckets = gil_out.get(timeout=30)
+        gil_proc.join()
         gil = profile.finish() if profile else None
         profile = None
         prober.stop.set()
@@ -649,6 +680,19 @@ def run_level(args: argparse.Namespace, n: int, prompt_chars: int) -> Dict[str, 
                   if r["first"] is not None and r["last"] > r["first"]]
     ttft = [r["first"] - r["sent"] for r in ok if r["first"] is not None]
     gaps = [g for r in records for g in r["gaps"]]
+    # Null backend only: the first token's stamps split TTFT into the time before
+    # the backend's generator first ran (connect, accept, parse, admission,
+    # thread, GIL), the backend's own first-yield latency, and the delivery
+    # (push, write, client read). Added TTFT is TTFT minus the backend's part.
+    stamped = [r for r in ok if r["first"] is not None and r["bench_t"]]
+    pre = [r["bench_t"][0] - r["sent"] for r in stamped]
+    # Of that, the client's own share: until its TCP connect completed (the
+    # kernel completes the handshake from the listen backlog, before accept),
+    # which is the client process's event loop when it opens hundreds at once.
+    connect = [r["connected"] - r["sent"] for r in stamped if "connected" in r]
+    own = [r["bench_t"][1] - r["bench_t"][0] for r in stamped]
+    post = [r["first"] - r["bench_t"][1] for r in stamped]
+    added = [(r["first"] - r["sent"]) - (r["bench_t"][1] - r["bench_t"][0]) for r in stamped]
     last_token = max((r["last"] or 0 for r in ok), default=0.0)
     keys = [k for k in sorted(buckets) if 0.1 * last_token <= k * BUCKET_S and (k + 1) * BUCKET_S <= 0.9 * last_token]
     steady = statistics.median([buckets[k] / BUCKET_S for k in keys]) if keys else 0.0
@@ -656,6 +700,14 @@ def run_level(args: argparse.Namespace, n: int, prompt_chars: int) -> Dict[str, 
     window = [s for s in sampler.samples if t_lo <= s["t"] <= t_hi] or sampler.samples
     cpu = {k: statistics.mean(s[k] for s in window) for k in window[0] if k not in ("t", "rss_mb")} if window else {}
     busiest = sampler.busiest_thread(t_lo, t_hi)
+    if isinstance(gil_buckets, dict):
+        gil_exact: Dict[str, Any] = {
+            "held_fraction": gil_sampler.fraction(gil_buckets, t_lo, t_hi),
+            "held_fraction_whole_run": gil_sampler.fraction(gil_buckets, 0.0, float("inf")),
+            "reads": sum(v[1] for v in gil_buckets.values()),
+        }
+    else:
+        gil_exact = {"error": gil_buckets}
     if args.backend == "deepinfer":
         offered = min(n, args.dp * args.max_num_seqs) * args.step_rate * args.tokens_per_step
     else:
@@ -683,6 +735,15 @@ def run_level(args: argparse.Namespace, n: int, prompt_chars: int) -> Dict[str, 
                              "median": round(_pct(per_stream, 0.5), 1), "p90": round(_pct(per_stream, 0.9), 1)},
         "ttft_s": {"median": round(_pct(ttft, 0.5), 3), "p90": round(_pct(ttft, 0.9), 3),
                    "p99": round(_pct(ttft, 0.99), 3), "max": round(max(ttft, default=0.0), 3)},
+        "added_ttft_ms": ({"median": round(1000 * _pct(added, 0.5), 1), "p99": round(1000 * _pct(added, 0.99), 1),
+                           "max": round(1000 * max(added), 1),
+                           "before_backend_p99": round(1000 * _pct(pre, 0.99), 1),
+                           "client_connect_p99": round(1000 * _pct(connect, 0.99), 1),
+                           "server_before_backend_p99": round(1000 * _pct(
+                               [r["bench_t"][0] - r["connected"] for r in stamped if "connected" in r], 0.99), 1),
+                           "backend_own_p99": round(1000 * _pct(own, 0.99), 2),
+                           "delivery_median": round(1000 * _pct(post, 0.5), 2),
+                           "delivery_p99": round(1000 * _pct(post, 0.99), 1)} if stamped else None),
         "gap_ms": {"median": round(1000 * _pct(gaps, 0.5), 1), "p99": round(1000 * _pct(gaps, 0.99), 1),
                    "max": round(1000 * max(gaps, default=0.0), 1)},
         "healthz": prober.summary(),
@@ -697,9 +758,15 @@ def run_level(args: argparse.Namespace, n: int, prompt_chars: int) -> Dict[str, 
         "python_user_cores": round(max(cpu.get("parent", 0.0) - cpu.get("parent_sys", 0.0), 0.0) / 100.0
                                    - busiest.get("native_user_cores", 0.0), 3),
         "rss_mb_max": round(max((s["rss_mb"] for s in sampler.samples), default=0.0), 1),
+        # The GIL's ``locked`` flag read from the server's memory about 1,700
+        # times a second (gil_sampler.py), between the first and the last token.
+        "gil_exact": gil_exact,
         "gil": gil,
         "clients_done_s": round(last_token, 2),
     }
+    if gil and "serving_cores" in gil and cpu.get("parent"):
+        # Gate 2's "serving-layer share of parent CPU".
+        result["serving_share_of_parent_cpu"] = round(gil["serving_cores"] / (cpu["parent"] / 100.0), 3)
     if stats is not None:
         chunks = stats.get("chunks_pushed") or 0
         result["debug_stats"] = stats
@@ -743,6 +810,13 @@ def main() -> None:
     parser.add_argument("--py-spy", default=find_py_spy(),
                         help="py-spy binary for the GIL profile (default: beside python or on PATH); '' turns it off")
     parser.add_argument("--py-spy-rate", type=int, default=100, help="py-spy samples per second")
+    parser.add_argument("--py-spy-blocking", action="store_true",
+                        help="pause the parent at every sample: exact GIL attribution (with the native transport the "
+                             "nonblocking sampler sees almost none of the GIL holders), at a cost in throughput; "
+                             "use a low --py-spy-rate and read only the attribution, not the throughput")
+    parser.add_argument("--server-cpus", default="",
+                        help="pin the backend (and its ranks) to these CPUs, e.g. '0-7' for an 8 vCPU parent")
+    parser.add_argument("--client-cpus", default="", help="pin the client processes to these CPUs, e.g. '8-11'")
     parser.add_argument("--label", default="", help="free text stored in every result line (for example 'burst')")
     parser.add_argument("--out", default="", help="append the results as JSON lines to this file (e.g. results/x.jsonl)")
     args = parser.parse_args()
@@ -756,6 +830,11 @@ def main() -> None:
         if args.label:
             result["label"] = args.label
         result["ramp_s"] = args.ramp_s
+        if args.py_spy_blocking:
+            result["py_spy_blocking"] = True
+            result["py_spy_rate"] = args.py_spy_rate
+        result["server_cpus"] = args.server_cpus
+        result["client_cpus"] = args.client_cpus
         if args.backend == "null":
             result["tok_s"] = args.tok_s
             result["chunk_format"] = args.chunk_format
@@ -767,6 +846,9 @@ def main() -> None:
             result["lockstep"] = not args.no_lockstep
         if args.backend_config:
             result["backend_config"] = json.loads(args.backend_config)
+        knobs = {k: v for k, v in os.environ.items() if k.startswith(("IK_BACKEND_", "IK_SSE_")) and k != "IK_BACKEND_HTTP"}
+        if knobs:
+            result["env_knobs"] = knobs
         print(json.dumps(result), flush=True)
         if args.out:
             with open(args.out, "a", encoding="utf-8") as fh:

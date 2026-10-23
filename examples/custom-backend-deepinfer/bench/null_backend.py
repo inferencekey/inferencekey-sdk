@@ -11,6 +11,11 @@ no tokenizer, no engine: whatever limits a run of this backend is the runtime.
     python -m inferencekey.backend.serve --port N --backend null_backend:NullBackend \\
         --config-json '{"tok_s": 50}'
 
+The first token chunk carries ``bench_t``: ``[t_enter, t_yield]``, the wall
+clock when the runtime first resumed the generator and when it yielded that
+token. ``load.py`` uses them to split the time to first token into the part
+before the backend runs, the backend's own latency and the delivery.
+
 Config keys: ``tok_s`` (50), ``default_tokens`` (256, when the request has no
 ``max_tokens``) and ``chunk_format``: ``"dict"`` (the default) or ``"str"``,
 which yields each chunk already serialized (the runtime passes ``str`` chunks
@@ -72,6 +77,7 @@ class NullBackend(CustomBackend):
             return json.dumps(obj) if self.chunk_format == "str" else obj
 
         interval = 1.0 / self.tok_s if self.tok_s > 0 else 0.0
+        t_enter = time.time()
         start = time.monotonic()
         yield chunk([{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}])
         for i in range(n):
@@ -79,6 +85,14 @@ class NullBackend(CustomBackend):
                 delay = start + i * interval - time.monotonic()
                 if delay > 0:
                     time.sleep(delay)
+            if i == 0:
+                # Wall-clock stamps for load.py: when the runtime first resumed
+                # this generator and when the first token was yielded, so the
+                # time the runtime adds to the first token can be told apart
+                # from the backend's own first-yield latency.
+                yield chunk([{"index": 0, "delta": {"content": "tok "}, "finish_reason": None}],
+                            bench_t=[t_enter, time.time()])
+                continue
             yield chunk([{"index": 0, "delta": {"content": "tok "}, "finish_reason": None}])
         yield chunk([{"index": 0, "delta": {}, "finish_reason": "length"}])
         yield chunk([], usage={"prompt_tokens": 1, "completion_tokens": n, "total_tokens": n + 1})

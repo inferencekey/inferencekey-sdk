@@ -97,6 +97,7 @@ Fields of a result line:
 | `steady_tok_s` | median of the per-second token counts in the middle 80 % of the run (a chunk may carry several tokens; each stream's tokens are spread over its chunks by their length, successful streams only). The baseline harness counted one token per chunk, which was true there, so steady rates before and after are only roughly comparable; compare on `total_tok_s`, the same formula in both. Runs shorter than a few seconds have no steady rate (0). |
 | `per_stream_tok_s` | completion tokens / (last token - first token), p10, median, p90 |
 | `ttft_s` | time to first content token |
+| `added_ttft_ms` | null backend only: the TTFT the runtime adds over the backend's own first-yield latency, from wall-clock stamps the backend puts in its first token (`bench_t`): TTFT minus (first yield - first resume of the generator). `server_before_backend_p99` is the server's part (TCP connect done to generator first resumed), `client_connect_p99` the client's own (its event loop opening hundreds of connections at once), `backend_own_p99` the backend's first-yield latency, `delivery_*` first yield to client read |
 | `cpu_pct_mean` | mean CPU % between the first and the last token: `parent` (the backend process, 100 = one core), each rank, the clients |
 | `ranks_busy_tok_s`, `ranks_steps_per_s` | what the simulated ranks produced while busy, from their own counters (1 s resolution) |
 | `ranks_done_s`, `clients_done_s` | when the ranks produced their last token and when the clients received it; the gap is backlog queued in the parent |
@@ -110,9 +111,12 @@ Fields of a result line:
 | `healthz_dense` | a second prober, every 50 ms with a 3 s timeout, whose 100+ samples per level give a real p50 and p99 (the gate-1 latency). In both, percentiles and `max_ms` count a miss at 3 s (a lower bound of its cost), and `max_answered_ms` is the slowest answered probe |
 | `busiest_thread` | the parent thread with the most CPU over the run, % of one core (from `/proc/<pid>/task`, what `pidstat -t` reads) |
 | `python_user_cores` | user-mode CPU of the parent's Python threads, in cores: an upper bound of the GIL-held fraction |
-| `gil` | `py-spy record --gil --nonblocking` on the parent during the run: `gil_held_fraction` (samples / rate x seconds; without pausing the process py-spy reads the GIL's last holder, so threads that just released it around a socket write or a sleep still count: an upper bound), `serving_leaf_share` (samples whose innermost frame is in `socketserver`, `http.server`, `serve.py`, `json` or `socket`) and the top innermost frames. A blocking py-spy pauses all threads at every sample and halved the throughput at 400 streams, so it is not used. `--py-spy ''` turns it off. |
+| `gil_exact` | the exact fraction of time some parent thread held the GIL, between the first and the last token (`held_fraction`) and over the whole level: `gil_sampler.py` reads the GIL's `locked` flag from the parent's memory (`/proc/<pid>/mem`) about 1,700 times a second without stopping it. This is the gate's GIL-held fraction. |
+| `gil` | `py-spy record --gil --nonblocking` on the parent during the run: `gil_held_fraction` (samples / rate x seconds; without pausing the process py-spy reads the GIL's last holder, so threads that just released it around a socket write or a sleep still count), `serving_leaf_share` (samples whose innermost frame is in `socketserver`, `http.server`, `serve.py`, `json` or `socket`), `serving_cores` (those samples / rate x seconds) and the top innermost frames. On the native transport the nonblocking sampler sees almost none of the GIL holders (0.02 to 0.06 against an exact 0.45 to 0.6), so its attribution there is a handful of samples: `--py-spy-blocking --py-spy-rate 20` pauses the parent at every sample for exact attribution, at a cost in throughput (read only the attribution of such a run). `--py-spy ''` turns it off. |
+| `serving_share_of_parent_cpu` | `gil.serving_cores` / parent cores: gate 2's serving-layer share of parent CPU (meaningful with `--py-spy-blocking`) |
 | `rss_mb_max` | peak RSS of the parent |
-| `frames_per_chunk`, `debug_stats` | native transport only: `/debug/stats` frames written per chunk pushed (coalescing) |
+| `frames_per_chunk`, `debug_stats` | native transport only: `/debug/stats` frames written per chunk pushed (coalescing), and the flusher's `flush_batches` / `flush_wakes` |
+| `server_cpus`, `client_cpus`, `env_knobs` | `--server-cpus 0-7` pins the backend (and its ranks) to those CPUs, `--client-cpus 8-11` the clients; `env_knobs` records any `IK_BACKEND_*` / `IK_SSE_*` setting passed through to the backend |
 
 ## Baseline (2026-10-23, before the fix)
 
@@ -373,6 +377,212 @@ burst of connections is being accepted. These dense-prober rows are the
 Reading the py-spy column: it is an upper bound (see `gil` above), and on this
 harness the serving share includes `json.dumps` of every chunk, which stays in
 Python with the native transport too.
+
+## Native transport gates (2026-10-23, IK-537 T8 and T10)
+
+The same harness with `--transport native` (the Rust HTTP/SSE server of the
+SDK, commit 07db64a, which wakes stream bodies in batches; see "Tuning"
+below), next to the stdlib transport rerun with the same instrumentation.
+One run per row unless it says repeat; same shared 12-vCPU VM (load average
+3 to 5 from other work). Raw lines: `results/gate1-2026-10-23.jsonl` and
+`results/gate2-2026-10-23.jsonl`. Two measurements are new since the baseline
+tables: the GIL-held fraction is now exact (`gil_exact`, read from the
+parent's memory; the py-spy figure is an upper bound on stdlib and close to
+useless on native), and the null backend stamps its first token so the TTFT
+the runtime adds can be separated from the backend's own latency
+(`added_ttft_ms`).
+
+### Gate 1: null backend, 256 tokens at 50 tok/s per stream
+
+Design 9.5 asks for an 8 vCPU box: the backend is pinned to CPUs 0 to 7
+(`--server-cpus 0-7`) and the clients to CPUs 8 to 11, except the row marked
+unpinned. Native at 400 and 800 streams was run three times (burst, burst
+repeat twice).
+
+| Criterion (gate 1) | Target | Native, measured | Verdict |
+| --- | --- | --- | --- |
+| 400 streams delivered | >= 95 % (19,000 tok/s) | 100.0 / 99.6 / 99.9 % (19,994 / 19,921 / 19,973 tok/s) | PASS |
+| 800 streams delivered | >= 90 % (36,000 tok/s) | 100.1 / 99.7 / 100.3 % (40,032 / 39,890 / 40,112 tok/s) | PASS |
+| Connection errors at a burst of 800 | 0 | 0 in every run (stdlib: 0 too, the backlog of 1024 holds) | PASS |
+| `/healthz` dense prober p99 | < 50 ms | 400: 3.7 / 13.7 / 7.5 ms; 800: 31.9 / 4.1 / 6.3 ms (slowest answer 80 ms) | PASS |
+| `/healthz` misses, either prober | 0 | 0 in every native run (stdlib: 1 at 400, 3 + 3 at 800) | PASS |
+| Added TTFT over the backend's first yield, p99 | < 20 ms | burst: 400: 77 / 86 / 110 ms, 800: 275 / 348 / 303 ms; ramp 20 s: 5 to 10 ms at every level | **FAIL at burst** (PASS with a 20 s ramp) |
+| Busiest OS thread | < 85 % of a core | 9 to 12 % (`ik-http-io-N`) | PASS |
+| GIL-held fraction | < 50 % | 400: 0.40 / 0.48 / 0.45; 800: 0.69 / 0.68 / 0.73 | PASS at 400 (margin 2 to 10 points), **FAIL at 800** |
+| Every stream ends with `[DONE]` | 100 % | 100 % in every run | PASS |
+
+Against the stdlib rows of the same table, native turns 90.9 % and 39.3 %
+delivered (400 and 800 burst) into 100 %, first tokens 3.1 s and 9.6 s late
+into 0.08 to 0.35 s, and `/healthz` misses into none.
+
+**Why added TTFT fails at burst.** Nearly all of it is on the server between
+the TCP connect and the backend's generator first running
+(`server_before_backend_p99`: 65 to 80 ms at 400, 245 to 326 ms at 800); the
+backend's own first-yield latency is under 1 ms and the delivery of the first
+token is about 1 ms. Every request start runs Python (`prepare_chat`, the
+`json.loads` of the body, the generator's first resume) under the GIL, so a
+burst of N simultaneous starts is serialized: about 0.1 to 0.15 ms each when
+the GIL is otherwise idle (a burst with a 2 tok/s backend, GIL 3 to 5 %, still
+shows 54 ms at 400 and 100 ms at 800 server side; three bursts in a row on one
+server, with the request threads already spawned, give the same 71 to 93 ms
+at 800, so thread creation is not the cause). At 800 the 40,000 chunks a
+second the earlier streams already push take most of the GIL, and the starts
+wait longer. With arrivals spread over 20 s the same levels add 5 to 6 ms at
+p99. A 20 ms p99 for a simultaneous burst of 400 would need under 50 us of
+GIL time per request start, which no Python request path gets near.
+
+**Why the GIL fails at 800.** 800 streams at 50 tok/s are 40,000 chunks a
+second, and each chunk holds the GIL for about 17 to 20 us. A breakdown with
+the same pacing loop in isolation (exact sampler, `push` vs no `push`):
+about 4 us is the generator thread waking from `time.sleep` and taking the
+GIL, about 12 us is building the chunk dict and `json.dumps` of it (1.9 us
+in a hot loop, but every chunk runs on a different, cache-cold thread), and
+`push` with its pyo3 call is 1 to 3 us after the tuning below (7 to 9 us
+before). `--chunk-format str` (the backend serializes, the runtime passes the
+string through) does not lower it: the `json.dumps` just moves into the
+backend. What is left is per-chunk Python in the backend and in the
+`drive_chat_stream` loop, which the native transport cannot remove; the
+design's phase 2 (chunk helpers formatted in Rust, a batched push API) is the
+lever for it.
+
+| Run | N | OK / errors | Steady tok/s (delivered) | Added TTFT p50 / p99 (ms) [server side p99] | Gap p99 (ms) | Dense healthz p50 / p99 / max answered (misses) | Worker-like misses | Parent CPU % (kernel) | Busiest thread % | GIL held | Frames per chunk |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| native burst | 50 | 50 / 0 | 2,499 (100.0 %) | 5.7 / 12.8 [5.8] | 22.1 | 0.5 / 2.5 / 3.5 (0 of 103) | 0 of 11 | 17 (9) | 2.0 | 0.06 | 0.989 |
+| native burst | 200 | 200 / 0 | 9,999 (100.0 %) | 20.6 / 35.6 [24.6] | 22.5 | 0.5 / 1.9 / 3.7 (0 of 103) | 0 of 11 | 59 (29) | 5.1 | 0.209 | 0.989 |
+| native burst | 400 | 400 / 0 | 19,994 (100.0 %) | 40.2 / 76.5 [65.1] | 23.6 | 0.6 / 3.7 / 7.5 (0 of 105) | 0 of 11 | 123 (64) | 9.2 | 0.402 | 0.988 |
+| native burst | 800 | 800 / 0 | 40,032 (100.1 %) | 104.8 / 274.6 [245.2] | 149.4 | 0.8 / 31.9 / 36.6 (0 of 113) | 0 of 12 | 277 (176) | 12.0 | 0.687 | 0.482 |
+| native ramp | 50 | 50 / 0 | 638 (25.5 %) | 1.1 / 10.0 [3.4] | 22.1 | 0.5 / 2.0 / 3.4 (0 of 494) | 0 of 50 | 5 (3) | 0.8 | 0.016 | 0.991 |
+| native ramp | 200 | 200 / 0 | 2,560 (25.6 %) | 1.3 / 4.9 [2.1] | 22.6 | 0.5 / 1.7 / 4.4 (0 of 500) | 0 of 51 | 16 (8) | 1.5 | 0.047 | 0.99 |
+| native ramp | 400 | 400 / 0 | 5,120 (25.6 %) | 1.3 / 4.8 [2.0] | 22.4 | 0.5 / 2.1 / 9.4 (0 of 501) | 0 of 51 | 29 (15) | 2.4 | 0.091 | 0.99 |
+| native ramp | 800 | 800 / 0 | 10,240 (25.6 %) | 1.5 / 6.1 [2.2] | 23.0 | 0.5 / 1.7 / 8.7 (0 of 501) | 0 of 51 | 56 (29) | 4.3 | 0.176 | 0.99 |
+| stdlib burst | 50 | 50 / 0 | 2,500 (100.0 %) | 11.2 / 16.1 [14.9] | 20.7 | 0.8 / 4.2 / 4.5 (0 of 104) | 0 of 11 | 18 (11) | 0.4 | 0.077 | - |
+| stdlib burst | 200 | 200 / 0 | 9,998 (100.0 %) | 63.4 / 141.6 [137.1] | 21.9 | 1.1 / 8.0 / 114.7 (0 of 105) | 0 of 11 | 85 (49) | 1.0 | 0.29 | - |
+| stdlib burst | 400 | 400 / 0 | 18,180 (90.9 %) | 148.4 / 3109.2 [3094.4] | 72.5 | 1.2 / 3000.0 / 319.2 (1 of 95) | 0 of 13 | 140 (91) | 1.4 | 0.373 | - |
+| stdlib burst | 800 | 800 / 0 | 15,737 (39.3 %) | 2880.2 / 9581.3 [9567.8] | 72.2 | 1.0 / 3000.0 / 878.3 (3 of 105) | 3 of 15 | 153 (99) | 1.5 | 0.412 | - |
+| stdlib ramp | 50 | 50 / 0 | 638 (25.5 %) | 0.8 / 3.2 [1.5] | 20.9 | 0.9 / 2.7 / 8.4 (0 of 494) | 0 of 50 | 6 (2) | 0.5 | 0.028 | - |
+| stdlib ramp | 200 | 200 / 0 | 2,560 (25.6 %) | 1.1 / 5.9 [4.4] | 22.5 | 1.0 / 4.2 / 5.6 (0 of 500) | 0 of 51 | 23 (14) | 0.8 | 0.076 | - |
+| stdlib ramp | 400 | 400 / 0 | 5,120 (25.6 %) | 1.0 / 4.5 [3.0] | 22.2 | 0.9 / 3.3 / 7.7 (0 of 501) | 0 of 51 | 41 (24) | 0.9 | 0.128 | - |
+| stdlib ramp | 800 | 800 / 0 | 10,240 (25.6 %) | 1.0 / 5.3 [4.0] | 22.6 | 1.1 / 4.8 / 11.3 (0 of 501) | 0 of 51 | 77 (47) | 1.2 | 0.235 | - |
+| native burst repeat | 400 | 400 / 0 | 19,921 (99.6 %) | 33.7 / 85.7 [76.0] | 54.5 | 0.8 / 13.7 / 19.0 (0 of 105) | 0 of 11 | 148 (86) | 10.3 | 0.482 | 0.943 |
+| native burst repeat | 800 | 800 / 0 | 39,890 (99.7 %) | 94.5 / 348.1 [325.8] | 139.3 | 0.7 / 4.1 / 53.8 (0 of 111) | 0 of 12 | 267 (164) | 11.7 | 0.675 | 0.519 |
+| native burst repeat | 400 | 400 / 0 | 19,973 (99.9 %) | 63.0 / 109.7 [79.4] | 39.2 | 0.7 / 7.5 / 20.6 (0 of 105) | 0 of 11 | 143 (79) | 10.4 | 0.451 | 0.978 |
+| native burst repeat | 800 | 800 / 0 | 40,112 (100.3 %) | 97.8 / 303.4 [285.2] | 168.1 | 0.9 / 6.3 / 80.4 (0 of 110) | 0 of 12 | 277 (178) | 11.7 | 0.727 | 0.435 |
+| native burst flush tick 0 | 400 | 400 / 0 | 20,025 (100.1 %) | 41.9 / 104.9 [92.6] | 34.9 | 0.7 / 5.4 / 34.1 (0 of 106) | 0 of 11 | 180 (113) | 17.1 | 0.514 | 0.984 |
+| native burst flush tick 0 | 800 | 800 / 0 | 40,156 (100.4 %) | 136.0 / 446.0 [422.0] | 199.7 | 0.8 / 8.7 / 100.8 (0 of 116) | 0 of 12 | 290 (198) | 15.6 | 0.732 | 0.458 |
+| native burst str chunks | 400 | 400 / 0 | 19,983 (99.9 %) | 50.0 / 88.8 [69.5] | 33.3 | 0.7 / 6.4 / 16.9 (0 of 106) | 0 of 11 | 157 (90) | 10.1 | 0.496 | 0.983 |
+| native burst str chunks | 800 | 800 / 0 | 40,048 (100.1 %) | 100.0 / 337.0 [303.5] | 164.0 | 0.8 / 17.9 / 93.8 (0 of 113) | 0 of 12 | 274 (176) | 10.7 | 0.708 | 0.438 |
+| native burst unpinned | 400 | 400 / 0 | 20,006 (100.0 %) | 42.0 / 98.9 [87.0] | 73.7 | 0.7 / 7.9 / 26.8 (0 of 105) | 0 of 11 | 154 (83) | 9.9 | 0.485 | 0.907 |
+| native burst unpinned | 800 | 800 / 0 | 39,858 (99.6 %) | 115.7 / 319.2 [299.2] | 155.7 | 0.9 / 10.7 / 63.8 (0 of 113) | 0 of 12 | 306 (200) | 11.0 | 0.705 | 0.453 |
+
+
+### Tuning (T8)
+
+- **Body wakes (changed).** Each `push` woke its stream's body through the
+  channel; with the IO threads parked that wake is a futex syscall (an IPI on
+  this VM) made while holding the GIL. The server now hands the body's waker to
+  a flusher task that wakes an idle server at once and, while pushes keep
+  coming, wakes the pending bodies in one batch per 1 ms tick from an IO
+  thread (`IK_BACKEND_FLUSH_TICK_US`, default 1000; 0 restores a wake per
+  push). Rows "flush tick 0" against the native burst rows: at 400 streams the
+  GIL goes from 0.51 to 0.40 to 0.48, parent CPU from 180 % to 123 to 148 %,
+  the busiest thread from 17 % to 10 %; at 800 the GIL from 0.73 to 0.68 to
+  0.73 and parent CPU from 290 % to 267 to 277 %. The bytes on the wire are
+  the same (a Python test compares them).
+- **`io_threads` (not changed).** A sweep of 1, 2, 4 and 8 IO threads at 400
+  and 800 streams (before the flusher, unpinned, not saved) left the GIL
+  within noise (0.53 to 0.56 at 400, 0.72 to 0.73 at 800) and only moved the
+  busiest thread: 51 %, 35 %, 18 %, 11 % of a core. The default
+  `min(4, ncpu)` stays.
+- **Channel size and coalesce cap (not changed).** Neither binds here: at
+  50 tok/s a stream's 256-event channel only fills if its client stalls for
+  about 5 s, and frames are 0.9 to 1.0 per chunk at 400 streams (each stream
+  has one event per 20 ms, so there is nothing to coalesce) and 0.44 to 0.52 at
+  800, far below the 64 KiB cap.
+
+### Gate 2: DeepInfer with simulated ranks, native transport and the DeepInfer fix
+
+Unpinned (the ranks need cores of their own), 256 tokens, burst, dp 4,
+`max_num_seqs` 128, real tokenizer unless noted.
+
+| Criterion (gate 2, 400 streams) | Target | Native, measured | Verdict |
+| --- | --- | --- | --- |
+| Throughput within 10 % of the simulated capacity (28,000 tok/s) | >= 25,200 tok/s | steady 28,023 / 28,026 / 27,875 (99.6 to 100.1 %); total_tok_s (whole wall time, ramp-up and tail included) 25,794 / 25,871 / 25,465 (90.9 to 92.4 %) | PASS (fake tokenizer: steady 90.6 % in one run, 100.1 % in the repeat) |
+| Connection errors, healthz misses | 0, 0 | 0, 0 (dense p99 10 to 16 ms; stdlib 685 ms) | PASS |
+| Parent busiest thread | < 85 % of a core | 5.9 / 6.4 / 6.1 % | PASS |
+| Serving-layer share of parent CPU (py-spy) | < 5 % | `socketserver` / `http.server` / socket frames: 0 % (framing and writes are in Rust). The Python that remains per chunk, `serve.py`'s stream driver and `json.dumps` of each chunk, is 9.2 % of parent CPU (blocking py-spy at 20 Hz, 151 samples: driver 13 % and `json` 13 % of GIL samples, GIL held 0.51) | PASS for the frames the design names; **FAIL (9.2 %)** if the runtime's per-chunk Python counts |
+
+The serving share comes from a separate attribution run with a blocking
+py-spy (rows "attribution"): the nonblocking sampler, used everywhere else,
+sees almost none of the GIL holders on native. A blocking sampler pauses the
+parent, so read only the attribution of those two rows, not their throughput.
+Per delivered token, the runtime's serving frames cost about 4 us on native
+against 7 us on stdlib (0.088 cores at 21,800 tok/s against 0.099 cores at
+13,500 tok/s).
+
+**The four configurations** ({stdlib, native} x {DeepInfer fix off, on}, 400
+streams): fix off (the example as of before c722f5c, run from a scratch
+worktree on today's runtime) delivers 1,690 to 1,760 tok/s on stdlib and
+1,540 to 1,625 tok/s on native, with the parent's reader thread at 75 to
+83 % of a core and the GIL held 0.90 to 0.93 of the time, its top frames in
+`transformers` decoding: the transport cannot help while the per-token
+re-decode is there (native only removes the `/healthz` stalls: dense p99
+2 to 5 ms against 41 to 52 ms, slowest answer 8 to 29 ms against up to 2.2 s,
+and stdlib's one miss). Fix on, both
+transports reach the ceiling at 400 streams; native does it with 94 % parent
+CPU instead of 117 %, `/healthz` p99 16 ms instead of 685 ms and first tokens
+p99 0.29 s instead of 0.72 s.
+
+**Capacity** (1,024 tokens, burst): at 140 steps/s and 400 streams native
+delivers steady 54,752 tok/s of 56,000 (97.8 %; stdlib 96.0 %, with
+`/healthz` p99 149 ms and a 612 ms answer); at 200 steps/s and 200 streams
+39,599 of 40,000 (99.0 %); at 210 steps/s and 400 streams 76,357 tok/s
+(90.9 % of 84,000) against stdlib's 59,908 (71.3 %). In that last row the
+simulated ranks themselves only reach 175 steps/s on this VM (about 73,000
+tok/s possible), so native is close to what was produced; stdlib's parent
+falls behind (per stream 156 tok/s against native's 190).
+
+At 800 streams (past the 512-stream ceiling, 288 streams wait in the engine)
+`total_tok_s` is the same on both transports (26,151 / 26,286 native, 26,696
+/ 26,643 stdlib), and on native the clients finish when the ranks do. The
+lower native steady figure (78 % against 89 to 95 %) is the steady window
+(the middle 80 % of a two-phase run) rather than lost tokens; not a gate
+level, recorded for completeness.
+
+
+| Run | N | Step rate | OK / errors | Sim ceiling tok/s | Total tok/s (of ceiling) | Steady tok/s (delivered) | TTFT p99 (s) | Dense healthz p50 / p99 / max answered (misses) | Worker-like misses | Parent CPU % (kernel) | Busiest thread % | GIL held | Serving share of parent CPU |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| native, fix on, real tokenizer | 50 | 70 | 50 / 0 | 3,500 | 3,443 (98.4 %) | 3,493 (99.8 %) | 0.067 | 0.5 / 6.3 / 6.3 (0 of 75) | 0 of 8 | 14 (4) | 1.4 | 0.072 | - |
+| native, fix on, real tokenizer | 200 | 70 | 200 / 0 | 14,000 | 13,487 (96.3 %) | 13,945 (99.6 %) | 0.146 | 0.5 / 8.0 / 8.0 (0 of 77) | 0 of 8 | 51 (18) | 3.7 | 0.259 | - |
+| native, fix on, real tokenizer | 400 | 70 | 400 / 0 | 28,000 | 25,794 (92.1 %) | 28,023 (100.1 %) | 0.29 | 0.6 / 15.9 / 15.9 (0 of 80) | 0 of 8 | 94 (35) | 5.9 | 0.491 | - |
+| native, fix on, real tokenizer | 800 | 70 | 800 / 0 | 35,840 | 26,151 (73.0 %) | 27,890 (77.8 %) | 4.174 | 0.5 / 10.3 / 51.3 (0 of 157) | 0 of 16 | 74 (29) | 5.6 | 0.372 | - |
+| native, fix on, fake tokenizer | 50 | 70 | 50 / 0 | 3,500 | 3,433 (98.1 %) | 3,513 (100.4 %) | 0.078 | 0.5 / 5.1 / 5.1 (0 of 76) | 0 of 8 | 15 (6) | 1.7 | 0.068 | - |
+| native, fix on, fake tokenizer | 200 | 70 | 200 / 0 | 14,000 | 13,230 (94.5 %) | 14,073 (100.5 %) | 0.216 | 0.6 / 3.7 / 3.7 (0 of 78) | 0 of 8 | 50 (18) | 4.0 | 0.257 | - |
+| native, fix on, fake tokenizer | 400 | 70 | 400 / 0 | 28,000 | 24,246 (86.6 %) | 25,379 (90.6 %) | 0.323 | 0.6 / 29.7 / 29.7 (0 of 86) | 0 of 9 | 94 (35) | 5.9 | 0.476 | - |
+| stdlib, fix on, real tokenizer | 50 | 70 | 50 / 0 | 3,500 | 3,438 (98.2 %) | 3,524 (100.7 %) | 0.073 | 0.9 / 6.3 / 6.3 (0 of 76) | 0 of 8 | 16 (6) | 1.4 | 0.088 | - |
+| stdlib, fix on, real tokenizer | 200 | 70 | 200 / 0 | 14,000 | 13,205 (94.3 %) | 14,045 (100.3 %) | 0.224 | 0.9 / 147.1 / 147.1 (0 of 77) | 0 of 8 | 56 (22) | 3.9 | 0.285 | - |
+| stdlib, fix on, real tokenizer | 400 | 70 | 400 / 0 | 28,000 | 23,270 (83.1 %) | 27,961 (99.9 %) | 0.72 | 2.7 / 685.1 / 685.1 (0 of 76) | 0 of 9 | 117 (53) | 6.1 | 0.523 | - |
+| stdlib, fix on, real tokenizer | 800 | 70 | 800 / 0 | 35,840 | 26,696 (74.5 %) | 31,988 (89.3 %) | 4.153 | 1.3 / 145.9 / 2,024.8 (0 of 112) | 0 of 14 | 103 (46) | 6.6 | 0.502 | - |
+| native, fix on, real tokenizer, repeat | 400 | 70 | 400 / 0 | 28,000 | 25,871 (92.4 %) | 28,026 (100.1 %) | 0.298 | 0.6 / 14.9 / 14.9 (0 of 80) | 0 of 8 | 97 (38) | 6.4 | 0.502 | - |
+| native, fix on, real tokenizer, repeat | 400 | 70 | 400 / 0 | 28,000 | 25,465 (90.9 %) | 27,875 (99.6 %) | 0.298 | 0.6 / 10.2 / 10.2 (0 of 82) | 0 of 9 | 93 (35) | 6.1 | 0.487 | - |
+| native capacity 140 steps/s | 400 | 140 | 400 / 0 | 56,000 | 51,591 (92.1 %) | 54,752 (97.8 %) | 0.283 | 0.6 / 3.1 / 7.5 (0 of 160) | 0 of 16 | 105 (38) | 11.2 | 0.561 | - |
+| stdlib capacity 140 steps/s | 400 | 140 | 400 / 0 | 56,000 | 48,317 (86.3 %) | 53,770 (96.0 %) | 0.752 | 4.9 / 149.3 / 612.0 (0 of 157) | 0 of 18 | 127 (55) | 11.5 | 0.6 | - |
+| native capacity 200 steps/s | 200 | 200 | 200 / 0 | 40,000 | 37,493 (93.7 %) | 39,599 (99.0 %) | 0.158 | 0.5 / 7.0 / 7.6 (0 of 109) | 0 of 11 | 57 (19) | 8.7 | 0.312 | - |
+| native capacity 210 steps/s | 400 | 210 | 400 / 0 | 84,000 | 72,860 (86.7 %) | 76,357 (90.9 %) | 0.222 | 0.6 / 8.5 / 14.7 (0 of 113) | 0 of 12 | 114 (41) | 14.8 | 0.623 | - |
+| stdlib capacity 210 steps/s | 400 | 210 | 400 / 0 | 84,000 | 58,718 (69.9 %) | 59,908 (71.3 %) | 1.039 | 8.7 / 57.9 / 926.9 (0 of 122) | 0 of 14 | 131 (56) | 13.9 | 0.644 | - |
+| stdlib, fix off, real tokenizer | 50 | 70 | 50 / 0 | 3,500 | 1,725 (49.3 %) | 1,727 (49.4 %) | 0.073 | 13.1 / 41.1 / 60.8 (0 of 148) | 0 of 15 | 104 (15) | 75.2 | - | - |
+| stdlib, fix off, real tokenizer | 200 | 70 | 200 / 0 | 14,000 | 1,944 (13.9 %) | 1,623 (11.6 %) | 5.346 | 14.5 / 41.2 / 1,765.6 (0 of 492) | 0 of 52 | 110 (16) | 78.4 | - | - |
+| stdlib, fix off, real tokenizer | 400 | 70 | 400 / 0 | 28,000 | 1,689 (6.0 %) | 1,690 (6.0 %) | 40.26 | 16.6 / 51.7 / 2,186.2 (1 of 1104) | 1 of 114 | 107 (17) | 75.0 | - | - |
+| native, fix off, real tokenizer | 50 | 70 | 50 / 0 | 3,500 | 1,873 (53.5 %) | 1,548 (44.2 %) | 0.073 | 0.6 / 4.2 / 24.8 (0 of 137) | 0 of 14 | 105 (13) | 79.4 | - | - |
+| native, fix off, real tokenizer | 200 | 70 | 200 / 0 | 14,000 | 2,002 (14.3 %) | 1,514 (10.8 %) | 0.173 | 0.5 / 2.5 / 7.5 (0 of 510) | 0 of 52 | 110 (14) | 83.1 | - | - |
+| native, fix off, real tokenizer | 400 | 70 | 400 / 0 | 28,000 | 1,902 (6.8 %) | 1,538 (5.5 %) | 0.37 | 0.5 / 4.7 / 29.3 (0 of 1073) | 0 of 108 | 110 (14) | 82.1 | - | - |
+| attribution: native, fix on, blocking py-spy 20 Hz | 400 | 70 | 400 / 0 | 28,000 | 18,499 (66.1 %) | 21,828 (78.0 %) | 0.404 | 5.1 / 150.3 / 296.2 (0 of 410) | 0 of 45 | 96 (52) | 4.7 | 0.508 | 9.2 % |
+| attribution: stdlib, fix on, blocking py-spy 20 Hz | 400 | 70 | 400 / 0 | 28,000 | 21,402 (76.4 %) | 13,466 (48.1 %) | 3.265 | 33.0 / 208.8 / 1,635.7 (0 of 271) | 0 of 37 | 122 (72) | 5.9 | 0.554 | 8.1 % |
+| stdlib, fix off, real tokenizer, GIL measured | 400 | 70 | 400 / 0 | 28,000 | 1,821 (6.5 %) | 1,760 (6.3 %) | 34.606 | 14.5 / 40.7 / 2,077.0 (1 of 1023) | 1 of 106 | 110 (17) | 77.9 | 0.897 | - |
+| native, fix off, real tokenizer, GIL measured | 400 | 70 | 400 / 0 | 28,000 | 1,962 (7.0 %) | 1,625 (5.8 %) | 0.364 | 0.5 / 2.4 / 19.5 (0 of 1042) | 0 of 105 | 110 (14) | 82.8 | 0.929 | - |
+| native, fix on, fake tokenizer, repeat | 400 | 70 | 400 / 0 | 28,000 | 25,388 (90.7 %) | 28,030 (100.1 %) | 0.348 | 0.5 / 7.4 / 7.4 (0 of 81) | 0 of 9 | 86 (31) | 5.9 | 0.453 | - |
+| native, fix on, real tokenizer, repeat | 800 | 70 | 800 / 0 | 35,840 | 26,286 (73.3 %) | 28,254 (78.8 %) | 4.154 | 0.5 / 2.2 / 92.3 (0 of 156) | 0 of 16 | 70 (26) | 5.4 | 0.352 | - |
+| stdlib, fix on, real tokenizer, repeat | 800 | 70 | 800 / 0 | 35,840 | 26,643 (74.3 %) | 33,896 (94.6 %) | 4.03 | 1.1 / 21.8 / 1,687.6 (0 of 122) | 0 of 14 | 95 (41) | 6.0 | 0.473 | - |
+
 
 ### What the simulation does not model
 
