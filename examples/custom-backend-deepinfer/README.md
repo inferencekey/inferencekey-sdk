@@ -115,7 +115,8 @@ context is about 11 s of one rank). With `prefix_cache` on (the default):
   plus `prefix_cache_free_fraction`.
 - Every turn of a conversation goes to the rank that holds its prefix: the
   session is the OpenAI `user` field, or else a hash of the messages up to the
-  first user message. A new session goes to the rank with the least KV in use.
+  first user message. A new session goes to the rank whose active sessions
+  (seen in the last `session_idle_seconds`) add up to the fewest tokens.
 - The ranks tokenize a prompt piece by piece between chat-template markers and
   keep the ids of long pieces, so a warm turn only tokenizes its new pieces
   (the full encode of 1M tokens costs about 3 s of CPU).
@@ -149,6 +150,7 @@ ships DeepInfer built with it (`patches/deepinfer-prefix-cache.patch`, and
 | `prefix_cache_free_fraction` | `0.05` | KV pool kept free by eviction on top of the 10 % prefill watermark. |
 | `session_migrate_inflight` | `4 * max_num_seqs` | A session moves to another rank (one cold turn) only when its rank has this many requests in flight. |
 | `session_table_size` | `100000` | Sessions remembered by the router (LRU). |
+| `session_idle_seconds` | `1800` | A session idle this long no longer counts when new sessions are balanced across ranks. |
 | `tokenizer_cache_tokens` | `64000000` | Token ids of repeated prompt pieces kept per rank. `0` disables. |
 | `stats_interval_seconds` | `2.0` | How often each rank reports its KV and cache counters to the router. |
 | `log_rank_stats_seconds` | `30` | How often the backend logs one line per rank: sessions, requests in flight, KV used, cached blocks, hits, evictions, preemptions. `0` disables. |

@@ -972,10 +972,11 @@ class DeepInferEngine(Engine):
     The open release of DeepInfer ships no load balancer across data-parallel
     replicas; this router is ours. With the prefix cache on (``prefix_cache``,
     default), every turn of a conversation goes to the rank that holds its
-    prefix (a new conversation goes to the rank with the least KV in use), and
-    moves only when that rank already has ``session_migrate_inflight`` requests
-    in flight: a move costs a full cold prefill on the new rank. Without the
-    cache, the rank with the fewest requests in flight wins.
+    prefix (a new conversation goes to the rank whose active sessions add up to
+    the fewest tokens), and moves only when that rank already has
+    ``session_migrate_inflight`` requests in flight: a move costs a full cold
+    prefill on the new rank. Without the cache, the rank with the fewest
+    requests in flight wins.
 
     The work is split so this process (one GIL for every HTTP stream) stays
     cheap: the ranks tokenize prompts, detokenize completions incrementally and
@@ -1068,13 +1069,15 @@ class DeepInferEngine(Engine):
         self._owner: Dict[str, int] = {}
         self._in_flight = [0] * dp
         self._affinity = bool(config.get("prefix_cache", True))
-        self._sessions: "OrderedDict[str, int]" = OrderedDict()  # session key -> rank, LRU
+        # session key -> [rank, estimated tokens of its last prompt, last seen], LRU
+        self._sessions: "OrderedDict[str, list]" = OrderedDict()
+        self._session_idle = float(config.get("session_idle_seconds", 1800))
+        self._weights: List[float] = [0.0] * dp
+        self._weights_at = 0.0
         self._max_sessions = int(config.get("session_table_size", 100_000))
         self._migrate_at = int(config.get("session_migrate_inflight", 4 * int(settings["llm_kwargs"]["max_num_seqs"])))
-        self._used_blocks = [0] * dp  # from the ranks' stats messages
         self._log_stats_every = float(config.get("log_rank_stats_seconds", 30.0))
         self._next_stats_log = time.monotonic() + self._log_stats_every
-        self._assigned = [0] * dp  # estimated prompt blocks routed since the last stats message
         self.rank_stats: List[Dict[str, Any]] = [{} for _ in range(dp)]
         self.migrations = 0
         self._lock = threading.Lock()
@@ -1183,22 +1186,41 @@ class DeepInferEngine(Engine):
         if not self._affinity:
             return min(ranks, key=lambda r: self._in_flight[r])
         key = request.session_key
+        now = time.monotonic()
+        tokens = len(request.prompt) // 3  # prompt characters / 3: a rough token count
         if key is not None:
-            rank = self._sessions.get(key)
-            if rank is not None:
+            entry = self._sessions.get(key)
+            if entry is not None:
+                rank = entry[0]
                 if self._in_flight[rank] < self._migrate_at:
+                    entry[1], entry[2] = tokens, now
                     self._sessions.move_to_end(key)
                     return rank
                 self.migrations += 1
-        # Prompt characters / 3: a rough token count, refined by the next stats message.
-        rank = min(ranks, key=lambda r: (self._used_blocks[r] + self._assigned[r], self._in_flight[r]))
-        self._assigned[rank] += len(request.prompt) // 3 // BLOCK + 1
+        # A new session goes to the rank whose active sessions add up to the
+        # fewest tokens. Not to the rank with the least KV in use: a rank that
+        # thrashes evicts its cache, looks free, and would get still more.
+        weights = self._rank_weights(now)
+        rank = min(ranks, key=lambda r: (weights[r], self._in_flight[r]))
+        weights[rank] += tokens  # until the next recount
         if key is not None:
-            self._sessions[key] = rank
+            self._sessions[key] = [rank, tokens, now]
             self._sessions.move_to_end(key)
             while len(self._sessions) > self._max_sessions:
                 self._sessions.popitem(last=False)
         return rank
+
+    def _rank_weights(self, now: float) -> List[float]:
+        """Tokens of the sessions seen in the last session_idle_seconds, per rank
+        (recounted at most once a second)."""
+        if now - self._weights_at > 1.0:
+            weights = [0.0] * len(self._in_flight)
+            idle = self._session_idle
+            for rank, tokens, seen in self._sessions.values():
+                if now - seen < idle:
+                    weights[rank] += tokens
+            self._weights, self._weights_at = weights, now
+        return self._weights
 
     def _read_results(self) -> None:
         streams = self._streams
@@ -1223,8 +1245,6 @@ class DeepInferEngine(Engine):
                     rank, info = message[1], message[2]
                     with self._lock:
                         self.rank_stats[rank] = info
-                        self._used_blocks[rank] = int(info.get("total_blocks", 0)) - int(info.get("free_blocks", 0))
-                        self._assigned[rank] = 0
                     if self._log_stats_every and now >= self._next_stats_log:
                         self._next_stats_log = now + self._log_stats_every
                         self._log_rank_stats()
@@ -1253,8 +1273,10 @@ class DeepInferEngine(Engine):
         """One line per rank: what the router and the prefix cache see (for diagnosis)."""
         with self._lock:
             sessions = [0] * len(self._in_flight)
-            for rank in self._sessions.values():
-                sessions[rank] += 1
+            now = time.monotonic()
+            for rank, _, seen in self._sessions.values():
+                if now - seen < self._session_idle:
+                    sessions[rank] += 1
             rows = list(zip(self.rank_stats, self._in_flight, sessions))
             migrations = self.migrations
         for info, in_flight, owned in rows:
