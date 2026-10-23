@@ -106,7 +106,8 @@ Fields of a result line:
 | `done_pct` | streams that ended with `[DONE]` and no error event |
 | `offered_tok_s`, `delivered_pct` | what the backend can produce with every stream open at once (null: N x `--tok-s`; DeepInfer: the sim ceiling) and `steady_tok_s` as a share of it. With `--ramp-s` the streams are not all open at once, so the share is arrival-bound there. |
 | `per_stream_tok_s.p5`, `ttft_s.p99`, `gap_ms` | slowest streams, slowest first tokens, and the gap between consecutive content chunks of a stream (median, p99, max) |
-| `healthz` | the side prober: GET `/healthz` every 500 ms with a 3 s timeout, like the worker; latency p50, p99 and max, and misses (no answer in 3 s, a connection error, or a status other than 200 and 503) |
+| `healthz` | the worker-like side prober: GET `/healthz` every 500 ms with a 3 s timeout, like the worker; its `misses` (no answer in 3 s, a connection error, or a status other than 200 and 503) are what the worker would count. A burst level lasts only 5 to 7 s, so its 11 to 15 samples make p99 the maximum. |
+| `healthz_dense` | a second prober, every 50 ms with a 3 s timeout, whose 100+ samples per level give a real p50 and p99 (the gate-1 latency). In both, percentiles and `max_ms` count a miss at 3 s (a lower bound of its cost), and `max_answered_ms` is the slowest answered probe |
 | `busiest_thread` | the parent thread with the most CPU over the run, % of one core (from `/proc/<pid>/task`, what `pidstat -t` reads) |
 | `python_user_cores` | user-mode CPU of the parent's Python threads, in cores: an upper bound of the GIL-held fraction |
 | `gil` | `py-spy record --gil --nonblocking` on the parent during the run: `gil_held_fraction` (samples / rate x seconds; without pausing the process py-spy reads the GIL's last holder, so threads that just released it around a socket write or a sleep still count: an upper bound), `serving_leaf_share` (samples whose innermost frame is in `socketserver`, `http.server`, `serve.py`, `json` or `socket`) and the top innermost frames. A blocking py-spy pauses all threads at every sample and halved the throughput at 400 streams, so it is not used. `--py-spy ''` turns it off. |
@@ -340,6 +341,34 @@ At 800 streams (past the 512-stream ceiling, so 288 wait in the engine) the
 burst of connections pushes `/healthz` past one second and first tokens past
 4 s. These are the numbers the native transport has to beat; the gates are
 measured on the same harness with `--transport native`.
+
+### `/healthz` with a dense prober (rerun of the burst rows)
+
+The tables above come from the worker-like prober alone: 8 to 16 samples
+per burst level, so p99 is the maximum, and its misses were left out of the
+latency figures (the 809 ms "max" at 800 streams hid 3 probes of 3 s or
+more). `load.py` now runs a second prober every 50 ms and counts every miss
+at the 3 s timeout (`healthz_dense`, and `max_answered_ms` for the slowest
+answer). The burst rows were rerun on stdlib with both probers; delivered
+throughput and TTFT came out within run-to-run noise of the tables above.
+Raw lines: `results/serving-baseline-healthz-2026-10-23.jsonl`. Latencies in
+ms; misses / probes.
+
+| Bench | N | Delivered | TTFT p99 (s) | Worker prober p50 / max answered (misses) | Dense prober p50 / p99 / max answered (misses) |
+| --- | --- | --- | --- | --- | --- |
+| A null | 50 | 100 % | 0.020 | 0.9 / 2.0 (0 of 11) | 0.8 / 1.8 / 1.8 (0 of 104) |
+| A null | 200 | 100 % | 0.119 | 1.1 / 2.6 (0 of 11) | 1.0 / 3.1 / 94 (0 of 105) |
+| A null | 400 | 89 % | 3.03 | 2.0 / 2,714 (0 of 13) | 1.0 / **3,000** / 153 (**1 of 99**) |
+| A null | 800 | 43 % | 8.95 | 1.8 / 2,879 (**2 of 14**) | 0.9 / **3,000** / 324 (**3 of 104**) |
+| B DeepInfer, real tokenizer | 400 | 100 % | 0.447 | 1.3 / 5.2 (0 of 9) | 1.5 / **375** / 375 (0 of 76) |
+| B DeepInfer, real tokenizer | 800 | 93 % | 4.08 | 2.0 / 1,571 (0 of 14) | 1.0 / 44 / 2,020 (0 of 116) |
+
+So on stdlib `/healthz` fails gate 1 (p99 under 50 ms, no probe over 3 s)
+at 400 and 800 null-backend streams, and DeepInfer at 400 streams has a p99
+of 375 ms that the worker-like prober never saw. The median stays near 1 ms:
+most probes are fast, and the slow ones are those that arrive while the
+burst of connections is being accepted. These dense-prober rows are the
+`/healthz` baseline for T8 and T10.
 
 Reading the py-spy column: it is an upper bound (see `gil` above), and on this
 harness the serving share includes `json.dumps` of every chunk, which stays in

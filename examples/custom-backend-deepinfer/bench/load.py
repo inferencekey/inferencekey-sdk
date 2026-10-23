@@ -18,7 +18,9 @@ bottleneck), probes ``/healthz`` on the side like the worker does (every
   (from the moment that stream connects) and the gap between consecutive
   content chunks;
 * errors by kind (reset, timeout, refused, eof before ``[DONE]``, status);
-* ``/healthz`` latency (p50, p99, max) and misses (no answer within 3 s);
+* ``/healthz`` latency and misses (no answer within 3 s) from two side probers:
+  the worker-like one (every 500 ms) and a dense one (every 50 ms) whose
+  samples make p99 meaningful in a short level; misses count at 3 s;
 * CPU of the parent process, of its busiest thread, of each rank process and of
   the clients, and the parent's peak RSS, sampled from /proc twice a second;
 * with py-spy (``--py-spy``, on by default when it is installed), the fraction
@@ -342,10 +344,15 @@ class CpuSampler(threading.Thread):
 
 
 class HealthProber(threading.Thread):
-    """GET /healthz every 0.5 s with a 3 s timeout, like the worker's readiness and liveness checks.
+    """GET /healthz every ``interval`` seconds with a ``timeout``.
 
-    A miss is what the worker counts as one: no answer within 3 s, a connection
-    error, or a status other than 200 and 503.
+    With the defaults (0.5 s, 3 s) it probes like the worker's readiness and
+    liveness checks, and its misses are what the worker would count. The dense
+    prober (0.05 s) takes enough samples in a 5 to 7 s burst level for a p99
+    that is not just the maximum. A miss is no answer within the timeout, a
+    connection error, or a status other than 200 and 503. Percentiles and
+    ``max_ms`` count every miss at the timeout value (a lower bound of what it
+    cost); ``max_answered_ms`` is the slowest probe that did get an answer.
     """
 
     def __init__(self, port: int, interval: float = 0.5, timeout: float = 3.0) -> None:
@@ -374,10 +381,13 @@ class HealthProber(threading.Thread):
             self.stop.wait(max(self.interval - (time.monotonic() - started), 0.0))
 
     def summary(self) -> Dict[str, Any]:
-        ms = [x * 1000.0 for x in self.latencies]
-        return {"probes": len(ms) + self.misses, "misses": self.misses,
+        answered = [x * 1000.0 for x in self.latencies]
+        ms = answered + [self.timeout * 1000.0] * self.misses
+        return {"interval_ms": round(self.interval * 1000.0), "timeout_ms": round(self.timeout * 1000.0),
+                "probes": len(ms), "misses": self.misses,
                 "p50_ms": round(_pct(ms, 0.5), 1), "p99_ms": round(_pct(ms, 0.99), 1),
-                "max_ms": round(max(ms, default=0.0), 1)}
+                "max_ms": round(max(ms, default=0.0), 1),
+                "max_answered_ms": round(max(answered, default=0.0), 1)}
 
 
 TRANSPORT_LINE = re.compile(r"^http transport: (\w+)(.*)$", re.MULTILINE)
@@ -598,18 +608,22 @@ def run_level(args: argparse.Namespace, n: int, prompt_chars: int) -> Dict[str, 
         sampler.start()
         time.sleep(max(t0 - time.time(), 0))
         prober = HealthProber(port)
+        dense = HealthProber(port, interval=0.05)
         prober.start()
+        dense.start()
         if args.py_spy:
             profile = GilProfile(args.py_spy, server.pid, stats_path + ".pyspy.txt", args.py_spy_rate)
         parts = [out.get() for _ in clients]
         gil = profile.finish() if profile else None
         profile = None
         prober.stop.set()
+        dense.stop.set()
         for c in clients:
             c.join()
         sampler.stop.set()
         sampler.join()
         prober.join()
+        dense.join()
         stats = debug_stats(port)
         records = [r for p in parts for r in p["records"]]
         buckets: Dict[int, float] = {}
@@ -672,6 +686,7 @@ def run_level(args: argparse.Namespace, n: int, prompt_chars: int) -> Dict[str, 
         "gap_ms": {"median": round(1000 * _pct(gaps, 0.5), 1), "p99": round(1000 * _pct(gaps, 0.99), 1),
                    "max": round(1000 * max(gaps, default=0.0), 1)},
         "healthz": prober.summary(),
+        "healthz_dense": dense.summary(),
         "cpu_pct_mean": {k: round(v, 1) for k, v in cpu.items()},
         "cpu_pct_parent_max": round(max((s["parent"] for s in window), default=0.0), 1),
         "busiest_thread": busiest,
