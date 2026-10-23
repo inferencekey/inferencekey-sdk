@@ -376,6 +376,24 @@ def _rank_devices(visible: List[str], rank: int, cp_size: int) -> List[str]:
     return visible[start : start + cp_size]
 
 
+def _die_with_parent() -> None:
+    """Ask Linux to SIGKILL this process when its parent dies.
+
+    The ranks are separate processes holding GPU memory; when the backend
+    process goes away without stopping them (killed, or restarted by the
+    worker), orphaned ranks would keep their GPUs. The rank loop also checks
+    its parent between steps, for platforms without prctl.
+    """
+    try:
+        import ctypes  # noqa: PLC0415
+        import signal  # noqa: PLC0415
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(1, int(signal.SIGKILL), 0, 0, 0)  # PR_SET_PDEATHSIG
+    except Exception:  # noqa: BLE001 (best effort; the loop check remains)
+        pass
+
+
 def _rank_main(
     rank: int,
     settings: Dict[str, Any],
@@ -383,6 +401,7 @@ def _rank_main(
     results: Any,
 ) -> None:
     """One data-parallel rank: build an LLM, then loop in lockstep with the others."""
+    _die_with_parent()
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(settings["devices"][rank])
     os.environ.update(settings["env"])
 
@@ -699,6 +718,8 @@ def _rank_loop(
         tokenized.append((request_id, token_array(ids), params, None, hashes))
 
     results.put(("ready", rank, None))
+    parent = os.getppid()
+    next_parent_check = time.monotonic() + 1.0
     pending_flush = False
     try:
         while True:
@@ -767,6 +788,11 @@ def _rank_loop(
                 else:
                     items.append((request_id, "", 0, 0, True, *error))
 
+            if time.monotonic() >= next_parent_check:
+                next_parent_check = time.monotonic() + 1.0
+                if os.getppid() != parent:
+                    print(f"deepinfer rank {rank}: the backend process is gone; exiting", file=sys.stderr, flush=True)
+                    return
             if stuck_after and time.monotonic() >= next_stuck_check:
                 next_stuck_check = time.monotonic() + 10.0
                 _warn_stuck(rank, live, tokenizing, stuck_after)

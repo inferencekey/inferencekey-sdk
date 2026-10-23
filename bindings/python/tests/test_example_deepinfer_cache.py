@@ -328,3 +328,39 @@ def test_a_rejected_prefix_admission_runs_the_request_cold() -> None:
     assert cached == 0 and prompt_len == 2300
     assert not cache.index.protected
     requests.put(None)
+
+
+def test_a_rank_dies_with_its_backend_process(tmp_path) -> None:
+    """A killed backend must not leave ranks holding GPUs (orphans seen on the B200 run)."""
+    import os
+    import signal
+    import subprocess
+
+    script = tmp_path / "parent.py"
+    script.write_text(
+        "import multiprocessing as mp, sys, time\n"
+        f"sys.path.insert(0, {str(_EXAMPLE_DIR)!r})\n"
+        "import deepinfer_engines as de\n"
+        "def rank():\n"
+        "    de._die_with_parent()\n"
+        "    time.sleep(120)\n"
+        "if __name__ == '__main__':\n"
+        "    p = mp.get_context('spawn').Process(target=rank)\n"
+        "    p.start()\n"
+        "    print(p.pid, flush=True)\n"
+        "    time.sleep(120)\n"
+    )
+    parent = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True)
+    child = int(parent.stdout.readline())
+    time.sleep(1.0)  # let the child install its death signal
+    os.kill(parent.pid, signal.SIGKILL)
+    parent.wait(5)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    os.kill(child, signal.SIGKILL)
+    pytest.fail("the rank outlived its parent")
