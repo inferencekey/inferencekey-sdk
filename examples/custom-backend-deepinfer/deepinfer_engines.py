@@ -64,11 +64,13 @@ import itertools
 import json
 import os
 import queue
+import re
 import site
 import sys
 import threading
 import time
 import traceback
+from array import array
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -427,6 +429,73 @@ def _rank_main(
         llm.close()
 
 
+#: Chat-template markers of DeepSeek-V4.1 prompts. They are added tokens, which
+#: the tokenizer splits out before anything else, so encoding the text between
+#: them piece by piece gives exactly the ids of encoding the whole prompt.
+_SEGMENT_MARKERS = ("<｜begin▁of▁sentence｜>", "<｜User｜>", "<｜Assistant｜>", "<｜end▁of▁sentence｜>",
+                    "<think>", "</think>")
+
+
+class SegmentTokenizer:
+    """Encodes a prompt piece by piece between chat-template markers, keeping the
+    ids of long pieces.
+
+    A coding agent resends its whole conversation every turn; with a 1M-token
+    context that is about 3 s of tokenizer CPU per request. Every turn repeats
+    the pieces of the previous one (the system prompt and repository context,
+    earlier turns), so with this cache only the new pieces are encoded. Used only
+    when the markers are added tokens of the tokenizer (DeepSeek-V4.1's are),
+    which is what makes the piecewise result identical to a full encode.
+    Thread-safe (the rank tokenizes on a few threads).
+    """
+
+    MIN_CACHED_CHARS = 4096
+
+    def __init__(self, tokenizer: Any, max_tokens: int) -> None:
+        self.tokenizer = tokenizer
+        self.max_tokens = max_tokens
+        added = set(getattr(tokenizer, "get_added_vocab", lambda: {})())
+        markers = [m for m in _SEGMENT_MARKERS if m in added]
+        self.enabled = bool(markers) and max_tokens > 0
+        self.split = re.compile("(?=" + "|".join(re.escape(m) for m in markers) + ")") if markers else None
+        self.cache: "OrderedDict[bytes, array]" = OrderedDict()
+        self.cached_tokens = 0
+        self.lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    def encode(self, prompt: str) -> Any:
+        """The prompt's ids: a list, or for long prompts an ``array("i")`` (a 1M-token
+        list of Python ints would cost about 36 MB)."""
+        encode = self.tokenizer.encode
+        if not self.enabled or len(prompt) < 4 * self.MIN_CACHED_CHARS:
+            return encode(prompt, add_special_tokens=False)
+        ids = array("i")
+        for piece in self.split.split(prompt):
+            if len(piece) < self.MIN_CACHED_CHARS:
+                if piece:
+                    ids.extend(encode(piece, add_special_tokens=False))
+                continue
+            key = hashlib.blake2b(piece.encode("utf-8"), digest_size=16).digest()
+            with self.lock:
+                hit = self.cache.get(key)
+                if hit is not None:
+                    self.cache.move_to_end(key)
+                    self.hits += 1
+            if hit is None:
+                hit = array("i", encode(piece, add_special_tokens=False))
+                with self.lock:
+                    self.misses += 1
+                    if key not in self.cache:
+                        self.cache[key] = hit
+                        self.cached_tokens += len(hit)
+                        while self.cached_tokens > self.max_tokens and self.cache:
+                            _, old = self.cache.popitem(last=False)
+                            self.cached_tokens -= len(old)
+            ids.extend(hit)
+        return ids
+
+
 class _RankCache:
     """The GPU prefix cache of one rank: a :class:`PrefixIndex` and the engine calls around it.
 
@@ -581,6 +650,7 @@ def _rank_loop(
     are detokenized here, incrementally, per request.
     """
     new_detokenizer = detokenizer_factory(tokenizer)
+    segments = SegmentTokenizer(tokenizer, int(settings.get("tokenizer_cache_tokens", 64_000_000)))
     idle_sleep = float(settings["idle_poll_seconds"])
     stats_every = float(settings.get("stats_interval_seconds", 2.0))
     next_stats = time.monotonic()
@@ -597,7 +667,7 @@ def _rank_loop(
         try:
             # The encoded prompt starts with the BOS text already; the release
             # tokenizer would add a second BOS id otherwise.
-            ids = tokenizer.encode(prompt, add_special_tokens=False)
+            ids = segments.encode(prompt)
         except Exception as exc:  # noqa: BLE001 (report it on the request)
             tokenized.append((request_id, None, params, (f"tokenization failed: {exc}", None), []))
             return
@@ -702,7 +772,7 @@ def _rank_loop(
                     results.put(("out", rank, items))
                 if cache is not None and time.monotonic() >= next_stats:
                     next_stats = time.monotonic() + stats_every
-                    results.put(("stats", rank, cache.stats()))
+                    results.put(("stats", rank, {**cache.stats(), "tokenizer_cache_hits": segments.hits, "tokenizer_cache_misses": segments.misses}))
                 time.sleep(idle_sleep)
                 continue
 
@@ -718,7 +788,7 @@ def _rank_loop(
                         cache.forget(item[0])  # finished or failed: no-op once finalize ran
                 if time.monotonic() >= next_stats:
                     next_stats = time.monotonic() + stats_every
-                    results.put(("stats", rank, cache.stats()))
+                    results.put(("stats", rank, {**cache.stats(), "tokenizer_cache_hits": segments.hits, "tokenizer_cache_misses": segments.misses}))
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 
@@ -894,6 +964,7 @@ class DeepInferEngine(Engine):
             "tokenizer_threads": int(config.get("tokenizer_threads", 2)),
             "abort_on_disconnect": bool(config.get("abort_on_disconnect", True)),
             "prefix_cache": bool(config.get("prefix_cache", True)),
+            "tokenizer_cache_tokens": int(config.get("tokenizer_cache_tokens", 64_000_000)),
             "prefix_cache_free_fraction": float(config.get("prefix_cache_free_fraction", 0.05)),
             "stats_interval_seconds": float(config.get("stats_interval_seconds", 2.0)),
             "llm_kwargs": {

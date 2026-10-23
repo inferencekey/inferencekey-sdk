@@ -187,6 +187,46 @@ def test_aborted_request_releases_its_protection_and_blocks() -> None:
     requests.put(None)
 
 
+class MarkerTokenizer(CharTokenizer):
+    """Char-level, with the chat-template markers as added tokens (one id each)."""
+
+    MARKERS = ("<｜User｜>", "<｜Assistant｜>")
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def get_added_vocab(self):
+        return {m: 4000 + i for i, m in enumerate(self.MARKERS)}
+
+    def encode(self, text: str, add_special_tokens: bool = True):
+        self.calls += len(text)
+        out, i = [], 0
+        while i < len(text):
+            marker = next((m for m in self.MARKERS if text.startswith(m, i)), None)
+            if marker:
+                out.append(self.get_added_vocab()[marker])
+                i += len(marker)
+            else:
+                out.append(ord(text[i]) % 4000)
+                i += 1
+        return out
+
+
+def test_segment_tokenizer_matches_a_full_encode_and_reuses_long_pieces() -> None:
+    tok = MarkerTokenizer()
+    seg = de.SegmentTokenizer(tok, max_tokens=10**6)
+    assert seg.enabled
+    turn1 = "<｜User｜>" + "c" * 20000 + "<｜Assistant｜>answer"
+    turn2 = turn1 + "<｜User｜>" + "n" * 5000 + "<｜Assistant｜>"
+    assert list(seg.encode(turn1)) == tok.encode(turn1)
+    tok.calls = 0
+    assert list(seg.encode(turn2)) == tok.encode(turn2)
+    reference = tok.calls // 2  # the line above encoded turn2 once more in full
+    assert seg.hits == 1 and reference > 0
+    # Without added markers (e.g. the bench's fake tokenizer) it is a plain encode.
+    assert not de.SegmentTokenizer(CharTokenizer(), max_tokens=10**6).enabled
+
+
 # --- the parent: session routing ---------------------------------------------------
 
 
