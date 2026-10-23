@@ -133,6 +133,9 @@ class StreamSplitter:
 
     def _longest_prefix_tail(self, stops: List[str]) -> int:
         """Length of the longest end of the pending text that starts any stop marker."""
+        tail = self._pending[1 - max(len(stop) for stop in stops) :]
+        if not any(stop[0] in tail for stop in stops):
+            return 0  # the common case: no "<" or newline near the end
         best = 0
         for stop in stops:
             for n in range(min(len(stop) - 1, len(self._pending)), 0, -1):
@@ -199,16 +202,16 @@ class DeepInferBackend(CustomBackend):
             return {**base, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
         yield chunk({"role": "assistant", "content": ""})
-        text = ""
+        parts: List[str] = []
         last = GenEvent()
         for event in self.engine.generate(gen):
             if event.error:
                 raise RuntimeError(f"DeepInfer failed: {event.error}")
-            text += event.text
+            parts.append(event.text)
             last = event
             for delta in splitter.feed(event.text):
                 yield chunk(delta)
-        message, finish_reason = self._parse(text, request)
+        message, finish_reason = self._parse("".join(parts), request)
         for index, call in enumerate(message.get("tool_calls") or []):
             yield chunk({"tool_calls": [{"index": index, **call}]})
         yield chunk({}, finish_reason)
