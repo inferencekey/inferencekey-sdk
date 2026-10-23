@@ -80,8 +80,16 @@ class EndlessStreamBackend(ToolChatBackend):
     """Streams until the client goes away; records that its generator was closed."""
 
     closed = threading.Event()
+    # Strong references to every generator handed out, so ``closed`` is set
+    # only by an explicit close from the runtime, not by garbage collection.
+    generators: list = []
 
     def chat_stream(self, request):
+        gen = self._stream()
+        EndlessStreamBackend.generators.append(gen)
+        return gen
+
+    def _stream(self):
         try:
             while True:
                 yield {"object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "x"}, "finish_reason": None}]}
@@ -261,6 +269,7 @@ def test_server_listens_with_a_large_backlog_and_daemon_threads(server) -> None:
 
 def test_client_disconnect_closes_the_backend_stream(server) -> None:
     EndlessStreamBackend.closed.clear()
+    EndlessStreamBackend.generators.clear()
     port = server(EndlessStreamBackend)
     body = json.dumps({"stream": True, "messages": [{"role": "user", "content": "x"}]}).encode()
     s = socket.create_connection(("127.0.0.1", port), timeout=5)

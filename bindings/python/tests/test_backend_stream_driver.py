@@ -31,12 +31,18 @@ CHUNK = {"choices": [{"index": 0, "delta": {"content": "x"}, "finish_reason": No
 
 
 class ScriptedBackend(CustomBackend):
-    """Streams whatever ``request["script"]`` names; records generator close."""
+    """Streams whatever ``request["script"]`` names; records generator close.
+
+    It keeps a strong reference to every generator it returns, so the
+    ``finally`` that sets ``closed`` runs only when the runtime closes the
+    generator itself, never because the last reference went away.
+    """
 
     name = "scripted"
 
     def __init__(self) -> None:
         self.closed = threading.Event()
+        self.generators: List[Any] = []
 
     def setup(self, ctx: BackendContext) -> None:
         pass
@@ -61,7 +67,9 @@ class ScriptedBackend(CustomBackend):
             raise RuntimeError("no GPU")
         if script == "empty":
             return iter(())
-        return self._stream(script)
+        gen = self._stream(script)
+        self.generators.append(gen)
+        return gen
 
     def _stream(self, script):
         try:
@@ -74,6 +82,12 @@ class ScriptedBackend(CustomBackend):
             elif script == "fail_midway":
                 yield CHUNK
                 raise RuntimeError("lost the GPU")
+            elif script == "fail_oserror":
+                yield CHUNK
+                raise OSError("disk")
+            elif script == "multiline":
+                yield CHUNK
+                yield '{"choices": [\n]}'
             elif script == "endless":
                 while True:
                     yield CHUNK
@@ -139,6 +153,10 @@ def test_content_length_rules() -> None:
     assert serve_mod.content_length("-1") == too_large
     assert serve_mod.content_length(str(16 * 1024 * 1024 + 1)) == too_large
     assert serve_mod.content_length(str(16 * 1024 * 1024)) == (16 * 1024 * 1024, None)
+    assert serve_mod.content_length("0") == (0, None)
+    invalid = (0, (400, b'{"error": "invalid Content-Length"}'))
+    for header in ("+5", " 5", "5 ", "1_0", "\u0665", "", "-", "0x10", "5.0"):
+        assert serve_mod.content_length(header) == invalid, header
 
 
 def test_process_and_forecast_map_errors_to_status_codes() -> None:
@@ -223,6 +241,32 @@ def test_mid_stream_failure_sends_an_error_event_then_done() -> None:
     assert backend.closed.is_set()
 
 
+def test_an_oserror_from_the_backend_is_an_error_event_not_a_disconnect() -> None:
+    backend, state = _state()
+    out = RecordingOut()
+    serve_mod.drive_chat_stream(state, {"messages": MESSAGES, "script": "fail_oserror"}, out)
+    assert out.calls == [
+        ("start", None),
+        ("push", json.dumps(CHUNK).encode()),
+        ("push", b'{"error": {"message": "disk", "type": "server_error"}}'),
+        ("done", None),
+    ]
+    assert backend.closed.is_set()
+
+
+def test_a_multi_line_pre_serialized_chunk_ends_the_stream_with_an_error_event() -> None:
+    backend, state = _state()
+    out = RecordingOut()
+    serve_mod.drive_chat_stream(state, {"messages": MESSAGES, "script": "multiline"}, out)
+    assert out.calls == [
+        ("start", None),
+        ("push", json.dumps(CHUNK).encode()),
+        ("push", b'{"error": {"message": "pre-serialized chunk must be one line of JSON", "type": "server_error"}}'),
+        ("done", None),
+    ]
+    assert backend.closed.is_set()
+
+
 def test_a_client_that_leaves_closes_the_generator_and_gets_no_done() -> None:
     backend, state = _state()
     out = RecordingOut(accept=3)
@@ -237,6 +281,49 @@ def test_encode_chunk() -> None:
     assert serve_mod.encode_chunk("\u00e9") == "\u00e9".encode("utf-8")
     assert serve_mod.encode_chunk(b"raw") == b"raw"
     assert serve_mod.encode_chunk(memoryview(b"view")) == b"view"
+    assert serve_mod.encode_chunk({"text": "a\nb"}) == b'{"text": "a\\nb"}'  # escaped, one line
+    for chunk in ('{"a":\n1}', b'{"a":\r1}', bytearray(b"{\n}")):
+        with pytest.raises(ValueError, match="one line"):
+            serve_mod.encode_chunk(chunk)
+
+
+class _BrokenHeadHandler:
+    """Just enough of a request handler for ``_StdlibStream``: the head write fails."""
+
+    def __init__(self) -> None:
+        self.wfile = self
+
+    def send_response(self, status: int) -> None:
+        pass
+
+    def send_header(self, name: str, value: str) -> None:
+        pass
+
+    def end_headers(self) -> None:
+        raise BrokenPipeError("client left before the head")
+
+    def write(self, data: bytes) -> None:
+        raise AssertionError("nothing may be written after a failed head")
+
+    def flush(self) -> None:
+        raise AssertionError("nothing may be flushed after a failed head")
+
+
+def test_stdlib_stream_marks_a_failed_head_closed_and_the_driver_closes_the_generator() -> None:
+    sink = serve_mod._StdlibStream(_BrokenHeadHandler())
+    sink.start()
+    assert sink.closed
+    assert sink.push(b"{}") is False
+    assert sink.keepalive() is False
+    sink.done()  # a no-op once closed, never a write
+
+    backend, state = _state()
+    serve_mod.drive_chat_stream(
+        state, {"messages": MESSAGES, "script": "endless"}, serve_mod._StdlibStream(_BrokenHeadHandler())
+    )
+    assert backend.closed.is_set()
+    (gen,) = backend.generators
+    assert gen.gi_frame is None  # finished: closed, not merely abandoned
 
 
 # --------------------------------------------------------------------------

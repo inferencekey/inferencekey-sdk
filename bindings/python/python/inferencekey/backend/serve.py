@@ -58,6 +58,7 @@ import argparse
 import importlib
 import json
 import os
+import re
 import signal
 import sys
 import threading
@@ -186,6 +187,9 @@ class _BackendState:
 #: A JSON response: HTTP status and the exact body bytes.
 JsonReply = Tuple[int, bytes]
 
+#: An acceptable ``Content-Length`` value (see :func:`content_length`).
+_CONTENT_LENGTH = re.compile(r"-?[0-9]+")
+
 
 def _json_reply(status: int, payload: Any) -> JsonReply:
     return status, json.dumps(payload).encode("utf-8")
@@ -201,14 +205,18 @@ def _openai_error(status: int, message: str, kind: str, code: Optional[str] = No
 def content_length(header: Optional[str]) -> Tuple[int, Optional[JsonReply]]:
     """Validate a ``Content-Length`` header: ``(length, None)`` or ``(0, error reply)``.
 
-    A missing header counts as an empty body. Every POST route uses the same
-    rules and the same plain ``{"error": ...}`` shape, ``/v1/chat/completions``
-    included.
+    A missing header counts as an empty body. The value must be ASCII digits,
+    optionally after a minus sign (a negative length is "too large", as it has
+    always been); forms ``int()`` would also take, such as ``+5``, ``1_0``, inner
+    spaces or non-ASCII digits, are invalid, so every transport applies one
+    exact rule. Every POST route uses the same rules and the same plain
+    ``{"error": ...}`` shape, ``/v1/chat/completions`` included.
     """
-    try:
-        length = int(header if header is not None else "0")
-    except ValueError:
+    if header is None:
+        return 0, None
+    if not _CONTENT_LENGTH.fullmatch(header):
         return 0, _json_reply(400, {"error": "invalid Content-Length"})
+    length = int(header)
     if length < 0 or length > _MAX_BODY_BYTES:
         return 0, _json_reply(400, {"error": "request body too large"})
     return length, None
@@ -386,15 +394,22 @@ def encode_chunk(chunk: Any) -> bytes:
 
     A dict (or any JSON value) is serialized with :func:`json.dumps`. A ``str``
     or ``bytes`` chunk is taken as an already-serialized chunk object and passed
-    through as is, which saves the ``json.dumps`` on hot streaming paths.
+    through as is, which saves the ``json.dumps`` on hot streaming paths. It
+    must be one line of JSON: a line break would end the ``data:`` line early
+    and the client would get truncated JSON, so it raises ``ValueError``
+    instead (which the stream driver turns into an error event).
     """
     if isinstance(chunk, bytes):
-        return chunk
-    if isinstance(chunk, str):
-        return chunk.encode("utf-8")
-    if isinstance(chunk, (bytearray, memoryview)):
-        return bytes(chunk)
-    return json.dumps(chunk).encode("utf-8")
+        data = chunk
+    elif isinstance(chunk, str):
+        data = chunk.encode("utf-8")
+    elif isinstance(chunk, (bytearray, memoryview)):
+        data = bytes(chunk)
+    else:
+        return json.dumps(chunk).encode("utf-8")
+    if b"\n" in data or b"\r" in data:
+        raise ValueError("pre-serialized chunk must be one line of JSON")
+    return data
 
 
 def drive_chat_stream(state: _BackendState, request: Dict[str, Any], out: StreamOut) -> None:
