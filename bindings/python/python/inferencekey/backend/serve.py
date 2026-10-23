@@ -17,7 +17,8 @@ Two transports serve the same request semantics (the functions below):
 (exit code 2 when it is unavailable). One ``http transport: ...`` line on
 stderr names the transport in use. The native transport also reads
 ``IK_BACKEND_MAX_INFLIGHT``, ``IK_BACKEND_IO_THREADS``, ``IK_BACKEND_BACKLOG``,
-``IK_BACKEND_STREAM_MAX_BYTES`` and ``IK_SSE_CONNECTION_CLOSE``.
+``IK_BACKEND_STREAM_MAX_BYTES``, ``IK_BACKEND_FLUSH_TICK_US`` and
+``IK_SSE_CONNECTION_CLOSE``.
 
 Run it::
 
@@ -681,6 +682,7 @@ def _native_options() -> Dict[str, Any]:
         ("IK_BACKEND_IO_THREADS", "io_threads", 1),
         ("IK_BACKEND_BACKLOG", "backlog", 1),
         ("IK_BACKEND_STREAM_MAX_BYTES", "stream_max_bytes", 1),
+        ("IK_BACKEND_FLUSH_TICK_US", "flush_tick_us", 0),
     ):
         value = _env_int(env, minimum)
         if value is not None:

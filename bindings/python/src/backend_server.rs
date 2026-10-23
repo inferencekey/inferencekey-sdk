@@ -118,6 +118,8 @@ fn os_error(err: io::Error) -> PyErr {
 ///
 /// The socket is bound and listening when the constructor returns, so slow
 /// setup can run afterwards while `/healthz` answers 503 from Rust.
+/// `flush_tick_us` is how far apart stream bodies are woken in batches while
+/// the server is busy (0 wakes them on every push).
 #[pyclass(frozen, weakref, module = "inferencekey._inferencekey")]
 pub struct BackendServer {
     handle: ServerHandle,
@@ -140,6 +142,7 @@ impl BackendServer {
         sse_connection_close = false,
         shutdown_grace = 2.0,
         unsupported_method_page = None,
+        flush_tick_us = 1000,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -153,6 +156,7 @@ impl BackendServer {
         sse_connection_close: bool,
         shutdown_grace: f64,
         unsupported_method_page: Option<(String, String)>,
+        flush_tick_us: u64,
     ) -> PyResult<Self> {
         if !(shutdown_grace.is_finite() && shutdown_grace >= 0.0) {
             return Err(PyValueError::new_err("shutdown_grace must be a non-negative number of seconds"));
@@ -179,6 +183,7 @@ impl BackendServer {
             sse_connection_close,
             shutdown_grace: Duration::from_secs_f64(shutdown_grace),
             unsupported_method_page,
+            flush_tick: Duration::from_micros(flush_tick_us),
             ..ServerConfig::default()
         };
         let (io_threads, backlog, max_inflight) = (cfg.io_threads, cfg.backlog, cfg.max_inflight);

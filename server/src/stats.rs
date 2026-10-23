@@ -34,6 +34,10 @@ pub(crate) struct Stats {
     pub slow_client_closes: AtomicU64,
     /// `accept()` failures (for example EMFILE).
     pub accept_errors: AtomicU64,
+    /// Batches of body wakes the flusher ran (see `sse::Flusher`).
+    pub flush_batches: AtomicU64,
+    /// Body wakes in those batches.
+    pub flush_wakes: AtomicU64,
 }
 
 pub(crate) fn inc(counter: &AtomicU64) {
@@ -51,7 +55,7 @@ pub(crate) fn dec(counter: &AtomicU64) {
 impl Stats {
     /// The counters as one compact JSON object.
     pub fn to_json(&self) -> String {
-        let fields: [(&str, &AtomicU64); 13] = [
+        let fields: [(&str, &AtomicU64); 15] = [
             ("connections", &self.connections),
             ("connections_total", &self.connections_total),
             ("requests", &self.requests),
@@ -65,6 +69,8 @@ impl Stats {
             ("cancelled", &self.cancelled),
             ("slow_client_closes", &self.slow_client_closes),
             ("accept_errors", &self.accept_errors),
+            ("flush_batches", &self.flush_batches),
+            ("flush_wakes", &self.flush_wakes),
         ];
         let body: Vec<String> = fields
             .iter()
@@ -107,6 +113,6 @@ mod tests {
         assert_eq!(value["chunks_pushed"], 1);
         assert_eq!(value["bytes_written"], 42);
         assert_eq!(value["inflight"], 0);
-        assert_eq!(value.as_object().unwrap().len(), 13);
+        assert_eq!(value.as_object().unwrap().len(), 15);
     }
 }

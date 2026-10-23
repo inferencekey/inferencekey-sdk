@@ -181,7 +181,12 @@ async fn handle_post(
         }
         Route::Chat => {
             let (sink, head, mut stream) =
-                sse::channel(shared.cfg.stream_max_bytes, shared.closing.clone(), shared.stats.clone());
+                sse::channel(
+                shared.cfg.stream_max_bytes,
+                shared.closing.clone(),
+                shared.stats.clone(),
+                shared.flusher.clone(),
+            );
             tokio::task::spawn_blocking(move || {
                 name_request_thread();
                 let _permit = permit;

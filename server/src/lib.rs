@@ -50,7 +50,7 @@ use tokio::sync::{watch, Semaphore};
 
 pub use app::{AppHandler, JsonReply, Route};
 pub use errors::{internal_error, ErrorPage};
-pub use sse::{PendingFrame, SendOutcome, StreamSink, CHANNEL_CAPACITY, COALESCE_CAP};
+pub use sse::{PendingFrame, SendOutcome, StreamSink, CHANNEL_CAPACITY, COALESCE_CAP, DEFAULT_FLUSH_TICK};
 
 use conn::Stopped;
 use stats::Stats;
@@ -89,6 +89,10 @@ pub struct ServerConfig {
     pub header_read_timeout: Duration,
     /// The 501 page for methods other than GET and POST.
     pub unsupported_method_page: ErrorPage,
+    /// While the server is busy, stream bodies are woken in batches this far
+    /// apart instead of by each push (see the `sse` module); a push to an idle server
+    /// is still written at once. Zero wakes the body on every push.
+    pub flush_tick: Duration,
 }
 
 impl ServerConfig {
@@ -111,6 +115,7 @@ impl Default for ServerConfig {
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
             header_read_timeout: Duration::from_secs(30),
             unsupported_method_page: ErrorPage::default(),
+            flush_tick: sse::DEFAULT_FLUSH_TICK,
         }
     }
 }
@@ -138,6 +143,8 @@ pub(crate) struct Shared {
     pub admission: Arc<Semaphore>,
     /// Set when shutdown starts; every sink reports closed from then on.
     pub closing: Arc<AtomicBool>,
+    /// Wakes stream bodies for their producers.
+    pub flusher: Arc<sse::Flusher>,
 }
 
 impl Shared {
@@ -186,17 +193,21 @@ pub fn start(cfg: ServerConfig, app: Arc<dyn AppHandler>) -> io::Result<ServerHa
     };
     let local_addr = listener.local_addr()?;
 
+    let stats = Arc::new(Stats::default());
+    let flusher = sse::Flusher::new(cfg.flush_tick, stats.clone());
     let shared = Arc::new(Shared {
         admission: Arc::new(Semaphore::new(max_inflight)),
         cfg: ServerConfig { io_threads, max_inflight, ..cfg },
         app,
         ready: AtomicBool::new(false),
         manifest: RwLock::new(Manifest::from_bytes(b"{}")),
-        stats: Arc::new(Stats::default()),
+        stats,
         closing: Arc::new(AtomicBool::new(false)),
+        flusher: flusher.clone(),
     });
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let stopped = Arc::new(Stopped::default());
+    runtime.spawn(flusher.run());
     runtime.spawn(conn::serve(listener, shared.clone(), shutdown_rx, stopped.clone()));
 
     Ok(ServerHandle { local_addr, shared, shutdown_tx, stopped, runtime: Mutex::new(Some(runtime)) })

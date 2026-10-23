@@ -692,6 +692,7 @@ def test_native_without_the_native_module_exits_2(monkeypatch, capfd) -> None:
     ("IK_BACKEND_IO_THREADS", "four"),
     ("IK_BACKEND_BACKLOG", "-1"),
     ("IK_BACKEND_STREAM_MAX_BYTES", "1e6"),
+    ("IK_BACKEND_FLUSH_TICK_US", "1ms"),
     ("IK_SSE_CONNECTION_CLOSE", "maybe"),
 ])
 def test_invalid_transport_settings_exit_2(monkeypatch, capfd, env) -> None:
@@ -710,6 +711,22 @@ def test_env_knobs_reach_the_native_server(monkeypatch, capfd) -> None:
         assert "http transport: native (abi 1, io_threads=2, backlog=128, max_inflight=7)" in err
     finally:
         _stop(httpd)
+
+
+def test_flush_tick_zero_streams_the_same_bytes(monkeypatch) -> None:
+    # IK_BACKEND_FLUSH_TICK_US=0 wakes each stream on every push instead of in
+    # batches; the bytes on the wire must not depend on it.
+    bodies = []
+    for tick in ("0", "1000"):
+        httpd, _ = _start(GoldenBackend(), "native", monkeypatch, IK_BACKEND_FLUSH_TICK_US=tick)
+        try:
+            reply = raw_request(httpd.server_address[1], "POST", "/v1/chat/completions", _chat("default"))
+        finally:
+            _stop(httpd)
+        assert reply.status_line.endswith("200 OK")
+        bodies.append(reply.body)
+    assert bodies[0] == bodies[1]
+    assert bodies[0].endswith(b"data: [DONE]\n\n")
 
 
 # --------------------------------------------------------------------------
