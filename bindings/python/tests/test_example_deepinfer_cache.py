@@ -313,3 +313,18 @@ def test_two_turns_end_to_end_report_cached_tokens(tmp_path, monkeypatch) -> Non
         assert sum(s.get("hits", 0) for s in engine.rank_stats) == 1
     finally:
         engine.close()
+
+
+def test_a_rejected_prefix_admission_runs_the_request_cold() -> None:
+    engine = _sim(kv_blocks=1000)
+
+    def reject(*_args, **_kwargs):
+        raise RuntimeError("blocks rejected")
+
+    engine.enqueue_with_prefix = reject
+    requests, results, cache = _start_rank(engine, 1000)
+    _run(requests, results, "c1", "k" * 2000)
+    cached, prompt_len, _ = _run(requests, results, "c2", "k" * 2000 + "m" * 300)
+    assert cached == 0 and prompt_len == 2300
+    assert not cache.index.protected
+    requests.put(None)

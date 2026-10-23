@@ -501,8 +501,9 @@ class _RankCache:
 
     Needs DeepInfer with the local prefix-cache patch
     (``deepinfer-patch/0002-local-prefix-cache.patch``):
-    ``scheduler.add_sequence_with_prefix(seq, blocks, num_cached, swa_valid_start)``
-    and ``Sequence.block_table``. Uses the engine's own ``block_manager``
+    ``engine.enqueue_with_prefix(seq, blocks, num_cached, swa_valid_start)``
+    (which validates the blocks before pinning them and raises without side
+    effects) and ``Sequence.block_table``. Uses the engine's own ``block_manager``
     (``pin_blocks`` / ``unpin_blocks`` / ``get_num_free_blocks``),
     ``cache_config.num_gpu_blocks``, ``add_request(enqueue=False)`` and
     ``finalize_seq``, which this class wraps to cache a finished prompt's blocks
@@ -512,6 +513,9 @@ class _RankCache:
     def __init__(self, rank: int, engine: Any, settings: Dict[str, Any]) -> None:
         self.rank = rank
         self.engine = engine
+        block_size = int(getattr(engine.cache_config, "block_size", BLOCK))
+        if block_size != BLOCK:
+            raise ValueError(f"the prefix cache needs {BLOCK}-token KV blocks, the engine has {block_size}")
         self.blocks = engine.block_manager
         self.total_blocks = int(engine.cache_config.num_gpu_blocks)
         self.index = PrefixIndex(self.blocks.pin_blocks, self.blocks.unpin_blocks)
@@ -556,9 +560,15 @@ class _RankCache:
         if seq is None:
             self.index.unprotect(used)
             return None, 0
-        self.engine.scheduler.add_sequence_with_prefix(seq, blocks[:reused], hit - BLOCK, hit - BLOCK)
-        if self.engine.multi_modal_processor is not None:
-            self.engine.multi_modal_processor.add(request_id, None)
+        try:
+            self.engine.enqueue_with_prefix(seq, blocks[:reused], hit - BLOCK, hit - BLOCK)
+        except Exception as exc:  # noqa: BLE001 (nothing was queued or pinned: admit it cold)
+            print(f"deepinfer rank {self.rank}: prefix admission of {request_id} failed ({exc}); "
+                  "running it without the cache", file=sys.stderr, flush=True)
+            self.index.unprotect(used)
+            self.engine.scheduler.add_sequence(seq)
+            self.live[request_id] = (hashes, prompt_len, [])
+            return seq, 0
         self.index.hits += 1
         self.index.hit_tokens += hit - BLOCK
         self.live[request_id] = (hashes, prompt_len, used)

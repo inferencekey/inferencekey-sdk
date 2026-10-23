@@ -23,7 +23,7 @@ refcounts, the surface of DeepInfer plus the local prefix-cache patch that the
 backend's ``_RankCache`` uses: ``block_manager.pin_blocks / unpin_blocks /
 get_num_free_blocks``, ``cache_config.num_gpu_blocks``,
 ``add_request(enqueue=False)``, ``scheduler.add_sequence_with_prefix(seq,
-blocks, num_cached, swa_valid_start)`` (only the uncached suffix is
+blocks, num_cached, swa_valid_start)`` / ``enqueue_with_prefix`` (only the uncached suffix is
 prefilled), ``Sequence.block_table`` and ``finalize_seq(seq)``, called for a
 finished sequence before its blocks are freed. A request is admitted when its
 prompt and ``max_tokens`` fit in the free blocks and the pool is under the
@@ -131,6 +131,9 @@ class _Scheduler:
         self.engine.hit_tokens += num_cached
         self.engine.waiting.append(seq)
 
+    def add_sequence(self, seq: _Seq) -> None:
+        self.engine.waiting.append(seq)
+
     def get_num_preempted_seqs(self) -> int:
         return self.preempted
 
@@ -164,7 +167,7 @@ class SimEngine:
         self.decode_ctx_beta = float(sim.get("decode_ctx_beta", 0.0))
         kv_blocks = int(sim.get("kv_blocks", 0)) or 1 << 40
         self.block_manager = _BlockManager(kv_blocks)
-        self.cache_config = types.SimpleNamespace(num_gpu_blocks=kv_blocks)
+        self.cache_config = types.SimpleNamespace(num_gpu_blocks=kv_blocks, block_size=BLOCK)
         self.scheduler = _Scheduler(self)
         self.hit_tokens = 0
         self.prompt_tokens = 0
@@ -193,6 +196,10 @@ class SimEngine:
         if enqueue:
             self.waiting.append(seq)
         return seq
+
+    def enqueue_with_prefix(self, seq: _Seq, blocks: Any, num_cached: int, swa_valid_start: int) -> None:
+        """The patched engine's entry point (multimodal and structured-output handling aside)."""
+        self.scheduler.add_sequence_with_prefix(seq, blocks, num_cached, swa_valid_start)
 
     def finalize_seq(self, seq: _Seq) -> None:
         """DeepInfer's hook for a finished sequence; frees its blocks (the backend wraps it)."""
