@@ -693,7 +693,10 @@ class CustomBackend(ABC):
         The default runs :meth:`chat` and replays its result as chunks with
         :func:`completion_to_chunks`, so a backend that cannot stream token by
         token still works with streaming clients such as Claude Code. Override
-        it to yield chunks as the model produces them.
+        it to yield chunks as the model produces them. An override may also
+        yield ``None`` when it has had nothing to send for a while: the runtime
+        writes an SSE keepalive comment, and a client that left makes that write
+        fail, which closes the generator so the backend can stop the work.
         """
         yield from completion_to_chunks(self.chat(request))
 

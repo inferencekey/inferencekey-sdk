@@ -58,14 +58,23 @@ class _Seq:
         self.offset = offset
 
 
+class _ModelConfig:
+    def __init__(self, vocab_size: int) -> None:
+        self._vocab_size = vocab_size
+
+    def get_vocab_size(self) -> int:
+        return self._vocab_size
+
+
 class SimEngine:
     """The ``llm.llm_engine`` surface the rank loop uses."""
 
     multi_modal_processor = None
 
     def __init__(self, rank: int, max_num_seqs: int, max_num_batched_tokens: int, sim: Dict[str, Any],
-                 token_ids: List[int]) -> None:
+                 token_ids: List[int], vocab_size: int) -> None:
         self.rank = rank
+        self.model_config = _ModelConfig(vocab_size)
         self.max_num_seqs = max_num_seqs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.step_s = 1.0 / float(sim.get("step_rate", 70.0))
@@ -88,9 +97,12 @@ class SimEngine:
     # --- the calls _rank_main makes -------------------------------------------
 
     def add_request(self, user_id: str, request_id: str, sampling_params: Any, prompt_token_ids: Any,
-                    multi_modal_data: Optional[dict] = None, **_: Any) -> None:
+                    multi_modal_data: Optional[dict] = None, **_: Any) -> _Seq:
+        # Like DeepInfer, the new sequence is returned (None would mean "dropped").
         offset = zlib.crc32(request_id.encode()) % len(self.token_ids)
-        self.waiting.append(_Seq(request_id, len(prompt_token_ids), sampling_params.max_tokens, offset))
+        seq = _Seq(request_id, len(prompt_token_ids), sampling_params.max_tokens, offset)
+        self.waiting.append(seq)
+        return seq
 
     def has_unfinished_requests(self) -> bool:
         local = bool(self.waiting or self.prefilling or self.running)
@@ -171,7 +183,8 @@ class SimEngine:
             token = ids[(seq.offset + seq.generated) % len(ids)]
             seq.generated += 1
             finished = seq.generated >= seq.max_tokens
-            outputs.append(RequestOutput(seq.request_id, token, finished, seq.prompt_len))
+            outputs.append(RequestOutput(seq.request_id, token, finished, seq.prompt_len,
+                                         "length" if finished else ""))
             if finished:
                 return True
         return False
@@ -210,7 +223,8 @@ class LLM:
 
             self._tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
         token_ids = list(self._tokenizer.encode(_PASSAGE * 4, add_special_tokens=False))
-        self.llm_engine = SimEngine(engine_rank, int(max_num_seqs), int(max_num_batched_tokens), sim, token_ids)
+        self.llm_engine = SimEngine(engine_rank, int(max_num_seqs), int(max_num_batched_tokens), sim, token_ids,
+                                    len(self._tokenizer))
 
     def get_tokenizer(self) -> Any:
         return self._tokenizer

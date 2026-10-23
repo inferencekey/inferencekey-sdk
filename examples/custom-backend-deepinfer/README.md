@@ -43,6 +43,35 @@ stays in the rank processes:
   one SSE chunk, at most every `stream_interval_ms` (longer when the number of
   streams would exceed `stream_chunks_per_second` in total).
 - A client that disconnects frees its slot, and its rank aborts the request.
+  A disconnect is only seen when a write fails, so a stream that has had
+  nothing to send for `stream_heartbeat_seconds` (queued, prefilling, or
+  generating a tool call, which goes out only once complete) writes an SSE
+  comment (`: keepalive`), which clients ignore.
+
+What fails, and how:
+
+- Prompts are tokenized without the tokenizer's own BOS
+  (`add_special_tokens=False`): the encoded prompt already starts with it, and
+  DeepInfer's release tokenizer forces `add_bos_token` on.
+- A prompt with a token id outside the model vocabulary (a message that quotes
+  a reserved special token such as `<|place_holder_mm_span_0000|>`) is a 400.
+  DeepInfer would drop it without an error and the client would wait forever.
+- A prompt the engine will not schedule (longer than `max_model_len` or than
+  the KV cache) is a 400 with the OpenAI error code `context_length_exceeded`,
+  so a client can compact and retry; when that is known only after the stream
+  started, the stream ends with an error event. A request DeepInfer stops for
+  lack of memory, or a structured-output or vision failure, ends with an
+  error, never with the bogus token DeepInfer reports for it.
+- The ranks run in lockstep, so when one rank dies the others block in the
+  next collective. The backend then fails every open stream, answers new
+  requests with a 500 at once and stops the remaining ranks; restart the
+  backend. The same happens if no rank produces anything for
+  `stall_timeout_seconds` while requests are in flight. A single request with
+  no output for `request_stall_seconds` fails on its own.
+- At unload the ranks get `close_timeout_seconds` to exit, then are terminated
+  (and killed if needed): a clean lockstep exit is not guaranteed, and a rank
+  left behind would keep its GPUs and the process alive. A failed `setup()`
+  stops the ranks it started.
 
 ## Requirements (engine `deepinfer`)
 
@@ -85,6 +114,10 @@ minor version (3.12). `requirements.txt` stays empty.
 | `stream_interval_ms` | `50` | Shortest time between two chunks of one stream: tokens that arrive meanwhile go out together. `0` sends every engine step on its own (more CPU in the backend process). |
 | `stream_chunks_per_second` | `8000` | Budget of SSE chunks per second over all streams: with more than 400 streams the interval grows (1,000 streams: 125 ms) so the backend process keeps up. `0` disables. |
 | `abort_on_disconnect` | `true` | Abort the request in DeepInfer when its client disconnects. |
+| `stream_heartbeat_seconds` | `1.0` | After this long with nothing to send, a stream writes an SSE keepalive comment, so a client that left is noticed (and its request aborted) while the request is queued, prefilling or generating a tool call. `0` disables. |
+| `request_stall_seconds` | `1800` | A request with no output for this long fails and frees its slot (a backstop for a request the engine lost). `0` disables. |
+| `stall_timeout_seconds` | `600` | With requests in flight and no output from any rank for this long, the engine is considered hung: every stream fails. `0` disables. |
+| `close_timeout_seconds` | `30` | At unload, how long the ranks get to exit before they are terminated. |
 | `thinking_mode`, `reasoning_effort` | `thinking`, `high` | Prompt mode (`thinking` or `chat`) and effort (1 to 100, or `low` / `high` / `max`). |
 | `temperature`, `top_p`, `default_max_tokens` | `0.6`, `1.0`, `8192` | Sampling defaults when the request has none. |
 | `served_model_name` | `deepseek-v4.1-flash` | `model` field of the answers. |
@@ -151,4 +184,6 @@ with simulated ranks, no GPU: `bench/README.md`.
 10. Whether DeepInfer reuses prompt prefixes across requests (a cache). Without one, every agent turn reads its whole context again.
 11. `llm_engine.abort_request()` between steps, while other requests run and with DSpark in-flight steps, leaves the engine and the lockstep healthy. Set `abort_on_disconnect` to `false` if it does not.
 12. The tokenizer from `llm.get_tokenizer()` can encode on the rank's tokenizer threads while the loop steps (encode only; nothing changes its settings). With the Hugging Face fast tokenizer it releases the GIL, as measured offline.
-13. The rank's added CPU stays small next to a GPU step. On the dev VM, grouping and detokenizing one step of 128 requests takes about 0.24 ms (2 us per request), and building and checking the byte table takes about 0.5 s at startup. Not measured: `RequestOutput.clone` and the queue message on the real engine.
+13. Requests the scheduler ignores or stops (`FINISHED_IGNORED`, `FINISHED_PREEMPTED`, `FINISHED_SO_FAILED`, `FINISHED_VE_FAILED`) arrive as one finished `RequestOutput` with `finish_reason` set (`prompt_length_exceeded`, `insufficient_system_resource`, `xgrammar ...`, `ve_error`), as read in `outputs.hpp`. Not seen on hardware yet; send a prompt over `max_model_len` and check for the 400.
+14. The backend process at 200 to 400 streams on the B200 host: per-user tok/s and its CPU. In the benchmark it sits at about 100 to 130 % CPU at 400 streams (per chunk, not per token), with no `/v1/messages` adapter or proxy in front. If it is near 100 % there, raise `stream_interval_ms`, lower `stream_chunks_per_second`, or split the HTTP layer across processes; treat about 400 streams as the limit of one backend process until then.
+15. The rank's added CPU stays small next to a GPU step. On the dev VM, grouping and detokenizing one step of 128 requests takes about 0.24 ms (2 us per request), and building and checking the byte table takes about 0.5 s at startup. Not measured: `RequestOutput.clone` and the queue message on the real engine.

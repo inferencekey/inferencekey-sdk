@@ -17,6 +17,14 @@ Per request:
    becomes OpenAI ``tool_calls`` (``dsv41_encoding.parse_message_from_completion_text``).
    While streaming, reasoning and text go out as they arrive; a tool call is
    sent once complete, because its arguments are only valid JSON at the end.
+   When nothing goes out for ``stream_heartbeat_seconds`` (a queued or
+   prefilling request, a tool call being generated) the stream yields ``None``,
+   which the runtime writes as an SSE comment: a client that left is noticed
+   and its request aborted.
+
+A prompt longer than the engine accepts is answered with a 400 whose error
+code is ``context_length_exceeded``, so a client such as Claude Code can
+compact the conversation and retry.
 
 Config (the workload ``config``, received as ``ctx.config``): see the README.
 """
@@ -24,19 +32,44 @@ Config (the workload ``config``, received as ``ctx.config``): see the README.
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 import time
 import uuid
 from typing import Any, Dict, Iterator, List, Optional
 
 import dsv41_encoding as dsv41
-from deepinfer_engines import Engine, GenEvent, GenRequest, build_engine
+from deepinfer_engines import (
+    CONTEXT_LENGTH_EXCEEDED,
+    INVALID_PROMPT,
+    Engine,
+    GenEvent,
+    GenRequest,
+    build_engine,
+)
 
 from inferencekey.backend import BackendContext, CustomBackend, InvalidInput, Job, Result
 
 TOOL_CALLS_START = f"\n\n<{dsv41.dsml_token}{dsv41.tool_calls_block_name}"
 THINK_END = dsv41.thinking_end_token
 EOS = dsv41.eos_token
+
+
+class ContextLengthExceeded(InvalidInput):
+    """The prompt does not fit the engine's context: a 400 with an OpenAI error code."""
+
+    code = CONTEXT_LENGTH_EXCEEDED
+
+
+def _raise_for(event: GenEvent) -> None:
+    """Raise the exception that matches a failed engine event (no-op without an error)."""
+    if not event.error:
+        return
+    if event.error_code == CONTEXT_LENGTH_EXCEEDED:
+        raise ContextLengthExceeded(f"the prompt is too long for this model's context ({event.error})")
+    if event.error_code == INVALID_PROMPT:
+        raise InvalidInput(event.error)
+    raise RuntimeError(f"DeepInfer failed: {event.error}")
 
 
 def _text_of(content: Any) -> str:
@@ -157,6 +190,7 @@ class DeepInferBackend(CustomBackend):
         self.thinking_mode = self.config.get("thinking_mode", "thinking")
         self.reasoning_effort = self.config.get("reasoning_effort", "high")
         self.default_max_tokens = int(self.config.get("default_max_tokens", 8192))
+        self.heartbeat_seconds = float(self.config.get("stream_heartbeat_seconds", 1.0))
         self.engine: Engine = build_engine(self.config)
 
     def process(self, job: Job) -> Result:
@@ -184,13 +218,20 @@ class DeepInferBackend(CustomBackend):
 
     def chat(self, request: Dict[str, Any]) -> Dict[str, Any]:
         events = list(self.engine.generate(self._gen_request(request)))
-        self._raise_on_error(events)
+        for event in events:
+            _raise_for(event)
         text = "".join(e.text for e in events)
         last = events[-1] if events else GenEvent(finished=True)
         message, finish_reason = self._parse(text, request)
         return self._completion(message, finish_reason, last)
 
-    def chat_stream(self, request: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+    def chat_stream(self, request: Dict[str, Any]) -> Iterator[Optional[Dict[str, Any]]]:
+        """Stream OpenAI chunks; ``None`` items are keepalives (no delta for a while).
+
+        The first chunk waits for the engine's first event or first heartbeat,
+        so a prompt the engine refuses at once (too long, invalid) still gets a
+        400 before the 200 headers go out.
+        """
         gen = self._gen_request(request)
         thinking = gen.prompt.endswith(dsv41.thinking_start_token)
         splitter = StreamSplitter(thinking=thinking)
@@ -201,16 +242,36 @@ class DeepInferBackend(CustomBackend):
         def chunk(delta: Dict[str, Any], finish: Optional[str] = None) -> Dict[str, Any]:
             return {**base, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
-        yield chunk({"role": "assistant", "content": ""})
-        parts: List[str] = []
-        last = GenEvent()
-        for event in self.engine.generate(gen):
-            if event.error:
-                raise RuntimeError(f"DeepInfer failed: {event.error}")
-            parts.append(event.text)
-            last = event
-            for delta in splitter.feed(event.text):
-                yield chunk(delta)
+        events = self.engine.generate(gen)
+        try:
+            first = next(events, None)
+            if first is not None:
+                _raise_for(first)
+            yield chunk({"role": "assistant", "content": ""})
+            parts: List[str] = []
+            last = GenEvent()
+            heartbeat = self.heartbeat_seconds
+            sent_at = time.monotonic()
+            for event in itertools.chain([first] if first is not None else [], events):
+                _raise_for(event)
+                if event.text:
+                    parts.append(event.text)
+                if event.finished or event.text:
+                    last = event
+                deltas = splitter.feed(event.text) if event.text else []
+                for delta in deltas:
+                    yield chunk(delta)
+                if deltas:
+                    sent_at = time.monotonic()
+                elif heartbeat and not event.finished and time.monotonic() - sent_at >= heartbeat:
+                    # Nothing for the client for a while: a keepalive lets the
+                    # runtime find out whether the client is still there.
+                    yield None
+                    sent_at = time.monotonic()
+        finally:
+            close = getattr(events, "close", None)
+            if close is not None:
+                close()  # a client that left frees its engine slot now
         message, finish_reason = self._parse("".join(parts), request)
         for index, call in enumerate(message.get("tool_calls") or []):
             yield chunk({"tool_calls": [{"index": index, **call}]})
@@ -226,8 +287,8 @@ class DeepInferBackend(CustomBackend):
         candidate = text if finished_by_eos else text + EOS
         try:
             parsed = dsv41.parse_message_from_completion_text(candidate, thinking_mode=mode)
-        except AssertionError:
-            # Truncated or malformed output: return what can be read as text.
+        except (AssertionError, ValueError):
+            # Truncated or malformed output (the parser raises both): return what can be read as text.
             reasoning, _, content = candidate.partition(THINK_END) if mode == "thinking" else ("", "", candidate)
             parsed = {
                 "content": content.split(TOOL_CALLS_START, 1)[0].replace(EOS, ""),
@@ -268,9 +329,3 @@ class DeepInferBackend(CustomBackend):
             "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
             "usage": self._usage(last),
         }
-
-    @staticmethod
-    def _raise_on_error(events: List[GenEvent]) -> None:
-        for event in events:
-            if event.error:
-                raise RuntimeError(f"DeepInfer failed: {event.error}")

@@ -32,9 +32,13 @@ Endpoints (a minimal, SDK-owned schema — **not** OpenAI-compatible):
 * ``POST /v1/chat/completions``: an OpenAI chat completion request, served by
   :meth:`~inferencekey.backend.CustomBackend.chat` (or ``chat_stream`` when the
   body has ``"stream": true``, answered as server-sent events ending in
-  ``data: [DONE]``). Only for backends that implement ``chat()`` (``api`` is
+  ``data: [DONE]``; a ``None`` item from ``chat_stream`` is written as the SSE
+  comment ``: keepalive``, which clients ignore, so a backend can find out that
+  a client left while it has nothing to send). Only for backends that implement ``chat()`` (``api`` is
   ``"openai-chat"`` in ``/meta``); the others answer ``501``. Errors use the
-  OpenAI shape ``{"error": {"message", "type"}}``.
+  OpenAI shape ``{"error": {"message", "type"}}``, plus ``"code"`` when the
+  raised :class:`~inferencekey.backend.InvalidInput` has a ``code`` attribute
+  (for example ``"context_length_exceeded"``).
 * ``GET /v1/models``: the one model this backend serves, OpenAI-shaped.
 
 To start a backend from code instead of the CLI, use :func:`serve_backend`.
@@ -75,10 +79,19 @@ HOST = "127.0.0.1"
 #: Cap request bodies so a misbehaving client cannot exhaust memory.
 _MAX_BODY_BYTES = 16 * 1024 * 1024
 
+#: What ``next()`` returns for a chunk generator with no chunk at all.
+_NO_CHUNK = object()
+
 #: Listen backlog. The stdlib default (5) resets connections as soon as a few
 #: hundred clients open streams at once (one LLM backend serving 400 developers
 #: lost about 300 of 400 that way); the kernel caps it at ``net.core.somaxconn``.
 LISTEN_BACKLOG = 1024
+
+
+class _ClientGone(Exception):
+    """A write to the client failed (``ConnectionError`` covers a broken pipe, a
+    reset and an abort; any other ``OSError``, a timeout for one, means the same):
+    nothing left to answer."""
 
 
 class _HTTPServer(ThreadingHTTPServer):
@@ -332,8 +345,13 @@ def _make_handler(state: _BackendState) -> type:
                 return
             self._send_json(200, result.to_wire())
 
-        def _send_openai_error(self, status: int, message: str, kind: str) -> None:
-            self._send_json(status, {"error": {"message": message, "type": kind}})
+        def _send_openai_error(
+            self, status: int, message: str, kind: str, code: Optional[str] = None
+        ) -> None:
+            error: Dict[str, Any] = {"message": message, "type": kind}
+            if code:
+                error["code"] = code
+            self._send_json(status, {"error": error})
 
         def _handle_chat(self) -> None:
             if not state.ready:
@@ -362,7 +380,9 @@ def _make_handler(state: _BackendState) -> type:
                 )
                 return
             except InvalidInput as exc:
-                self._send_openai_error(400, str(exc), "invalid_request_error")
+                self._send_openai_error(
+                    400, str(exc), "invalid_request_error", getattr(exc, "code", None)
+                )
                 return
             except Exception as exc:  # noqa: BLE001 (keep the server alive)
                 _log_err("chat failed:")
@@ -388,14 +408,16 @@ def _make_handler(state: _BackendState) -> type:
             """
             try:
                 chunks = iter(state.chat_stream(data))
-                first = next(chunks, None)
+                first = next(chunks, _NO_CHUNK)
             except NotImplementedError:
                 self._send_openai_error(
                     501, "backend does not support chat", "invalid_request_error"
                 )
                 return
             except InvalidInput as exc:
-                self._send_openai_error(400, str(exc), "invalid_request_error")
+                self._send_openai_error(
+                    400, str(exc), "invalid_request_error", getattr(exc, "code", None)
+                )
                 return
             except Exception as exc:  # noqa: BLE001 (keep the server alive)
                 _log_err("chat stream failed before the first chunk:")
@@ -412,16 +434,32 @@ def _make_handler(state: _BackendState) -> type:
             self.end_headers()
             self.close_connection = True
 
+            def write(data: bytes) -> None:
+                # Only socket errors count as a disconnect, not an OSError
+                # raised by the backend's own code while it produces a chunk.
+                try:
+                    self.wfile.write(data)
+                    self.wfile.flush()
+                except OSError as exc:
+                    raise _ClientGone() from exc
+
             def emit(payload: Any) -> None:
-                self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
-                self.wfile.flush()
+                write(f"data: {payload}\n\n".encode("utf-8"))
+
+            def emit_chunk(chunk: Any) -> None:
+                if chunk is None:
+                    # A keepalive: nothing to send, but a write is how a client
+                    # that left is noticed.
+                    write(b": keepalive\n\n")
+                else:
+                    emit(json.dumps(chunk))
 
             try:
-                if first is not None:
-                    emit(json.dumps(first))
+                if first is not _NO_CHUNK:
+                    emit_chunk(first)
                 for chunk in chunks:
-                    emit(json.dumps(chunk))
-            except (BrokenPipeError, ConnectionResetError):
+                    emit_chunk(chunk)
+            except _ClientGone:
                 # The client went away; nothing left to tell it. Closing the
                 # generator lets the backend cancel the generation now (its
                 # ``finally`` runs) instead of whenever it is garbage collected.
@@ -430,13 +468,14 @@ def _make_handler(state: _BackendState) -> type:
             except Exception as exc:  # noqa: BLE001 (keep the server alive)
                 _log_err("chat stream failed mid-way:")
                 traceback.print_exc(file=sys.stderr)
+                _close_quietly(chunks)
                 try:
                     emit(json.dumps({"error": {"message": str(exc), "type": "server_error"}}))
-                except (BrokenPipeError, ConnectionResetError):
+                except _ClientGone:
                     return
             try:
                 emit("[DONE]")
-            except (BrokenPipeError, ConnectionResetError):
+            except _ClientGone:
                 return
 
     return _Handler

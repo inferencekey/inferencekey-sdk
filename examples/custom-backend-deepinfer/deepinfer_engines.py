@@ -37,7 +37,19 @@ What :class:`DeepInferEngine` relies on, as read from the DeepInfer source on
 * ``llm.llm_engine.abort_request(request_id)`` (``scheduler.abort_sequence``,
   local to the rank) to drop the request of a client that disconnected.
 * ``llm.get_tokenizer()``: the checkpoint's Hugging Face tokenizer, used in the
-  rank to tokenize prompts and to detokenize completions.
+  rank to tokenize prompts and to detokenize completions. DeepInfer's release
+  tokenizer forces ``add_bos_token=True`` and the encoded prompt already starts
+  with the BOS text, so prompts are encoded with ``add_special_tokens=False``
+  (as DeepInfer's ``eval/run_eval.py`` does).
+* ``add_request`` returns ``None``, without raising, when a prompt id is outside
+  ``[0, model_config.get_vocab_size())``; such a request never produces output.
+  The rank rejects those ids itself and also checks the return value.
+* A request the scheduler gives up on (prompt longer than ``max_model_len`` or
+  than the KV cache, preempted and stopped, structured output or vision
+  failures) comes back as ONE finished ``RequestOutput`` whose ``token_id`` is
+  just the sequence's last token and whose ``finish_reason`` says why
+  (``csrc/engine/outputs.hpp``, ``sequence.hpp get_finished_reason``). The rank
+  turns it into an error instead of completion text.
 
 What has NOT been checked on hardware is marked ``UNVERIFIED`` below and listed
 in the README.
@@ -55,6 +67,7 @@ import site
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -81,6 +94,9 @@ class GenEvent:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     error: Optional[str] = None
+    #: Why the request failed, when the backend should answer something other
+    #: than a server error: ``"context_length_exceeded"`` or ``"invalid_prompt"``.
+    error_code: Optional[str] = None
 
 
 class Engine:
@@ -320,6 +336,24 @@ def detokenizer_factory(tokenizer: Any) -> Callable[[], IncrementalDetokenizer]:
 # --------------------------------------------------------------------------
 
 
+#: ``GenEvent.error_code`` values: client errors the backend answers with a 400.
+CONTEXT_LENGTH_EXCEEDED = "context_length_exceeded"
+INVALID_PROMPT = "invalid_prompt"
+
+#: ``RequestOutput.finish_reason`` values of requests the scheduler gave up on
+#: (``sequence.hpp get_finished_reason``), with the error code each maps to.
+#: Structured-output failures start with ``"xgrammar"``.
+_ENGINE_GAVE_UP = {
+    "prompt_length_exceeded": CONTEXT_LENGTH_EXCEEDED,
+    "insufficient_system_resource": None,
+    "ve_error": None,
+}
+
+
+def _gave_up(reason: str) -> bool:
+    return reason in _ENGINE_GAVE_UP or reason.startswith("xgrammar")
+
+
 def _rank_devices(visible: List[str], rank: int, cp_size: int) -> List[str]:
     """GPUs of one data-parallel rank: ``cp_size`` consecutive entries.
 
@@ -364,6 +398,7 @@ def _rank_main(
     )
     engine = llm.llm_engine
     needs_mm = engine.multi_modal_processor is not None
+    vocab_size = int(engine.model_config.get_vocab_size())
     try:
         _rank_loop(
             rank,
@@ -376,6 +411,7 @@ def _rank_main(
             sampling_params=SamplingParams,
             token_array=lambda ids: np.asarray(ids, dtype=np.int32),
             multi_modal_data=lambda: dict(image_bytes=[], image_sizes=[]) if needs_mm else None,
+            vocab_size=vocab_size,
         )
     finally:
         llm.close()
@@ -403,6 +439,7 @@ def _rank_loop(
     sampling_params: Callable[..., Any],
     token_array: Callable[[List[int]], Any],
     multi_modal_data: Callable[[], Any],
+    vocab_size: Optional[int] = None,
 ) -> None:
     """The rank's serving loop, apart from building the engine (so tests can drive it).
 
@@ -411,7 +448,9 @@ def _rank_loop(
     ``("ready", rank, None)`` once, then at most one ``("out", rank, items)``
     per engine step, ``items`` being one tuple per request that advanced:
     ``(request_id, text, completion_tokens, prompt_tokens, finished, error)``,
-    with the text these tokens made final and the totals so far.
+    with the text these tokens made final and the totals so far. A failed
+    request's last item carries a seventh field, its error code (see
+    ``CONTEXT_LENGTH_EXCEEDED`` and ``INVALID_PROMPT``) or ``None``.
 
     The parent never sees a token id: prompts are tokenized here, on a few
     threads (the Hugging Face fast tokenizer releases the GIL while it encodes,
@@ -431,9 +470,22 @@ def _rank_loop(
 
     def tokenize(request_id: str, prompt: str, params: Dict[str, Any]) -> None:
         try:
-            tokenized.append((request_id, token_array(tokenizer.encode(prompt)), params, None))
+            # The encoded prompt starts with the BOS text already; the release
+            # tokenizer would add a second BOS id otherwise.
+            ids = tokenizer.encode(prompt, add_special_tokens=False)
         except Exception as exc:  # noqa: BLE001 (report it on the request)
-            tokenized.append((request_id, None, params, f"tokenization failed: {exc}"))
+            tokenized.append((request_id, None, params, (f"tokenization failed: {exc}", None)))
+            return
+        if vocab_size is not None and ids and max(ids) >= vocab_size:
+            # The release tokenizer registers multimodal placeholders as added
+            # tokens past the vocabulary; a message quoting one would encode to
+            # such an id, and the engine would drop the request silently.
+            bad = next(i for i in ids if i >= vocab_size)
+            error = (f"the prompt holds token id {bad}, outside the model vocabulary ({vocab_size}); "
+                     f"the messages contain reserved special-token text: {tokenizer.decode([bad])!r}")
+            tokenized.append((request_id, None, params, (error, INVALID_PROMPT)))
+            return
+        tokenized.append((request_id, token_array(ids), params, None))
 
     results.put(("ready", rank, None))
     pending_flush = False
@@ -473,19 +525,23 @@ def _rank_loop(
                     try:
                         # UNVERIFIED: adding requests between steps while others are in flight
                         # (the offline example adds them all before the first step).
-                        engine.add_request(
+                        seq = engine.add_request(
                             user_id="0",
                             request_id=request_id,
                             sampling_params=sampling_params(**params),
                             prompt_token_ids=token_ids,
                             multi_modal_data=multi_modal_data(),
                         )
+                        if seq is None:
+                            # Dropped without an exception (a token id out of range): it
+                            # would never produce an output, so it must not wait for one.
+                            error = ("the engine rejected the prompt (token id out of range)", INVALID_PROMPT)
                     except Exception as exc:  # noqa: BLE001 (report and keep the rank alive)
-                        error = str(exc)
+                        error = (str(exc), None)
                 if error is None:
                     live[request_id] = _Live(new_detokenizer())
                 else:
-                    items.append((request_id, "", 0, 0, True, error))
+                    items.append((request_id, "", 0, 0, True, *error))
 
             # Collective across the data-parallel group: every rank calls it.
             # UNVERIFIED: that idle ranks may keep calling it (and step() with an
@@ -513,29 +569,44 @@ def _rank_loop(
 
 
 def _collect_step(outputs: Any, clone: Callable[[Any], Any], live: Dict[str, _Live], items: List[tuple]) -> None:
-    """Group one step's outputs by request, detokenize them and append one item per request."""
+    """Group one step's outputs by request, detokenize them and append one item per request.
+
+    A request the scheduler gave up on finishes with a ``finish_reason`` such as
+    ``prompt_length_exceeded`` and a token that was never generated (the last
+    prompt token, or a repeat of the last one sent): that token is dropped and
+    the request ends with an error instead.
+    """
     step: Dict[str, list] = {}
     for raw in outputs:
         # clone: the step's outputs are released by the next step.
         out = clone(raw)
         entry = step.get(out.request_id)
         if entry is None:
-            entry = step[out.request_id] = [[], False, 0]
-        entry[0].append(int(out.token_id))
-        entry[1] = entry[1] or bool(out.finished)
+            entry = step[out.request_id] = [[], False, 0, None]
+        finished = bool(out.finished)
+        reason = getattr(out, "finish_reason", "") if finished else ""
+        if reason and _gave_up(reason):
+            entry[3] = reason
+        else:
+            entry[0].append(int(out.token_id))
+        entry[1] = entry[1] or finished
         entry[2] = int(out.prompt_len)
-    for request_id, (token_ids, finished, prompt_len) in step.items():
+    for request_id, (token_ids, finished, prompt_len, gave_up) in step.items():
         state = live.get(request_id)
         if state is None:
             continue  # aborted
         state.tokens += len(token_ids)
-        text = state.detokenizer.feed(token_ids)
+        text = state.detokenizer.feed(token_ids) if token_ids else ""
         if finished:
             text += state.detokenizer.flush()
             del live[request_id]
         elif not text:
             continue  # nothing final yet (half a character); the totals ride on the next item
-        items.append((request_id, text, state.tokens, prompt_len, finished, None))
+        if gave_up:
+            error = f"DeepInfer finished the request: {gave_up}"
+            items.append((request_id, text, state.tokens, prompt_len, True, error, _ENGINE_GAVE_UP.get(gave_up)))
+        else:
+            items.append((request_id, text, state.tokens, prompt_len, finished, None))
 
 
 class _Stream:
@@ -560,13 +631,14 @@ class _Stream:
 def _merge(items: List[tuple]) -> GenEvent:
     """Everything a request received since its thread last ran, as one event."""
     last = items[-1]
-    error = next((item[5] for item in items if item[5]), None)
+    failed = next((item for item in items if item[5]), None)
     return GenEvent(
         text=last[1] if len(items) == 1 else "".join(item[1] for item in items),
-        finished=bool(last[4]) or error is not None,
+        finished=bool(last[4]) or failed is not None,
         prompt_tokens=last[3],
         completion_tokens=last[2],
-        error=error,
+        error=failed[5] if failed else None,
+        error_code=failed[6] if failed and len(failed) > 6 else None,
     )
 
 
@@ -678,11 +750,35 @@ class DeepInferEngine(Engine):
             ctx.Process(target=_rank_main, args=(r, settings, self._requests[r], self._results), daemon=False)
             for r in range(dp)
         ]
-        for proc in self._procs:
-            proc.start()
+        try:
+            for proc in self._procs:
+                proc.start()
+            self._wait_ready(dp, float(config.get("load_timeout_seconds", 3600)))
+        except BaseException:
+            # The ranks that did start would keep their GPUs, and as non-daemon
+            # processes they would keep this process from exiting.
+            self._stop_ranks(grace=0.0)
+            raise
 
+        self._streams: Dict[str, _Stream] = {}
+        self._owner: Dict[str, int] = {}
+        self._in_flight = [0] * dp
+        self._lock = threading.Lock()
+        self._ids = itertools.count()
+        self._closed = False
+        self._failed: Optional[str] = None
+        self._last_message = time.monotonic()
+        self._stream_interval = float(config.get("stream_interval_ms", 50)) / 1000.0
+        self._chunk_budget = float(config.get("stream_chunks_per_second", 8000))
+        self._heartbeat = float(config.get("stream_heartbeat_seconds", 1.0))
+        self._request_stall = float(config.get("request_stall_seconds", 1800))
+        self._stall_timeout = float(config.get("stall_timeout_seconds", 600))
+        self._close_timeout = float(config.get("close_timeout_seconds", 30))
+        self._reader = threading.Thread(target=self._read_results, name="deepinfer-results", daemon=True)
+        self._reader.start()
+
+    def _wait_ready(self, dp: int, load_timeout: float) -> None:
         ready = set()
-        load_timeout = float(config.get("load_timeout_seconds", 3600))
         deadline = time.time() + load_timeout
         while len(ready) < dp:
             if any(not p.is_alive() for p in self._procs):
@@ -696,18 +792,14 @@ class DeepInferEngine(Engine):
             if kind == "ready":
                 ready.add(rank)
 
-        self._streams: Dict[str, _Stream] = {}
-        self._owner: Dict[str, int] = {}
-        self._in_flight = [0] * dp
-        self._lock = threading.Lock()
-        self._ids = itertools.count()
-        self._closed = False
-        self._stream_interval = float(config.get("stream_interval_ms", 50)) / 1000.0
-        self._chunk_budget = float(config.get("stream_chunks_per_second", 8000))
-        self._reader = threading.Thread(target=self._read_results, name="deepinfer-results", daemon=True)
-        self._reader.start()
-
     def generate(self, request: GenRequest) -> Iterator[GenEvent]:
+        """Stream one request's completion.
+
+        Besides the completion events it yields an empty event (no text, not
+        finished) after ``stream_heartbeat_seconds`` without news, so the HTTP
+        layer can write a keepalive and notice a client that left while the
+        request is queued, prefilling or inside a tool call.
+        """
         request_id = str(next(self._ids))
         stream = _Stream()
         params: Dict[str, Any] = {
@@ -718,20 +810,37 @@ class DeepInferEngine(Engine):
         if request.seed is not None:
             params["seq_seed"] = request.seed
         with self._lock:
-            rank = min(range(len(self._in_flight)), key=lambda r: self._in_flight[r])
-            self._in_flight[rank] += 1
-            self._streams[request_id] = stream
-            self._owner[request_id] = rank
+            failed = self._failed
+            if not failed:
+                rank = min(range(len(self._in_flight)), key=lambda r: self._in_flight[r])
+                self._in_flight[rank] += 1
+                self._streams[request_id] = stream
+                self._owner[request_id] = rank
+        if failed:
+            yield GenEvent(finished=True, error=failed)
+            return
         self._requests[rank].put(("add", request_id, request.prompt, params))
         finished = False
         interval, budget = self._stream_interval, self._chunk_budget
+        heartbeat, request_stall = self._heartbeat or None, self._request_stall
+        last_item = time.monotonic()
         try:
             while not finished:
-                stream.wake.wait()
+                if not stream.wake.wait(heartbeat):
+                    if request_stall and time.monotonic() - last_item > request_stall:
+                        # A backstop: a request the engine lost must not hold its
+                        # client and its slot forever.
+                        self._cancel(request_id)
+                        finished = True
+                        yield GenEvent(finished=True, error=f"no output from DeepInfer for {request_stall:.0f} s")
+                        return
+                    yield GenEvent()
+                    continue
                 stream.wake.clear()
                 items = stream.drain()
                 if not items:
                     continue
+                last_item = time.monotonic()
                 event = _merge(items)
                 finished = event.finished
                 yield event
@@ -751,46 +860,73 @@ class DeepInferEngine(Engine):
 
     def _read_results(self) -> None:
         streams = self._streams
+        next_check = time.monotonic() + 1.0
         while True:
             try:
-                message = self._results.get(timeout=1.0)
-            except queue.Empty:
-                self._check_ranks()
-                continue
-            if message is None:
+                try:
+                    message = self._results.get(timeout=1.0)
+                except queue.Empty:
+                    message = ()
+                if message is None:
+                    return
+                now = time.monotonic()
+                if message or not streams:
+                    self._last_message = now
+                if message and message[0] == "out":
+                    for item in message[2]:
+                        stream = streams.get(item[0])
+                        if stream is None:
+                            continue  # cancelled
+                        stream.items.append(item)
+                        if item[4]:
+                            self._release(item[0])
+                            stream.done.set()
+                        if not stream.wake.is_set():  # a set() per item would cost a lock each
+                            stream.wake.set()
+                # On a timer, not only when the queue is quiet: with independent
+                # ranks a dead one would go unnoticed while the others produce.
+                if now >= next_check:
+                    next_check = now + 1.0
+                    self._check_ranks(now)
+            except Exception as exc:  # noqa: BLE001 (fail loudly instead of hanging every stream)
+                traceback.print_exc(file=sys.stderr)
+                self._fail(f"the DeepInfer results reader failed: {exc!r}")
                 return
-            kind, _rank, items = message
-            if kind != "out":
-                continue
-            for item in items:
-                stream = streams.get(item[0])
-                if stream is None:
-                    continue  # cancelled
-                stream.items.append(item)
-                if item[4]:
-                    self._release(item[0])
-                    stream.done.set()
-                if not stream.wake.is_set():  # a set() per item would cost a lock each
-                    stream.wake.set()
 
-    def _check_ranks(self) -> None:
-        """Fail the requests of a rank that died, so their clients get an error instead of hanging."""
-        if self._closed:
+    def _check_ranks(self, now: float) -> None:
+        """Fail the engine when a rank died or every rank went quiet with requests in flight.
+
+        The data-parallel ranks run in lockstep (``has_unfinished_requests()``
+        all-reduces across them), so once one rank is gone the others block in
+        that collective for good: every request fails, not only the dead rank's.
+        """
+        if self._closed or self._failed:
             return
         for rank, proc in enumerate(self._procs):
-            if proc.is_alive():
-                continue
-            with self._lock:
-                dead = [rid for rid, owner in self._owner.items() if owner == rank]
-            for request_id in dead:
-                stream = self._streams.get(request_id)
-                if stream is None:
-                    continue
-                self._release(request_id)
-                message = f"DeepInfer rank {rank} exited (code {proc.exitcode}); see its log"
-                stream.items.append((request_id, "", 0, 0, True, message))
-                stream.done.set()
-                stream.wake.set()
+            if not proc.is_alive():
+                self._fail(f"DeepInfer rank {rank} exited (code {proc.exitcode}); see its log. "
+                           "The ranks run in lockstep, so the engine stopped: restart the backend")
+                return
+        quiet = now - self._last_message
+        if self._stall_timeout and self._streams and quiet > self._stall_timeout:
+            self._fail(f"no output from any DeepInfer rank for {quiet:.0f} s with "
+                       f"{len(self._streams)} requests in flight; the engine looks hung")
+
+    def _fail(self, message: str) -> None:
+        """Stop serving: fail every request now and later ones at once, and stop the ranks."""
+        with self._lock:
+            if self._failed:
+                return
+            self._failed = message
+            streams = list(self._streams.items())
+        print(f"deepinfer: {message}", file=sys.stderr, flush=True)
+        for request_id, stream in streams:
+            self._release(request_id)
+            stream.items.append((request_id, "", 0, 0, True, message))
+            stream.done.set()
+            stream.wake.set()
+        # The ranks left are blocked in a collective or useless without a reader.
+        self._stop_ranks(grace=0.0)
 
     def _release(self, request_id: str) -> Optional[int]:
         """Forget a request; returns the rank it was on, or None if it was already gone."""
@@ -803,15 +939,34 @@ class DeepInferEngine(Engine):
 
     def _cancel(self, request_id: str) -> None:
         rank = self._release(request_id)
-        if rank is not None and not self._closed:
+        if rank is not None and not self._closed and not self._failed:
             self._requests[rank].put(("abort", request_id))
+
+    def _stop_ranks(self, grace: float) -> None:
+        """Wait up to ``grace`` seconds for the ranks to exit, then terminate, then kill.
+
+        A clean exit is not guaranteed: each rank stops at whatever iteration it
+        reads the stop message, and one still inside the lockstep collective
+        waits for a rank that already left.
+        """
+        procs = [p for p in self._procs if p.pid is not None]
+        deadline = time.monotonic() + grace
+        for proc in procs:
+            proc.join(timeout=max(deadline - time.monotonic(), 0.0))
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+        for proc in procs:
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=5)
 
     def close(self) -> None:
         self._closed = True
         for q in self._requests:
             q.put(None)
-        for proc in self._procs:
-            proc.join(timeout=30)
+        self._stop_ranks(grace=self._close_timeout)
         self._results.put(None)
 
 

@@ -12,6 +12,7 @@ import json
 import pathlib
 import socket
 import sys
+import urllib.error
 import urllib.request
 
 import pytest
@@ -274,11 +275,23 @@ class ToyTokenizer:
     def __init__(self, backend=None) -> None:
         self.backend_tokenizer = backend or ToyByteLevelBackend()
 
-    def encode(self, text: str):
+    def encode(self, text: str, add_special_tokens: bool = True):
         return self.backend_tokenizer.encode_ids(text)
 
     def decode(self, ids, skip_special_tokens: bool = False) -> str:
         return self.backend_tokenizer.decode(ids)
+
+
+class ReleaseToyTokenizer(ToyTokenizer):
+    """Like DeepInfer's release tokenizer: ``add_bos_token`` is forced on (BOS is
+    id 0 here) and the BOS text encodes to id 0 too."""
+
+    def encode(self, text: str, add_special_tokens: bool = True):
+        ids = [0] if add_special_tokens else []
+        if text.startswith(dsv41.bos_token):
+            ids.append(0)
+            text = text[len(dsv41.bos_token):]
+        return ids + super().encode(text)
 
 
 class ToySentencePiece:
@@ -394,6 +407,7 @@ class FakeRankEngine:
     def add_request(self, user_id, request_id, sampling_params, prompt_token_ids, multi_modal_data=None):
         self.added[request_id] = list(prompt_token_ids)
         self.running[request_id] = list(self.completions[request_id])
+        return types.SimpleNamespace(request_id=request_id)  # DeepInfer returns the Sequence
 
     def has_unfinished_requests(self) -> bool:
         return bool(self.running)
@@ -419,14 +433,14 @@ class FakeRankEngine:
         self.running.pop(request_id, None)
 
 
-def _start_rank(engine, tokenizer=None, **settings):
+def _start_rank(engine, tokenizer=None, vocab_size=None, **settings):
     requests, results = queue.Queue(), queue.Queue()
     thread = threading.Thread(
         target=de._rank_loop,
         args=(0, engine, tokenizer or ToyTokenizer(), requests, results,
               {"idle_poll_seconds": 0.001, "tokenizer_threads": 2, **settings}),
         kwargs={"clone": lambda raw: raw, "sampling_params": dict, "token_array": list,
-                "multi_modal_data": lambda: None},
+                "multi_modal_data": lambda: None, "vocab_size": vocab_size},
         daemon=True,
     )
     thread.start()
@@ -494,7 +508,7 @@ def test_rank_drops_a_request_aborted_while_tokenizing() -> None:
     release = threading.Event()
 
     class SlowTokenizer(ToyTokenizer):
-        def encode(self, text):
+        def encode(self, text, add_special_tokens=True):
             release.wait(5)
             return super().encode(text)
 
@@ -513,7 +527,7 @@ def test_rank_drops_a_request_aborted_while_tokenizing() -> None:
 
 def test_rank_reports_tokenization_and_engine_errors_on_the_request() -> None:
     class BrokenTokenizer(ToyTokenizer):
-        def encode(self, text):
+        def encode(self, text, add_special_tokens=True):
             if text == "bad":
                 raise ValueError("cannot tokenize")
             return super().encode(text)
@@ -522,7 +536,7 @@ def test_rank_reports_tokenization_and_engine_errors_on_the_request() -> None:
         def add_request(self, user_id, request_id, **kwargs):
             if request_id == "refused":
                 raise RuntimeError("prompt too long")
-            super().add_request(user_id, request_id, **kwargs)
+            return super().add_request(user_id, request_id, **kwargs)
 
     engine = PickyEngine({"fine": [65, 66]})
     requests, results, thread = _start_rank(engine, BrokenTokenizer())
@@ -534,6 +548,97 @@ def test_rank_reports_tokenization_and_engine_errors_on_the_request() -> None:
     assert "cannot tokenize" in items["broken"][5]
     assert items["refused"][5] == "prompt too long"
     assert items["fine"][5] is None and items["fine"][2] == 2
+
+
+def test_rank_encodes_the_prompt_with_a_single_bos() -> None:
+    tok = ReleaseToyTokenizer()
+    engine = FakeRankEngine({"a": [65]})
+    requests, results, thread = _start_rank(engine, tok)
+    prompt = dsv41.encode_messages([{"role": "user", "content": "hi"}], thinking_mode="chat")
+    assert prompt.startswith(dsv41.bos_token)
+    requests.put(("add", "a", prompt, {}))
+    items = [item for batch in _collect(results, {"a"}) for item in batch]
+    requests.put(None)
+    thread.join(5)
+    ids = engine.added["a"]
+    assert ids[0] == 0 and ids[1] != 0  # one BOS, not the tokenizer's plus the prompt's
+    assert ids == tok.encode(prompt, add_special_tokens=False)
+    assert items[-1][3] == len(ids)  # prompt_tokens counts it once
+
+
+def test_rank_rejects_out_of_vocabulary_ids_and_dropped_requests() -> None:
+    tok = ToyTokenizer()
+
+    class DroppingEngine(FakeRankEngine):
+        def add_request(self, user_id, request_id, **kwargs):
+            if request_id == "dropped":
+                return None  # DeepInfer's add_request on an id it considers invalid
+            return super().add_request(user_id, request_id, **kwargs)
+
+    engine = DroppingEngine({"fine": [65, 66]})
+    # "</think>" is an added token past the 256 byte ids, like the release
+    # tokenizer's multimodal placeholders past the model vocabulary.
+    requests, results, thread = _start_rank(engine, tok, vocab_size=256)
+    for rid, prompt in (("special", "quote </think> here"), ("dropped", "p"), ("fine", "p")):
+        requests.put(("add", rid, prompt, {}))
+    items = {item[0]: item for batch in _collect(results, {"special", "dropped", "fine"}) for item in batch if item[4]}
+    requests.put(None)
+    thread.join(5)
+    assert "special" not in engine.added
+    assert "outside the model vocabulary" in items["special"][5] and items["special"][6] == de.INVALID_PROMPT
+    assert "rejected" in items["dropped"][5] and items["dropped"][6] == de.INVALID_PROMPT
+    assert items["fine"][5] is None and items["fine"][2] == 2
+
+
+def test_rank_turns_requests_the_scheduler_gave_up_on_into_errors() -> None:
+    tok = ToyTokenizer()
+
+    class GivingUpEngine(FakeRankEngine):
+        """``too_long`` is ignored at once; ``preempted`` emits two tokens, then is
+        stopped with a repeat of its last token, like outputs.hpp's ignored_seqs."""
+
+        def step(self):
+            outputs = []
+            for rid in list(self.running):
+                left = self.running[rid]
+                prompt_len = len(self.added[rid])
+                if rid == "too_long":
+                    outputs.append(types.SimpleNamespace(request_id=rid, token_id=self.added[rid][-1], finished=True,
+                                                         prompt_len=prompt_len, finish_reason="prompt_length_exceeded"))
+                    del self.running[rid]
+                elif rid == "preempted" and not left:
+                    outputs.append(types.SimpleNamespace(request_id=rid, token_id=66, finished=True,
+                                                         prompt_len=prompt_len,
+                                                         finish_reason="insufficient_system_resource"))
+                    del self.running[rid]
+                else:
+                    token = left.pop(0)
+                    done = not left and rid != "preempted"
+                    outputs.append(types.SimpleNamespace(request_id=rid, token_id=token, finished=done,
+                                                         prompt_len=prompt_len, finish_reason="stop" if done else ""))
+                    if done:
+                        del self.running[rid]
+            time.sleep(0.002)
+            return outputs
+
+    engine = GivingUpEngine({"too_long": [], "preempted": [65, 66], "fine": [67]})
+    requests, results, thread = _start_rank(engine, tok)
+    for rid in ("too_long", "preempted", "fine"):
+        requests.put(("add", rid, "<think>", {}))
+    messages = _collect(results, {"too_long", "preempted", "fine"})
+    requests.put(None)
+    thread.join(5)
+    by_id = {}
+    for batch in messages:
+        for item in batch:
+            by_id.setdefault(item[0], []).append(item)
+    too_long = by_id["too_long"][-1]
+    assert too_long[1] == "" and too_long[2] == 0 and too_long[4]  # the prompt token is not completion text
+    assert "prompt_length_exceeded" in too_long[5] and too_long[6] == de.CONTEXT_LENGTH_EXCEEDED
+    preempted = by_id["preempted"]
+    assert "".join(item[1] for item in preempted) == "AB" and preempted[-1][2] == 2  # no repeated "B"
+    assert "insufficient_system_resource" in preempted[-1][5] and preempted[-1][6] is None
+    assert by_id["fine"][-1][1] == "C" and by_id["fine"][-1][5] is None
 
 
 # --- the parent side, with in-process queues --------------------------------
@@ -549,8 +654,14 @@ def _parent_engine(stream_interval: float = 0.0, dp: int = 1):
     engine._lock = threading.Lock()
     engine._ids = __import__("itertools").count()
     engine._closed = False
+    engine._failed = None
+    engine._last_message = time.monotonic()
     engine._stream_interval = stream_interval
     engine._chunk_budget = 0.0
+    engine._heartbeat = 0.0
+    engine._request_stall = 0.0
+    engine._stall_timeout = 0.0
+    engine._close_timeout = 1.0
     engine._reader = threading.Thread(target=engine._read_results, daemon=True)
     engine._reader.start()
     return engine
@@ -634,6 +745,179 @@ def test_parent_cancels_on_close_and_reports_errors() -> None:
     reader.join(5)
     assert holder[-1].finished and holder[-1].error == "tokenization failed: boom"
     assert engine._requests[0].empty()  # a finished request is not aborted
+
+
+class _FakeProc:
+    def __init__(self, alive: bool = True) -> None:
+        self.alive, self.exitcode, self.pid = alive, None if alive else -9, None
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+
+def _drain_in_thread(gen):
+    events = []
+    thread = threading.Thread(target=lambda: events.extend(gen), daemon=True)
+    thread.start()
+    return events, thread
+
+
+def test_parent_heartbeats_while_nothing_arrives() -> None:
+    engine = _parent_engine()
+    engine._heartbeat = 0.05
+    gen = engine.generate(de.GenRequest(prompt="p"))
+    events, thread = _drain_in_thread(gen)
+    rid = engine._requests[0].get(timeout=5)[1]
+    time.sleep(0.3)
+    engine._results.put(("out", 0, [(rid, "done", 1, 1, True, None)]))
+    thread.join(5)
+    beats = [e for e in events[:-1] if not e.text and not e.finished]
+    assert len(beats) >= 3 and events[-1].text == "done" and events[-1].finished
+
+
+def test_parent_request_stall_backstop_frees_the_slot() -> None:
+    engine = _parent_engine()
+    engine._heartbeat, engine._request_stall = 0.02, 0.1
+    events, thread = _drain_in_thread(engine.generate(de.GenRequest(prompt="p")))
+    rid = engine._requests[0].get(timeout=5)[1]
+    thread.join(5)
+    assert events[-1].finished and "no output" in events[-1].error
+    assert engine._requests[0].get(timeout=5) == ("abort", rid)
+    assert engine._in_flight == [0] and not engine._streams
+
+
+def test_parent_dead_rank_fails_every_stream_and_new_requests() -> None:
+    engine = _parent_engine(dp=2)
+    engine._procs = [_FakeProc(), _FakeProc()]
+    first, t1 = _drain_in_thread(engine.generate(de.GenRequest(prompt="p")))
+    second, t2 = _drain_in_thread(engine.generate(de.GenRequest(prompt="p")))
+    engine._requests[0].get(timeout=5), engine._requests[1].get(timeout=5)
+    assert engine._in_flight == [1, 1]
+    engine._procs[1].alive = False  # rank 1 dies; rank 0 would hang in the collective
+    t1.join(5), t2.join(5)
+    for events in (first, second):
+        assert events[-1].finished and "rank 1 exited" in events[-1].error
+    assert engine._in_flight == [0, 0] and not engine._streams
+    started = time.time()
+    late = list(engine.generate(de.GenRequest(prompt="p")))
+    assert time.time() - started < 0.5 and late[-1].finished and "rank 1 exited" in late[-1].error
+    assert engine._requests[1].empty()  # nothing routed to the dead rank
+
+
+def test_parent_fails_streams_when_every_rank_goes_quiet() -> None:
+    engine = _parent_engine()
+    engine._stall_timeout = 0.2
+    events, thread = _drain_in_thread(engine.generate(de.GenRequest(prompt="p")))
+    thread.join(5)
+    assert events[-1].finished and "looks hung" in events[-1].error
+
+
+def test_parent_reader_failure_fails_streams_instead_of_hanging() -> None:
+    engine = _parent_engine()
+    events, thread = _drain_in_thread(engine.generate(de.GenRequest(prompt="p")))
+    engine._requests[0].get(timeout=5)
+    engine._results.put(("out", 0, None))  # malformed: the reader cannot iterate it
+    thread.join(5)
+    assert events[-1].finished and "reader failed" in events[-1].error
+    assert list(engine.generate(de.GenRequest(prompt="p")))[-1].error == engine._failed
+
+
+def test_close_terminates_a_rank_that_does_not_stop() -> None:
+    import multiprocessing as mp
+
+    engine = _parent_engine()
+    engine._close_timeout = 0.2
+    proc = mp.get_context("spawn").Process(target=time.sleep, args=(60,), daemon=False)
+    proc.start()
+    engine._procs = [proc]
+    started = time.time()
+    engine.close()
+    assert not proc.is_alive() and time.time() - started < 10
+
+
+class _ScriptedEngine(de.Engine):
+    """Yields the given events; records whether the consumer closed it early."""
+
+    def __init__(self, events, forever=False) -> None:
+        self.events, self.forever, self.closed = events, forever, threading.Event()
+
+    def generate(self, request):
+        try:
+            yield from self.events
+            while self.forever:
+                time.sleep(0.01)
+                yield de.GenEvent()  # heartbeats
+        finally:
+            self.closed.set()
+
+
+def test_chat_stream_yields_keepalives_while_nothing_is_sent() -> None:
+    # A heartbeat this short makes every event without a delta overdue.
+    backend = _backend(thinking_mode="chat", stream_heartbeat_seconds=1e-9)
+    events = [de.GenEvent()]  # the engine's first heartbeat: the role chunk goes out
+    for _ in range(5):
+        events += [de.GenEvent(), de.GenEvent(text="x")]
+    # A tool call being generated: text arrives, but nothing can be sent yet.
+    events += [de.GenEvent(text=db.TOOL_CALLS_START)] + [de.GenEvent(text="...")] * 3
+    events.append(de.GenEvent(text="", finished=True, prompt_tokens=3, completion_tokens=9))
+    backend.engine = _ScriptedEngine(events)
+    chunks = list(backend.chat_stream({"messages": [{"role": "user", "content": "hi"}]}))
+    assert chunks[0]["choices"][0]["delta"]["role"] == "assistant"
+    assert chunks.count(None) >= 5 + 4  # the heartbeats and the tool-call stretch
+    assert chunks[-1]["usage"] == {"prompt_tokens": 3, "completion_tokens": 9, "total_tokens": 12}
+    content = "".join(c["choices"][0]["delta"].get("content", "") or "" for c in chunks if c and c["choices"])
+    assert content == "x" * 5
+
+
+def test_context_length_exceeded_is_a_400_with_its_code() -> None:
+    failed = de.GenEvent(finished=True, error="DeepInfer finished the request: prompt_length_exceeded",
+                         error_code=de.CONTEXT_LENGTH_EXCEEDED)
+    backend = _backend()
+    backend.engine = _ScriptedEngine([failed])
+    with pytest.raises(db.ContextLengthExceeded):
+        backend.chat({"messages": [{"role": "user", "content": "hi"}]})
+
+    port = _free_port()
+    served = db.DeepInferBackend()
+    httpd, _ = serve_mod.serve(served, port, {"engine": "fake"})
+    served.engine = _ScriptedEngine([failed])
+    try:
+        for stream in (False, True):
+            body = {"stream": stream, "messages": [{"role": "user", "content": "hi"}]}
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
+                                         data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with pytest.raises(urllib.error.HTTPError) as info:
+                urllib.request.urlopen(req, timeout=10)
+            assert info.value.code == 400
+            error = json.loads(info.value.read())["error"]
+            assert error["code"] == "context_length_exceeded" and error["type"] == "invalid_request_error"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_runtime_writes_keepalives_and_aborts_when_the_client_leaves() -> None:
+    port = _free_port()
+    served = db.DeepInferBackend()
+    httpd, _ = serve_mod.serve(served, port,
+                               {"engine": "fake", "thinking_mode": "chat", "stream_heartbeat_seconds": 0.01})
+    engine = _ScriptedEngine([de.GenEvent(text="hello")], forever=True)
+    served.engine = engine
+    try:
+        body = json.dumps({"stream": True, "messages": [{"role": "user", "content": "hi"}]}).encode()
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                     + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+        received = b""
+        while b": keepalive" not in received:
+            received += sock.recv(65536)
+        assert b"200" in received.split(b"\r\n", 1)[0] and b'"hello"' in received
+        sock.close()  # the client leaves while the engine has nothing to send
+        assert engine.closed.wait(5)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
 # --- end to end: spawned ranks on the benchmark's simulated DeepInfer ---------
