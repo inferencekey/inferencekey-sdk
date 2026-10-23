@@ -111,6 +111,9 @@ python -m inferencekey.backend.serve --port 8099 --backend deepinfer_backend:Dee
 
 Tests: `bindings/python/tests/test_example_deepinfer.py`.
 
+Throughput of the parent process (router, result queue, detokenization, SSE)
+with simulated ranks, no GPU: `bench/README.md`.
+
 ## What is unverified (check on the first B200 run)
 
 1. DeepInfer builds and imports in the backend's venv (wheel from `build.sh`, `deep_cluster` included).
