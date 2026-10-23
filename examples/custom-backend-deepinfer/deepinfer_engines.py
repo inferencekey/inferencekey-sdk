@@ -1066,6 +1066,8 @@ class DeepInferEngine(Engine):
         self._max_sessions = int(config.get("session_table_size", 100_000))
         self._migrate_at = int(config.get("session_migrate_inflight", 4 * int(settings["llm_kwargs"]["max_num_seqs"])))
         self._used_blocks = [0] * dp  # from the ranks' stats messages
+        self._log_stats_every = float(config.get("log_rank_stats_seconds", 30.0))
+        self._next_stats_log = time.monotonic() + self._log_stats_every
         self._assigned = [0] * dp  # estimated prompt blocks routed since the last stats message
         self.rank_stats: List[Dict[str, Any]] = [{} for _ in range(dp)]
         self.migrations = 0
@@ -1217,6 +1219,9 @@ class DeepInferEngine(Engine):
                         self.rank_stats[rank] = info
                         self._used_blocks[rank] = int(info.get("total_blocks", 0)) - int(info.get("free_blocks", 0))
                         self._assigned[rank] = 0
+                    if self._log_stats_every and now >= self._next_stats_log:
+                        self._next_stats_log = now + self._log_stats_every
+                        self._log_rank_stats()
                 elif message and message[0] == "out":
                     for item in message[2]:
                         stream = streams.get(item[0])
@@ -1237,6 +1242,25 @@ class DeepInferEngine(Engine):
                 traceback.print_exc(file=sys.stderr)
                 self._fail(f"the DeepInfer results reader failed: {exc!r}")
                 return
+
+    def _log_rank_stats(self) -> None:
+        """One line per rank: what the router and the prefix cache see (for diagnosis)."""
+        with self._lock:
+            sessions = [0] * len(self._in_flight)
+            for rank in self._sessions.values():
+                sessions[rank] += 1
+            rows = list(zip(self.rank_stats, self._in_flight, sessions))
+            migrations = self.migrations
+        for info, in_flight, owned in rows:
+            if not info:
+                continue
+            total = max(int(info.get("total_blocks", 0)), 1)
+            used = total - int(info.get("free_blocks", 0))
+            print(f"deepinfer rank {info.get('rank')}: {owned} sessions, {in_flight} in flight, KV {used / total:.0%} used "
+                  f"({info.get('cached_blocks', 0)} cached blocks), hits {info.get('hits', 0)}/{info.get('lookups', 0)} "
+                  f"({info.get('hit_tokens', 0):,} tokens), evicted {info.get('evicted', 0)} blocks, "
+                  f"preempted {info.get('preempted', 0)}, tokenizer cache {info.get('tokenizer_cache_hits', 0)} hits; "
+                  f"migrations {migrations}", file=sys.stderr, flush=True)
 
     def _check_ranks(self, now: float) -> None:
         """Fail the engine when a rank died or every rank went quiet with requests in flight.

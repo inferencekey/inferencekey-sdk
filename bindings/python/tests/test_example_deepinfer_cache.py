@@ -382,3 +382,15 @@ def test_a_rank_dies_with_its_backend_process(tmp_path) -> None:
         time.sleep(0.1)
     os.kill(child, signal.SIGKILL)
     pytest.fail("the rank outlived its parent")
+
+
+def test_rank_stats_log_line(capsys) -> None:
+    engine = _router(dp=2)
+    engine._lock = threading.Lock()
+    engine._sessions.update({"a": 0, "b": 1, "c": 1})
+    engine.rank_stats = [{"rank": 0, "total_blocks": 100, "free_blocks": 40, "cached_blocks": 30, "hits": 3,
+                          "lookups": 4, "hit_tokens": 3000, "evicted": 2}, {}]
+    engine._log_rank_stats()
+    err = capsys.readouterr().err
+    assert "deepinfer rank 0: 1 sessions, 0 in flight, KV 60% used (30 cached blocks), hits 3/4" in err
+    assert "rank 1" not in err  # no stats from it yet

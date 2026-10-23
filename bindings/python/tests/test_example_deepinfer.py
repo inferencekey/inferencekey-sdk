@@ -654,6 +654,8 @@ def _parent_engine(stream_interval: float = 0.0, dp: int = 1):
     engine._affinity = False
     engine._used_blocks, engine._assigned = [0] * dp, [0] * dp
     engine.rank_stats = [{} for _ in range(dp)]
+    engine._log_stats_every, engine._next_stats_log = 0.0, 0.0
+    engine._sessions, engine.migrations = {}, 0
     engine._lock = threading.Lock()
     engine._ids = __import__("itertools").count()
     engine._closed = False

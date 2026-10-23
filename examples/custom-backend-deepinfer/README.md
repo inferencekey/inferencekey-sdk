@@ -148,6 +148,8 @@ It needs DeepInfer with a small patch that adds `LLMEngine.enqueue_with_prefix`,
 | `session_table_size` | `100000` | Sessions remembered by the router (LRU). |
 | `tokenizer_cache_tokens` | `64000000` | Token ids of repeated prompt pieces kept per rank. `0` disables. |
 | `stats_interval_seconds` | `2.0` | How often each rank reports its KV and cache counters to the router. |
+| `log_rank_stats_seconds` | `30` | How often the backend logs one line per rank: sessions, requests in flight, KV used, cached blocks, hits, evictions, preemptions. `0` disables. |
+| `stuck_request_seconds` | `120` | A rank logs, once, any request with no output for this long and where it sits. `0` disables. |
 | `stream_interval_ms` | `50` | Shortest time between two chunks of one stream: tokens that arrive meanwhile go out together. `0` sends every engine step on its own (more CPU in the backend process). |
 | `stream_chunks_per_second` | `8000` | Budget of SSE chunks per second over all streams: with more than 400 streams the interval grows (1,000 streams: 125 ms) so the backend process keeps up. `0` disables. |
 | `abort_on_disconnect` | `true` | Abort the request in DeepInfer when its client disconnects. |
