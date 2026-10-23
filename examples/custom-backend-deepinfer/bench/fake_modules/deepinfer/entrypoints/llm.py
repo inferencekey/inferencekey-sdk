@@ -18,6 +18,18 @@ Lockstep: with ``barrier`` and ``flags`` (multiprocessing objects made by
 ``step()`` ends on a barrier, like DeepInfer's all-reduce and expert-parallel
 collectives: one slow rank (tokenizing a long prompt, prefilling) slows all.
 
+KV cache (``kv_blocks``, 0 = unlimited): a pool of 128-token blocks with
+refcounts, the surface of DeepInfer plus the local prefix-cache patch that the
+backend's ``_RankCache`` uses: ``block_manager.pin_blocks / unpin_blocks /
+get_num_free_blocks``, ``cache_config.num_gpu_blocks``,
+``add_request(enqueue=False)``, ``scheduler.add_sequence_with_prefix(seq,
+blocks, num_cached, swa_valid_start)`` (only the uncached suffix is
+prefilled), ``Sequence.block_table`` and ``finalize_seq(seq)``, called for a
+finished sequence before its blocks are freed. A request is admitted when its
+prompt and ``max_tokens`` fit in the free blocks and the pool is under the
+90 % prefill watermark; otherwise it waits. ``decode_ctx_beta`` adds that many seconds per
+step for every token of context in the running batch (attention cost).
+
 Every ``stats_interval_s`` the rank appends one JSON line with its counters to
 ``<stats_path>.rank<N>`` so the load driver can compare what the ranks produce
 with what the clients receive.
@@ -27,6 +39,7 @@ from __future__ import annotations
 
 import json
 import time
+import types
 import zlib
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional
@@ -46,8 +59,13 @@ _PASSAGE = (
 )
 
 
+BLOCK = 128
+PREFILL_WATERMARK = 0.9
+
+
 class _Seq:
-    __slots__ = ("request_id", "prompt_len", "prefill_left", "max_tokens", "generated", "offset")
+    __slots__ = ("request_id", "prompt_len", "prefill_left", "max_tokens", "generated", "offset",
+                 "block_table", "num_cached_tokens")
 
     def __init__(self, request_id: str, prompt_len: int, max_tokens: int, offset: int) -> None:
         self.request_id = request_id
@@ -56,6 +74,69 @@ class _Seq:
         self.max_tokens = max_tokens
         self.generated = 0
         self.offset = offset
+        self.block_table: List[int] = []
+        self.num_cached_tokens = 0
+
+
+class _BlockManager:
+    """Refcounted block ids; ids are handed out lazily so a huge pool costs nothing."""
+
+    def __init__(self, num_blocks: int) -> None:
+        self.num_blocks = num_blocks
+        self.refs: Dict[int, int] = {}
+        self.released: List[int] = []
+        self.next_fresh = 0
+
+    def get_num_free_blocks(self) -> int:
+        return self.num_blocks - len(self.refs)
+
+    def allocate(self, n: int) -> List[int]:
+        out = []
+        for _ in range(n):
+            if self.released:
+                block = self.released.pop()
+            else:
+                block = self.next_fresh
+                self.next_fresh += 1
+            self.refs[block] = 1
+            out.append(block)
+        return out
+
+    def pin_blocks(self, block_ids: List[int]) -> None:
+        for block in block_ids:
+            self.refs[block] += 1
+
+    def unpin_blocks(self, block_ids: List[int]) -> None:
+        for block in block_ids:
+            n = self.refs[block] - 1
+            if n:
+                self.refs[block] = n
+            else:
+                del self.refs[block]
+                self.released.append(block)
+
+
+class _Scheduler:
+    def __init__(self, engine: "SimEngine") -> None:
+        self.engine = engine
+        self.preempted = 0
+
+    def add_sequence_with_prefix(self, seq: _Seq, blocks: Any, num_cached: int, swa_valid_start: int) -> None:
+        blocks = [int(b) for b in blocks]
+        assert len(blocks) == num_cached // BLOCK, (len(blocks), num_cached)
+        self.engine.block_manager.pin_blocks(blocks)
+        seq.block_table = blocks
+        seq.num_cached_tokens = num_cached
+        seq.prefill_left = seq.prompt_len - num_cached
+        self.engine.hit_tokens += num_cached
+        self.engine.waiting.append(seq)
+
+    def get_num_preempted_seqs(self) -> int:
+        return self.preempted
+
+    def get_sum_prompt_len_waiting(self) -> "tuple[int, int]":
+        waiting = self.engine.waiting
+        return len(waiting), sum(s.prompt_len for s in waiting)
 
 
 class _ModelConfig:
@@ -80,6 +161,13 @@ class SimEngine:
         self.step_s = 1.0 / float(sim.get("step_rate", 70.0))
         self.tokens_per_step = int(sim.get("tokens_per_step", 1))
         self.prefill_rate = float(sim.get("prefill_tokens_per_s", 0.0))
+        self.decode_ctx_beta = float(sim.get("decode_ctx_beta", 0.0))
+        kv_blocks = int(sim.get("kv_blocks", 0)) or 1 << 40
+        self.block_manager = _BlockManager(kv_blocks)
+        self.cache_config = types.SimpleNamespace(num_gpu_blocks=kv_blocks)
+        self.scheduler = _Scheduler(self)
+        self.hit_tokens = 0
+        self.prompt_tokens = 0
         self.barrier = sim.get("barrier")
         self.flags = sim.get("flags")
         self.stats_path: Optional[str] = sim.get("stats_path")
@@ -97,12 +185,29 @@ class SimEngine:
     # --- the calls _rank_main makes -------------------------------------------
 
     def add_request(self, user_id: str, request_id: str, sampling_params: Any, prompt_token_ids: Any,
-                    multi_modal_data: Optional[dict] = None, **_: Any) -> _Seq:
+                    multi_modal_data: Optional[dict] = None, enqueue: bool = True, **_: Any) -> _Seq:
         # Like DeepInfer, the new sequence is returned (None would mean "dropped").
         offset = zlib.crc32(request_id.encode()) % len(self.token_ids)
         seq = _Seq(request_id, len(prompt_token_ids), sampling_params.max_tokens, offset)
-        self.waiting.append(seq)
+        self.prompt_tokens += seq.prompt_len
+        if enqueue:
+            self.waiting.append(seq)
         return seq
+
+    def finalize_seq(self, seq: _Seq) -> None:
+        """DeepInfer's hook for a finished sequence; frees its blocks (the backend wraps it)."""
+        self.block_manager.unpin_blocks(seq.block_table)
+        seq.block_table = []
+
+    def _admit(self, seq: _Seq) -> bool:
+        bm = self.block_manager
+        need = -(-(seq.prompt_len + seq.max_tokens) // BLOCK) - len(seq.block_table)
+        used = bm.num_blocks - bm.get_num_free_blocks()
+        # As DeepInfer: no new prefill above the watermark, and the blocks must exist.
+        if used > PREFILL_WATERMARK * bm.num_blocks or need > bm.get_num_free_blocks():
+            return False
+        seq.block_table = seq.block_table + bm.allocate(need)
+        return True
 
     def has_unfinished_requests(self) -> bool:
         local = bool(self.waiting or self.prefilling or self.running)
@@ -118,6 +223,8 @@ class SimEngine:
 
     def step(self) -> List[RequestOutput]:
         while self.waiting and len(self.prefilling) + len(self.running) < self.max_num_seqs:
+            if not self._admit(self.waiting[0]):
+                break  # FIFO: wait for blocks to free up
             self.prefilling.append(self.waiting.popleft())
 
         outputs: List[RequestOutput] = []
@@ -146,6 +253,8 @@ class SimEngine:
         self.prefilling = still_prefilling
 
         work = self.step_s + (prefill_tokens / self.prefill_rate if self.prefill_rate > 0 else 0.0)
+        if self.decode_ctx_beta:
+            work += self.decode_ctx_beta * sum(s.prompt_len + s.generated for s in self.running)
         now = time.perf_counter()
         # Steps follow a fixed grid while the rank keeps up, so the loop's own
         # overhead (barriers, queue polling) is absorbed like GPU time overlapping
@@ -168,6 +277,11 @@ class SimEngine:
     def abort_request(self, request_id: Any) -> tuple:
         ids = {request_id} if isinstance(request_id, str) else set(request_id)
         before = len(self.waiting) + len(self.prefilling) + len(self.running)
+        for seq in [*self.waiting, *self.prefilling, *self.running]:
+            if seq.request_id in ids:
+                # Aborts free the blocks directly, without finalize_seq (as the C++ abort does).
+                self.block_manager.unpin_blocks(seq.block_table)
+                seq.block_table = []
         self.waiting = deque(s for s in self.waiting if s.request_id not in ids)
         self.prefilling = [s for s in self.prefilling if s.request_id not in ids]
         self.running = [s for s in self.running if s.request_id not in ids]
@@ -186,6 +300,7 @@ class SimEngine:
             outputs.append(RequestOutput(seq.request_id, token, finished, seq.prompt_len,
                                          "length" if finished else ""))
             if finished:
+                self.finalize_seq(seq)
                 return True
         return False
 
@@ -200,6 +315,8 @@ class SimEngine:
             "rank": self.rank, "t": now, "steps": self.steps, "tokens": self.tokens,
             "prefilled": self.prefilled, "running": len(self.running),
             "prefilling": len(self.prefilling), "waiting": len(self.waiting),
+            "free_blocks": self.block_manager.get_num_free_blocks(), "hit_tokens": self.hit_tokens,
+            "prompt_tokens": self.prompt_tokens,
         }
         with open(f"{self.stats_path}.rank{self.rank}", "a", encoding="utf-8") as fh:
             fh.write(json.dumps(line) + "\n")

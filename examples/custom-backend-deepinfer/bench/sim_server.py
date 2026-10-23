@@ -50,6 +50,8 @@ def build_config(args: argparse.Namespace) -> dict:
         "step_rate": args.step_rate,
         "tokens_per_step": args.tokens_per_step,
         "prefill_tokens_per_s": args.prefill_rate,
+        "kv_blocks": args.kv_blocks,
+        "decode_ctx_beta": args.decode_ctx_beta,
         "tokenizer": "fake" if args.fake_tokenizer else "hf",
         "stats_path": args.stats_path,
     }
@@ -81,6 +83,10 @@ def main() -> None:
     parser.add_argument("--max-num-batched-tokens", type=int, default=32768)
     parser.add_argument("--prefill-rate", type=float, default=88000.0,
                         help="prompt tokens per second per rank (0: prefill is free)")
+    parser.add_argument("--kv-blocks", type=int, default=0,
+                        help="KV cache blocks of 128 tokens per rank (0: unlimited)")
+    parser.add_argument("--decode-ctx-beta", type=float, default=0.0,
+                        help="extra seconds per decode step per token of context in the batch")
     parser.add_argument("--tokenizer-dir", default=os.environ.get("BENCH_TOKENIZER_DIR", ""),
                         help="directory with the DeepSeek-V4.1 tokenizer.json and tokenizer_config.json")
     parser.add_argument("--fake-tokenizer", action="store_true",
