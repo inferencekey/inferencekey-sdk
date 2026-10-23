@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 from array import array
+from collections import OrderedDict
 from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 BLOCK = 128
@@ -60,23 +61,29 @@ def usable_hit(hit_blocks: int, prompt_len: int, block: int = BLOCK) -> int:
 
 
 class _Node:
-    __slots__ = ("block_id", "parent", "children", "last_used")
+    __slots__ = ("block_id", "parent", "children", "depth")
 
-    def __init__(self, block_id: int, parent: Optional[bytes], last_used: int) -> None:
+    def __init__(self, block_id: int, parent: Optional[bytes], depth: int) -> None:
         self.block_id = block_id
         self.parent = parent
         self.children = 0
-        self.last_used = last_used
+        self.depth = depth  # position of the block in its chain
 
 
 class PrefixIndex:
-    """Chain hash -> GPU block, with leaf-only LRU eviction."""
+    """Chain hash -> GPU block, with leaf-only LRU eviction.
+
+    The evictable leaves (no children, not protected) are kept in an
+    ``OrderedDict``, oldest first, so eviction pops from the front instead of
+    sorting every node on each call (about 0.2 s for 226K nodes, on the
+    lockstep thread, and with the host tier eviction runs on almost every step).
+    """
 
     def __init__(self, pin: Callable[[List[int]], None], unpin: Callable[[List[int]], None]) -> None:
         self._pin = pin
         self._unpin = unpin
         self._nodes: Dict[bytes, _Node] = {}
-        self._clock = 0
+        self._leaves: "OrderedDict[bytes, None]" = OrderedDict()  # evictable leaves, least recently used first
         self.protected: Dict[bytes, int] = {}  # node -> running sequences using it
         self.hits = 0
         self.hit_tokens = 0
@@ -87,92 +94,127 @@ class PrefixIndex:
     def __len__(self) -> int:
         return len(self._nodes)
 
-    def _tick(self) -> int:
-        self._clock += 1
-        return self._clock
+    def __contains__(self, h: bytes) -> bool:
+        return h in self._nodes
 
-    def lookup(self, hashes: Sequence[bytes]) -> List[int]:
+    def lookup(self, hashes: Sequence[bytes], count: bool = True) -> List[int]:
         """GPU blocks of the longest cached prefix of ``hashes`` (touched as used)."""
-        self.lookups += 1
+        if count:
+            self.lookups += 1
         blocks: List[int] = []
-        now = self._tick()
+        leaves = self._leaves
         for h in hashes:
             node = self._nodes.get(h)
             if node is None:
                 break
-            node.last_used = now
+            if h in leaves:
+                leaves.move_to_end(h)
             blocks.append(node.block_id)
         return blocks
 
     def protect(self, hashes: Iterable[bytes]) -> None:
         for h in hashes:
-            self.protected[h] = self.protected.get(h, 0) + 1
+            n = self.protected.get(h, 0)
+            if not n:
+                self._leaves.pop(h, None)
+            self.protected[h] = n + 1
 
     def unprotect(self, hashes: Iterable[bytes]) -> None:
         for h in hashes:
             n = self.protected.get(h, 0) - 1
             if n > 0:
                 self.protected[h] = n
-            else:
-                self.protected.pop(h, None)
+            elif self.protected.pop(h, None) is not None:
+                node = self._nodes.get(h)
+                if node is not None and node.children == 0:
+                    self._leaves[h] = None
 
-    def insert(self, hashes: Sequence[bytes], block_ids: Sequence[int]) -> int:
+    def insert(self, hashes: Sequence[bytes], block_ids: Sequence[int], adopt_from: Optional[int] = None,
+               duplicates: Optional[List[int]] = None) -> int:
         """Cache ``block_ids[i]`` under ``hashes[i]`` for the blocks not cached yet;
-        returns how many were added (each gets one pin)."""
-        now = self._tick()
-        new_hashes: List[bytes] = []
+        returns how many were added.
+
+        Pass the whole chain from its first block, so parent links stay right.
+        Without ``adopt_from`` each added block gets one pin. With
+        ``adopt_from = k``, positions ``>= k`` carry a reference the caller
+        already holds (a block restored from the host tier), which the index
+        takes over instead of pinning; a position ``>= k`` that is already
+        cached under another block id is appended to ``duplicates`` so the
+        caller drops its reference. Positions ``< k`` behave as without it.
+        """
         new_blocks: List[int] = []
+        added = 0
         parent: Optional[bytes] = None
-        for h, block_id in zip(hashes, block_ids):
-            node = self._nodes.get(h)
+        nodes, leaves = self._nodes, self._leaves
+        for i, (h, block_id) in enumerate(zip(hashes, block_ids)):
+            adopted = adopt_from is not None and i >= adopt_from
+            node = nodes.get(h)
             if node is None:
-                node = _Node(int(block_id), parent, now)
-                self._nodes[h] = node
+                node = _Node(int(block_id), parent, i)
+                nodes[h] = node
                 if parent is not None:
-                    self._nodes[parent].children += 1
-                new_hashes.append(h)
-                new_blocks.append(int(block_id))
+                    parent_node = nodes[parent]
+                    if parent_node.children == 0:
+                        leaves.pop(parent, None)
+                    parent_node.children += 1
+                if h not in self.protected:
+                    leaves[h] = None
+                if not adopted:
+                    new_blocks.append(int(block_id))
+                added += 1
             else:
-                node.last_used = now
+                if h in leaves:
+                    leaves.move_to_end(h)
+                if adopted and node.block_id != int(block_id) and duplicates is not None:
+                    duplicates.append(int(block_id))
             parent = h
         if new_blocks:
             self._pin(new_blocks)
-            self.inserted += len(new_blocks)
-        return len(new_blocks)
+        self.inserted += added
+        return added
 
-    def evict(self, blocks_wanted: int) -> int:
-        """Unpin up to ``blocks_wanted`` least recently used leaves that no running
-        sequence uses; returns how many were unpinned."""
-        if blocks_wanted <= 0 or not self._nodes:
+    def evict(self, blocks_wanted: int,
+              demote: Optional[Callable[[List[bytes], List[int], List[int]], None]] = None) -> int:
+        """Drop up to ``blocks_wanted`` least recently used leaves that no running
+        sequence uses; returns how many left the index.
+
+        Without ``demote`` their pins are released. With it, ``demote(hashes,
+        block_ids, depths)`` takes the pins over (the host tier copies the blocks
+        out first), deepest leaves first.
+        """
+        if blocks_wanted <= 0 or not self._leaves:
             return 0
-        leaves = sorted((n.last_used, h) for h, n in self._nodes.items()
-                        if n.children == 0 and h not in self.protected)
+        nodes, leaves = self._nodes, self._leaves
+        hashes: List[bytes] = []
         freed: List[int] = []
-        queue = [h for _, h in leaves]
-        i = 0
-        while len(freed) < blocks_wanted and i < len(queue):
-            h = queue[i]
-            i += 1
-            node = self._nodes.pop(h, None)
-            if node is None:
-                continue
+        depths: List[int] = []
+        while len(freed) < blocks_wanted and leaves:
+            h, _ = leaves.popitem(last=False)
+            node = nodes.pop(h)
+            hashes.append(h)
             freed.append(node.block_id)
+            depths.append(node.depth)
             if node.parent is not None:
-                parent = self._nodes.get(node.parent)
+                parent = nodes.get(node.parent)
                 if parent is not None:
                     parent.children -= 1
                     if parent.children == 0 and node.parent not in self.protected:
                         # The parent became a leaf; it is older than anything
                         # touched after it, so it goes next in line.
-                        queue.insert(i, node.parent)
+                        leaves[node.parent] = None
+                        leaves.move_to_end(node.parent, last=False)
         if freed:
-            self._unpin(freed)
             self.evicted += len(freed)
+            if demote is not None:
+                demote(hashes, freed, depths)
+            else:
+                self._unpin(freed)
         return len(freed)
 
     def clear(self) -> int:
         blocks = [n.block_id for n in self._nodes.values()]
         self._nodes.clear()
+        self._leaves.clear()
         if blocks:
             self._unpin(blocks)
         return len(blocks)
