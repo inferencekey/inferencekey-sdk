@@ -68,7 +68,19 @@ $PY $B/load.py --concurrency 50,200,400                       # burst, like prod
 $PY $B/load.py --concurrency 200,400 --ramp-s 20              # starts spread over 20 s
 $PY $B/load.py --concurrency 50 --prompt-tokens 137000        # long prompts
 $PY $B/load.py --fake-tokenizer --concurrency 50,200          # no tokenizer files
+$PY $B/load.py --backend null --concurrency 50,200,400,800     # the runtime alone
+$PY $B/load.py --backend null --transport native ...           # refused unless the backend serves native
 ```
+
+`--backend null` serves `null_backend.py` through the real
+`python -m inferencekey.backend.serve` CLI: a backend whose `chat_stream`
+only yields `--max-tokens` one-token chunks at `--tok-s` (50) tokens per
+second, with no engine, no tokenizer and no multiprocessing, so whatever limits
+it is the runtime's HTTP/SSE layer (`--chunk-format str` makes it yield
+pre-serialized chunks). `--transport stdlib|native` sets `IK_BACKEND_HTTP` for
+the backend, and `load.py` refuses to report a level unless the backend's
+`http transport: ...` startup line names that transport (a runtime that prints
+no such line predates the native transport and counts as `stdlib`).
 
 Each level starts a fresh `sim_server.py`, runs N streams of `--max-tokens`
 (256) from `--client-procs` (4) client processes, prints one JSON line and, with
@@ -90,6 +102,16 @@ Fields of a result line:
 | `ranks_done_s`, `clients_done_s` | when the ranks produced their last token and when the clients received it; the gap is backlog queued in the parent |
 | `sim_ceiling_tok_s` | what the ranks allow: min(N, dp x max_num_seqs) x step_rate x tokens_per_step |
 | `errors`, `error_samples` | failed streams (the baseline's connection resets came from the listen backlog of 5) |
+| `error_kinds` | failed streams by kind: `reset`, `refused`, `timeout`, `eof` (closed before `[DONE]`), `status` (not 200), `error_event` |
+| `done_pct` | streams that ended with `[DONE]` and no error event |
+| `offered_tok_s`, `delivered_pct` | what the backend can produce with every stream open at once (null: N x `--tok-s`; DeepInfer: the sim ceiling) and `steady_tok_s` as a share of it. With `--ramp-s` the streams are not all open at once, so the share is arrival-bound there. |
+| `per_stream_tok_s.p5`, `ttft_s.p99`, `gap_ms` | slowest streams, slowest first tokens, and the gap between consecutive content chunks of a stream (median, p99, max) |
+| `healthz` | the side prober: GET `/healthz` every 500 ms with a 3 s timeout, like the worker; latency p50, p99 and max, and misses (no answer in 3 s, a connection error, or a status other than 200 and 503) |
+| `busiest_thread` | the parent thread with the most CPU over the run, % of one core (from `/proc/<pid>/task`, what `pidstat -t` reads) |
+| `python_user_cores` | user-mode CPU of the parent's Python threads, in cores: an upper bound of the GIL-held fraction |
+| `gil` | `py-spy record --gil --nonblocking` on the parent during the run: `gil_held_fraction` (samples / rate x seconds; without pausing the process py-spy reads the GIL's last holder, so threads that just released it around a socket write or a sleep still count: an upper bound), `serving_leaf_share` (samples whose innermost frame is in `socketserver`, `http.server`, `serve.py`, `json` or `socket`) and the top innermost frames. A blocking py-spy pauses all threads at every sample and halved the throughput at 400 streams, so it is not used. `--py-spy ''` turns it off. |
+| `rss_mb_max` | peak RSS of the parent |
+| `frames_per_chunk`, `debug_stats` | native transport only: `/debug/stats` frames written per chunk pushed (coalescing) |
 
 ## Baseline (2026-10-23, before the fix)
 
@@ -259,6 +281,69 @@ ceiling). The 400-stream runs are close to the parent's limit, see point 7.
    `stream_chunks_per_second`, or split the HTTP layer across processes.
    Keepalives (`stream_heartbeat_seconds`) only fire on streams that have had
    nothing to send for a second, so they add nothing while tokens flow.
+
+## Serving layer baseline (2026-10-23, stdlib transport)
+
+The baseline for the native HTTP/SSE transport (IK-537), taken with the
+runtime's standard library server (`ThreadingHTTPServer`, backlog 1024, one
+thread per connection) after the DeepInfer fix above. Same shared 12-vCPU VM
+(load average 3 to 4.5), 256 new tokens per stream, one run per row. Raw lines:
+`results/serving-baseline-2026-10-23.jsonl`. Parent CPU is the mean between
+the first and the last token, kernel share in parentheses; healthz is
+p50 / p99 / max in ms and misses / probes.
+
+### Bench A: null backend (the runtime alone), 50 tok/s per stream
+
+| Run | N | OK | Offered tok/s | Total tok/s | Steady tok/s (delivered) | Per stream tok/s p5 / median | TTFT median / p99 (s) | Gap p99 (ms) | Healthz p50 / p99 / max (misses) | Parent CPU % (kernel) | Busiest thread % | Python user cores | py-spy GIL / serving share |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| burst | 50 | 50 | 2,500 | 2,494 | 2,500 (100 %) | 50.2 / 50.2 | 0.012 / 0.024 | 20.7 | 0.9 / 1.9 / 1.9 (0 of 11) | 18 (12) | 0.4 | 0.06 | 0.10 / 0.33 |
+| burst | 200 | 200 | 10,000 | 9,753 | 10,000 (100 %) | 50.2 / 50.2 | 0.056 / 0.134 | 21.5 | 1.3 / 4.6 / 4.6 (0 of 11) | 78 (43) | 0.4 | 0.35 | 0.29 / 0.18 |
+| burst | 400 | 400 | 20,000 | 11,819 | 17,962 (**90 %**) | 49.8 / 50.2 | 0.165 / **3.48** | 71.3 | 1.3 / 127 / 127 (**1 of 13**) | 141 (93) | 1.0 | 0.48 | 0.35 / 0.53 |
+| burst | 800 | 800 | 40,000 | 13,405 | 16,237 (**41 %**) | 49.6 / 50.2 | 2.94 / **9.88** | 69.0 | 1.5 / 809 / 809 (**3 of 15**) | 161 (103) | 1.4 | 0.58 | 0.41 / 0.57 |
+| ramp 20 s | 50 | 50 | 2,500 | 518 | 638 (arrival-bound) | 50.2 / 50.2 | 0.001 / 0.003 | 20.8 | 0.8 / 2.7 / 2.7 (0 of 50) | 5 (3) | 0.1 | 0.02 | 0.02 / 0.75 |
+| ramp 20 s | 200 | 200 | 10,000 | 2,048 | 2,560 (arrival-bound) | 50.2 / 50.2 | 0.002 / 0.005 | 22.2 | 1.1 / 3.8 / 3.8 (0 of 51) | 21 (11) | 0.2 | 0.10 | 0.06 / 0.63 |
+| ramp 20 s | 400 | 400 | 20,000 | 4,087 | 5,120 (arrival-bound) | 50.2 / 50.2 | 0.002 / 0.005 | 22.1 | 1.0 / 4.8 / 4.8 (0 of 51) | 42 (25) | 0.4 | 0.17 | 0.11 / 0.50 |
+| ramp 20 s | 800 | 800 | 40,000 | 8,167 | 10,239 (arrival-bound) | 50.2 / 50.2 | 0.002 / 0.007 | 22.5 | 1.5 / 10.1 / 10.1 (0 of 51) | 79 (47) | 0.8 | 0.31 | 0.22 / 0.43 |
+
+Against gate 1 (section 9.5 of the design), the stdlib transport fails at
+burst: 90 % delivered at 400 streams (target 95 %) and 41 % at 800 (target
+90 %), first tokens up to 3.5 s and 9.9 s late, and `/healthz` taking up to
+0.8 s with misses. No connection was reset (the backlog of 1024 holds). The
+busiest thread stays near 1 % because every stream has its own thread; the
+cost is the parent as a whole: about 1.4 to 1.6 cores, two thirds of it
+kernel time (one `write` and one `flush` per chunk, thread wake-ups), behind
+one GIL. Spread over 20 s the same 800 streams are cheap (0.8 cores), so the
+burst, not the steady rate, is what breaks it.
+
+### Bench B: DeepInfer with simulated ranks (after the DeepInfer fix)
+
+Defaults (dp 4, 70 steps/s, 1 token per step, `max_num_seqs` 128, so the
+ceiling is 512 streams), burst.
+
+| Tokenizer | N | OK | Sim ceiling tok/s | Total tok/s | Steady tok/s (delivered) | Per stream tok/s p5 / median | TTFT median / p99 (s) | Gap p99 (ms) | Healthz p50 / p99 / max (misses) | Parent CPU % (kernel) | Busiest thread % | Python user cores | py-spy GIL / serving share |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| fake | 50 | 50 | 3,500 | 3,434 | 3,483 (100 %) | 70.2 / 70.3 | 0.049 / 0.078 | 51.4 | 0.9 / 2.1 / 2.1 (0 of 8) | 15 (6) | 1.7 | 0.10 | 0.04 / 0.62 |
+| fake | 200 | 200 | 14,000 | 13,383 | 14,008 (100 %) | 69.7 / 70.1 | 0.104 / 0.163 | 52.3 | 0.9 / 4.6 / 4.6 (0 of 8) | 51 (20) | 3.7 | 0.31 | 0.09 / 0.66 |
+| fake | 400 | 400 | 28,000 | 24,569 | 27,966 (100 %) | 66.2 / 67.2 | 0.224 / 0.509 | 59.3 | 1.5 / 19.4 / 19.4 (0 of 9) | 109 (48) | 5.9 | 0.60 | 0.17 / 0.80 |
+| fake | 800 | 800 | 35,840 | 24,776 | 27,624 (77 %) | 59.7 / 61.2 | 0.463 / 4.60 | 106.2 | 1.0 / 961 / 961 (0 of 16) | 91 (41) | 5.7 | 0.50 | 0.13 / 0.78 |
+| real | 50 | 50 | 3,500 | 3,435 | 3,507 (100 %) | 70.2 / 70.3 | 0.058 / 0.073 | 51.5 | 1.0 / 1.9 / 1.9 (0 of 8) | 16 (6) | 1.4 | 0.10 | 0.05 / 0.65 |
+| real | 200 | 200 | 14,000 | 13,324 | 13,972 (100 %) | 69.9 / 70.1 | 0.114 / 0.188 | 52.3 | 1.0 / 1.7 / 1.7 (0 of 8) | 51 (21) | 3.1 | 0.29 | 0.06 / 0.65 |
+| real | 400 | 400 | 28,000 | 24,882 | 28,006 (100 %) | 68.9 / 69.5 | 0.174 / 0.448 | 61.3 | 2.7 / 5.3 / 5.3 (0 of 9) | 105 (49) | 5.6 | 0.56 | 0.15 / 0.79 |
+| real | 800 | 800 | 35,840 | 26,714 | 33,779 (94 %) | 68.3 / 69.5 | 0.622 / 4.03 | 103.4 | 1.0 / 1,166 / 1,166 (0 of 15) | 90 (39) | 5.7 | 0.51 | 0.14 / 0.76 |
+| real, 140 steps/s, 1,024 tokens | 400 | 400 | 56,000 | 52,567 | 56,058 (100 %) | 138.5 / 139.2 | 0.169 / 0.460 | 58.5 | 1.7 / 30.7 / 30.7 (0 of 16) | 111 (47) | 9.9 | 0.65 | 0.17 / 0.76 |
+
+With the DeepInfer fix the parent keeps up with the simulated ranks up to
+400 streams (gate 2's throughput target holds on stdlib), but it spends about
+1.1 cores doing it, almost half in the kernel, and at 400 streams three
+quarters of its GIL samples sit in the serving layer (gate 2 wants under 5 %).
+At 800 streams (past the 512-stream ceiling, so 288 wait in the engine) the
+burst of connections pushes `/healthz` past one second and first tokens past
+4 s. These are the numbers the native transport has to beat; the gates are
+measured on the same harness with `--transport native`.
+
+Reading the py-spy column: it is an upper bound (see `gil` above), and on this
+harness the serving share includes `json.dumps` of every chunk, which stays in
+Python with the native transport too.
 
 ### What the simulation does not model
 

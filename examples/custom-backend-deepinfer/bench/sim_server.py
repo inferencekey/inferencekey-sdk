@@ -2,7 +2,7 @@
 
 Everything on the parent side is the production code: ``DeepInferBackend``,
 ``DeepInferEngine`` (router, request and result queues, reader thread,
-detokenization), and the ``ThreadingHTTPServer`` of ``inferencekey.backend.serve``.
+detokenization), and the HTTP server of ``inferencekey.backend.serve``.
 Even the rank loop is the real ``_rank_main``; only what it imports is
 simulated: ``bench/fake_modules`` holds a stand-in ``torch`` and ``deepinfer``
 (see ``fake_modules/deepinfer/entrypoints/llm.py`` for the rank model), and it
@@ -106,6 +106,9 @@ def main() -> None:
     sys.path.append(str(FAKE_MODULES))
 
     from deepinfer_backend import DeepInferBackend  # noqa: PLC0415
+    from null_backend import allow_ptrace  # noqa: PLC0415
+
+    allow_ptrace()  # so load.py's py-spy (a sibling, not an ancestor) may attach
 
     from inferencekey.backend.serve import serve_backend  # noqa: PLC0415
 
