@@ -123,8 +123,11 @@ context is about 11 s of one rank). With `prefix_cache` on (the default):
   from the cache; requests may set `ignore_eos`.
 
 It needs DeepInfer with a small patch that adds `LLMEngine.enqueue_with_prefix`,
-`Scheduler.add_sequence_with_prefix` and `Sequence.block_table` (only
-`deepinfer._C` is rebuilt). Without it, set `prefix_cache: false`.
+`Scheduler.add_sequence_with_prefix` and `Sequence.block_table`. The prebuilt
+package [inferencekey/deepinfer-sm100-cu132](https://huggingface.co/inferencekey/deepinfer-sm100-cu132)
+ships DeepInfer built with it (`patches/deepinfer-prefix-cache.patch`, and
+`rebuild-deepinfer-C.sh` to apply it to another tree). Without it, set
+`prefix_cache: false`.
 
 ## Workload config
 
