@@ -550,6 +550,7 @@ def _parent_engine(stream_interval: float = 0.0, dp: int = 1):
     engine._ids = __import__("itertools").count()
     engine._closed = False
     engine._stream_interval = stream_interval
+    engine._chunk_budget = 0.0
     engine._reader = threading.Thread(target=engine._read_results, daemon=True)
     engine._reader.start()
     return engine
@@ -591,6 +592,22 @@ def test_parent_stream_interval_batches_steps_without_delaying_the_end() -> None
     assert "".join(e.text for e in events) == "x" * 10
     assert len(events) <= 3 and events[-1].completion_tokens == 10
     assert time.time() - started < 0.2 + 0.15  # the last item cut the interval short
+
+
+def test_parent_chunk_budget_stretches_the_interval_with_many_streams() -> None:
+    engine = _parent_engine(stream_interval=0.0)
+    engine._chunk_budget = 10.0  # one stream may send 10 chunks per second
+    gen = engine.generate(de.GenRequest(prompt="p"))
+    events = []
+    reader = threading.Thread(target=lambda: events.extend(gen), daemon=True)
+    reader.start()
+    rid = engine._requests[0].get(timeout=5)[1]
+    for i in range(20):
+        engine._results.put(("out", 0, [(rid, "y", i + 1, 3, i == 19, None)]))
+        time.sleep(0.005)
+    reader.join(5)
+    assert "".join(e.text for e in events) == "y" * 20
+    assert len(events) <= 3 and events[-1].completion_tokens == 20
 
 
 def test_parent_cancels_on_close_and_reports_errors() -> None:

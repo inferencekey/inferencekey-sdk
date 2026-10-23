@@ -703,6 +703,7 @@ class DeepInferEngine(Engine):
         self._ids = itertools.count()
         self._closed = False
         self._stream_interval = float(config.get("stream_interval_ms", 50)) / 1000.0
+        self._chunk_budget = float(config.get("stream_chunks_per_second", 8000))
         self._reader = threading.Thread(target=self._read_results, name="deepinfer-results", daemon=True)
         self._reader.start()
 
@@ -723,7 +724,7 @@ class DeepInferEngine(Engine):
             self._owner[request_id] = rank
         self._requests[rank].put(("add", request_id, request.prompt, params))
         finished = False
-        interval = self._stream_interval
+        interval, budget = self._stream_interval, self._chunk_budget
         try:
             while not finished:
                 stream.wake.wait()
@@ -734,11 +735,15 @@ class DeepInferEngine(Engine):
                 event = _merge(items)
                 finished = event.finished
                 yield event
-                if interval and not finished:
+                if not finished:
                     # Let a few steps pile up: one wake-up and one SSE write per
-                    # interval instead of per step keeps this process cheap. The
-                    # last item cuts the wait short, so a request never ends late.
-                    stream.done.wait(interval)
+                    # interval instead of per step keeps this process cheap, and
+                    # the interval grows with the number of streams so the total
+                    # stays within the chunk budget. The last item cuts the wait
+                    # short, so a request never ends late.
+                    wait = max(interval, len(self._streams) / budget) if budget else interval
+                    if wait:
+                        stream.done.wait(wait)
         finally:
             if not finished:
                 # The consumer stopped early (client disconnected): free the slot.
