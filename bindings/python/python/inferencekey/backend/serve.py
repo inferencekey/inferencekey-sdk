@@ -75,6 +75,18 @@ HOST = "127.0.0.1"
 #: Cap request bodies so a misbehaving client cannot exhaust memory.
 _MAX_BODY_BYTES = 16 * 1024 * 1024
 
+#: Listen backlog. The stdlib default (5) resets connections as soon as a few
+#: hundred clients open streams at once (one LLM backend serving 400 developers
+#: lost about 300 of 400 that way); the kernel caps it at ``net.core.somaxconn``.
+LISTEN_BACKLOG = 1024
+
+
+class _HTTPServer(ThreadingHTTPServer):
+    """One daemon thread per connection, with a backlog sized for bursts of streams."""
+
+    request_queue_size = LISTEN_BACKLOG
+    daemon_threads = True
+
 
 def _log(message: str) -> None:
     """Emit one line to stdout (operational logs; no secrets)."""
@@ -410,7 +422,10 @@ def _make_handler(state: _BackendState) -> type:
                 for chunk in chunks:
                     emit(json.dumps(chunk))
             except (BrokenPipeError, ConnectionResetError):
-                # The client went away; nothing left to tell it.
+                # The client went away; nothing left to tell it. Closing the
+                # generator lets the backend cancel the generation now (its
+                # ``finally`` runs) instead of whenever it is garbage collected.
+                _close_quietly(chunks)
                 return
             except Exception as exc:  # noqa: BLE001 (keep the server alive)
                 _log_err("chat stream failed mid-way:")
@@ -425,6 +440,18 @@ def _make_handler(state: _BackendState) -> type:
                 return
 
     return _Handler
+
+
+def _close_quietly(chunks: Iterator[Dict[str, Any]]) -> None:
+    """Close a backend's chunk generator, logging (not raising) what its cleanup raises."""
+    close = getattr(chunks, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception:  # noqa: BLE001 (keep the server alive)
+        _log_err("chat stream cleanup failed:")
+        traceback.print_exc(file=sys.stderr)
 
 
 def _parse_config(args: argparse.Namespace) -> Dict[str, Any]:
@@ -490,7 +517,7 @@ def serve(
     """
     state = _BackendState(backend)
     handler_cls = _make_handler(state)
-    httpd = ThreadingHTTPServer((HOST, port), handler_cls)
+    httpd = _HTTPServer((HOST, port), handler_cls)
 
     serve_thread = threading.Thread(
         target=httpd.serve_forever, name="ik-backend-http", daemon=True
