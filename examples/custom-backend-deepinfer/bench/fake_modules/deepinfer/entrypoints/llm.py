@@ -65,7 +65,11 @@ PREFILL_WATERMARK = 0.9
 
 class _Seq:
     __slots__ = ("request_id", "prompt_len", "prefill_left", "max_tokens", "generated", "offset",
-                 "block_table", "num_cached_tokens")
+                 "block_table", "num_cached_tokens", "engine")
+
+    @property
+    def status(self) -> str:
+        return self.engine.seq_status(self) if self.engine is not None else "?"
 
     def __init__(self, request_id: str, prompt_len: int, max_tokens: int, offset: int) -> None:
         self.request_id = request_id
@@ -76,6 +80,7 @@ class _Seq:
         self.offset = offset
         self.block_table: List[int] = []
         self.num_cached_tokens = 0
+        self.engine: Any = None
 
 
 class _BlockManager:
@@ -192,6 +197,7 @@ class SimEngine:
         # Like DeepInfer, the new sequence is returned (None would mean "dropped").
         offset = zlib.crc32(request_id.encode()) % len(self.token_ids)
         seq = _Seq(request_id, len(prompt_token_ids), sampling_params.max_tokens, offset)
+        seq.engine = self
         self.prompt_tokens += seq.prompt_len
         if enqueue:
             self.waiting.append(seq)
@@ -200,6 +206,15 @@ class SimEngine:
     def enqueue_with_prefix(self, seq: _Seq, blocks: Any, num_cached: int, swa_valid_start: int) -> None:
         """The patched engine's entry point (multimodal and structured-output handling aside)."""
         self.scheduler.add_sequence_with_prefix(seq, blocks, num_cached, swa_valid_start)
+
+    def seq_status(self, seq: _Seq) -> str:
+        if any(s is seq for s in self.waiting):
+            return f"WAITING (position {next(i for i, s in enumerate(self.waiting) if s is seq)} of {len(self.waiting)})"
+        if seq in self.prefilling:
+            return f"PREFILLING ({seq.prefill_left} tokens left)"
+        if seq in self.running:
+            return "RUNNING"
+        return "NOT IN ENGINE"
 
     def finalize_seq(self, seq: _Seq) -> None:
         """DeepInfer's hook for a finished sequence; frees its blocks (the backend wraps it)."""

@@ -618,11 +618,14 @@ class _RankCache:
 class _Live:
     """A request this rank has handed to the engine."""
 
-    __slots__ = ("detokenizer", "tokens")
+    __slots__ = ("detokenizer", "tokens", "seq", "since", "warned")
 
-    def __init__(self, detokenizer: IncrementalDetokenizer) -> None:
+    def __init__(self, detokenizer: IncrementalDetokenizer, seq: Any = None) -> None:
         self.detokenizer = detokenizer
         self.tokens = 0
+        self.seq = seq
+        self.since = time.monotonic()  # added, or last output
+        self.warned = False
 
 
 def _rank_loop(
@@ -664,6 +667,8 @@ def _rank_loop(
     idle_sleep = float(settings["idle_poll_seconds"])
     stats_every = float(settings.get("stats_interval_seconds", 2.0))
     next_stats = time.monotonic()
+    stuck_after = float(settings.get("stuck_request_seconds", 120.0))
+    next_stuck_check = time.monotonic() + 10.0
     abort_on_disconnect = bool(settings.get("abort_on_disconnect", True))
     pool = ThreadPoolExecutor(
         max_workers=max(1, int(settings.get("tokenizer_threads", 2))),
@@ -758,9 +763,13 @@ def _rank_loop(
                     except Exception as exc:  # noqa: BLE001 (report and keep the rank alive)
                         error = (str(exc), None)
                 if error is None:
-                    live[request_id] = _Live(new_detokenizer())
+                    live[request_id] = _Live(new_detokenizer(), seq)
                 else:
                     items.append((request_id, "", 0, 0, True, *error))
+
+            if stuck_after and time.monotonic() >= next_stuck_check:
+                next_stuck_check = time.monotonic() + 10.0
+                _warn_stuck(rank, live, tokenizing, stuck_after)
 
             # Collective across the data-parallel group: every rank calls it.
             # UNVERIFIED: that idle ranks may keep calling it (and step() with an
@@ -803,6 +812,23 @@ def _rank_loop(
         pool.shutdown(wait=False, cancel_futures=True)
 
 
+def _warn_stuck(rank: int, live: Dict[str, _Live], tokenizing: Dict[str, bool], after: float) -> None:
+    """Log, once per request, a request with no output for ``after`` seconds and
+    where it sits, so a lost or starved request shows up in the backend log."""
+    now = time.monotonic()
+    for request_id, state in live.items():
+        if state.warned or now - state.since < after:
+            continue
+        state.warned = True
+        seq = state.seq
+        status = getattr(seq, "status", None)
+        where = ("waiting for its first token (queued or prefilling)" if state.tokens == 0
+                 else f"no new token after {state.tokens}")
+        print(f"deepinfer rank {rank}: request {request_id} {where} for {now - state.since:.0f} s"
+              f"{f', engine status {status}' if status is not None else ''}; {len(live)} live, "
+              f"{len(tokenizing)} tokenizing", file=sys.stderr, flush=True)
+
+
 def _collect_step(outputs: Any, clone: Callable[[Any], Any], live: Dict[str, _Live], items: List[tuple]) -> None:
     """Group one step's outputs by request, detokenize them and append one item per request.
 
@@ -831,6 +857,7 @@ def _collect_step(outputs: Any, clone: Callable[[Any], Any], live: Dict[str, _Li
         if state is None:
             continue  # aborted
         state.tokens += len(token_ids)
+        state.since = time.monotonic()
         text = state.detokenizer.feed(token_ids) if token_ids else ""
         if finished:
             text += state.detokenizer.flush()
@@ -977,6 +1004,7 @@ class DeepInferEngine(Engine):
             "tokenizer_cache_tokens": int(config.get("tokenizer_cache_tokens", 64_000_000)),
             "prefix_cache_free_fraction": float(config.get("prefix_cache_free_fraction", 0.05)),
             "stats_interval_seconds": float(config.get("stats_interval_seconds", 2.0)),
+            "stuck_request_seconds": float(config.get("stuck_request_seconds", 120.0)),
             "llm_kwargs": {
                 "max_model_len": max_model_len,
                 "max_num_seqs": int(config.get("max_num_seqs", 64)),
