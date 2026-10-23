@@ -542,8 +542,9 @@ class _RankCache:
         # admitting prefill above 90 % use (GPU_CACHE_PREFILL_WATERMARK), and a
         # sequence that runs out of blocks during decode is preempted.
         self.headroom = int((0.10 + float(settings.get("prefix_cache_free_fraction", 0.05))) * self.total_blocks)
-        self.waiting_len = getattr(engine.scheduler, "get_sum_prompt_len_waiting", None)
-        self.live: Dict[str, tuple] = {}  # request id -> (hashes, prompt_len, hashes the sequence reuses)
+
+        # request id -> (hashes, prompt_len, hashes the sequence reuses, new blocks it needs)
+        self.live: Dict[str, tuple] = {}
         self.preempt_check = getattr(engine.scheduler, "get_num_preempted_seqs", None)
         finalize = engine.finalize_seq
 
@@ -569,11 +570,12 @@ class _RankCache:
         reused = hit // BLOCK - 1 if hit else 0
         used = hashes[:reused]
         self.index.protect(used)  # before making room, so the hit is not the block evicted
-        self.make_room(prompt_len - hit + max_tokens)
+        new_blocks = -(-(prompt_len - hit + max_tokens) // BLOCK)
+        self.make_room(new_blocks)
         if not hit:
             seq = add_request(enqueue=True)
             if seq is not None:
-                self.live[request_id] = (hashes, prompt_len, [])
+                self.live[request_id] = (hashes, prompt_len, [], new_blocks)
             return seq, 0
         seq = add_request(enqueue=False)
         if seq is None:
@@ -586,26 +588,30 @@ class _RankCache:
                   "running it without the cache", file=sys.stderr, flush=True)
             self.index.unprotect(used)
             self.engine.scheduler.add_sequence(seq)
-            self.live[request_id] = (hashes, prompt_len, [])
+            self.live[request_id] = (hashes, prompt_len, [], -(-(prompt_len + max_tokens) // BLOCK))
             return seq, 0
         self.index.hits += 1
         self.index.hit_tokens += hit - BLOCK
-        self.live[request_id] = (hashes, prompt_len, used)
+        self.live[request_id] = (hashes, prompt_len, used, new_blocks)
         return seq, hit - BLOCK
 
-    def make_room(self, new_tokens: int) -> None:
-        want = -(-max(new_tokens, 0) // BLOCK) + self.headroom
+    def make_room(self, new_blocks: int) -> None:
+        want = max(new_blocks, 0) + self.headroom
         free = int(self.blocks.get_num_free_blocks())
         if free < want:
             self.index.evict(want - free)
 
-    def tick(self) -> None:
-        """Between steps: evict for the prompts already waiting in the engine's queue."""
-        if not len(self.index) or self.waiting_len is None:
+    def tick(self, pending: List[str]) -> None:
+        """Between steps: keep room for the requests not admitted yet (``pending``:
+        no output so far), counting only the blocks each one still needs, not its
+        whole prompt (a hit reuses most of it): counting whole prompts emptied the
+        cache whenever many turns were queued at once."""
+        if not len(self.index) or not pending:
             return
-        waiting, prompt_len = self.waiting_len()
-        if waiting:
-            self.make_room(min(int(prompt_len), self.total_blocks * BLOCK))
+        live = self.live
+        need = sum(live[r][3] for r in pending if r in live)
+        if need:
+            self.make_room(min(need, self.total_blocks))
 
     def forget(self, request_id: str) -> None:
         """A request left without finishing in the engine (aborted): drop its protection."""
@@ -617,7 +623,7 @@ class _RankCache:
         entry = self.live.pop(seq.request_id, None)
         if entry is None:
             return
-        hashes, prompt_len, used = entry
+        hashes, prompt_len, used, _ = entry
         self.index.unprotect(used)
         # Prompt blocks only, and never the last prompt token's block: with
         # drop_thinking the next turn re-renders everything after the prompt.
@@ -801,7 +807,7 @@ def _rank_loop(
             # UNVERIFIED: that idle ranks may keep calling it (and step() with an
             # empty local batch) indefinitely, as a long-lived server needs.
             if cache is not None:
-                cache.tick()
+                cache.tick([request_id for request_id, state in live.items() if state.tokens == 0])
             unfinished = engine.has_unfinished_requests()
             if unfinished:
                 outputs = engine.step()
@@ -1066,6 +1072,8 @@ class DeepInferEngine(Engine):
         self._max_sessions = int(config.get("session_table_size", 100_000))
         self._migrate_at = int(config.get("session_migrate_inflight", 4 * int(settings["llm_kwargs"]["max_num_seqs"])))
         self._used_blocks = [0] * dp  # from the ranks' stats messages
+        self._log_stats_every = float(config.get("log_rank_stats_seconds", 30.0))
+        self._next_stats_log = time.monotonic() + self._log_stats_every
         self._assigned = [0] * dp  # estimated prompt blocks routed since the last stats message
         self.rank_stats: List[Dict[str, Any]] = [{} for _ in range(dp)]
         self.migrations = 0
@@ -1217,6 +1225,9 @@ class DeepInferEngine(Engine):
                         self.rank_stats[rank] = info
                         self._used_blocks[rank] = int(info.get("total_blocks", 0)) - int(info.get("free_blocks", 0))
                         self._assigned[rank] = 0
+                    if self._log_stats_every and now >= self._next_stats_log:
+                        self._next_stats_log = now + self._log_stats_every
+                        self._log_rank_stats()
                 elif message and message[0] == "out":
                     for item in message[2]:
                         stream = streams.get(item[0])
@@ -1237,6 +1248,25 @@ class DeepInferEngine(Engine):
                 traceback.print_exc(file=sys.stderr)
                 self._fail(f"the DeepInfer results reader failed: {exc!r}")
                 return
+
+    def _log_rank_stats(self) -> None:
+        """One line per rank: what the router and the prefix cache see (for diagnosis)."""
+        with self._lock:
+            sessions = [0] * len(self._in_flight)
+            for rank in self._sessions.values():
+                sessions[rank] += 1
+            rows = list(zip(self.rank_stats, self._in_flight, sessions))
+            migrations = self.migrations
+        for info, in_flight, owned in rows:
+            if not info:
+                continue
+            total = max(int(info.get("total_blocks", 0)), 1)
+            used = total - int(info.get("free_blocks", 0))
+            print(f"deepinfer rank {info.get('rank')}: {owned} sessions, {in_flight} in flight, KV {used / total:.0%} used "
+                  f"({info.get('cached_blocks', 0)} cached blocks), hits {info.get('hits', 0)}/{info.get('lookups', 0)} "
+                  f"({info.get('hit_tokens', 0):,} tokens), evicted {info.get('evicted', 0)} blocks, "
+                  f"preempted {info.get('preempted', 0)}, tokenizer cache {info.get('tokenizer_cache_hits', 0)} hits; "
+                  f"migrations {migrations}", file=sys.stderr, flush=True)
 
     def _check_ranks(self, now: float) -> None:
         """Fail the engine when a rank died or every rank went quiet with requests in flight.
