@@ -91,7 +91,9 @@ pub struct ServerConfig {
     pub unsupported_method_page: ErrorPage,
     /// While the server is busy, stream bodies are woken in batches this far
     /// apart instead of by each push (see the `sse` module); a push to an idle server
-    /// is still written at once. Zero wakes the body on every push.
+    /// is still written at once. Zero wakes the body on every push. The timer
+    /// has a 1 ms resolution, so a push waits up to the tick plus 1 ms and a
+    /// tick below 1 ms behaves like about 1 ms.
     pub flush_tick: Duration,
 }
 

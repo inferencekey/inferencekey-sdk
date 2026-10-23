@@ -145,6 +145,9 @@ async def _stream(user: int, port: int, body: bytes, t0: float, buckets: Dict[in
                     f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n").encode()
             writer.write(head + body)
             await writer.drain()
+            # The request has left this process (it is in the kernel's send
+            # buffer): from here on the wait is the server's.
+            rec["written"] = time.time() - t0
             status = await reader.readline()
             if b" 200 " not in status:
                 rec["error"] = status.decode(errors="replace").strip() or "no status line"
@@ -690,6 +693,9 @@ def run_level(args: argparse.Namespace, n: int, prompt_chars: int) -> Dict[str, 
     # kernel completes the handshake from the listen backlog, before accept),
     # which is the client process's event loop when it opens hundreds at once.
     connect = [r["connected"] - r["sent"] for r in stamped if "connected" in r]
+    # And the rest of the client's share: from the connect to the request
+    # written out (an event loop with hundreds of fresh sockets on few CPUs).
+    write = [r["written"] - r["connected"] for r in stamped if "written" in r]
     own = [r["bench_t"][1] - r["bench_t"][0] for r in stamped]
     post = [r["first"] - r["bench_t"][1] for r in stamped]
     added = [(r["first"] - r["sent"]) - (r["bench_t"][1] - r["bench_t"][0]) for r in stamped]
@@ -739,8 +745,9 @@ def run_level(args: argparse.Namespace, n: int, prompt_chars: int) -> Dict[str, 
                            "max": round(1000 * max(added), 1),
                            "before_backend_p99": round(1000 * _pct(pre, 0.99), 1),
                            "client_connect_p99": round(1000 * _pct(connect, 0.99), 1),
+                           "client_write_p99": round(1000 * _pct(write, 0.99), 1),
                            "server_before_backend_p99": round(1000 * _pct(
-                               [r["bench_t"][0] - r["connected"] for r in stamped if "connected" in r], 0.99), 1),
+                               [r["bench_t"][0] - r["written"] for r in stamped if "written" in r], 0.99), 1),
                            "backend_own_p99": round(1000 * _pct(own, 0.99), 2),
                            "delivery_median": round(1000 * _pct(post, 0.5), 2),
                            "delivery_p99": round(1000 * _pct(post, 0.99), 1)} if stamped else None),

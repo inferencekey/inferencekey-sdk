@@ -665,6 +665,28 @@ def _env_int(name: str, minimum: int) -> Optional[int]:
     return int(raw)
 
 
+# The flush tick in microseconds: 0 (a wake per push) or a value the server's
+# 1 ms timer can honor (it rounds deadlines up to whole milliseconds, so ticks
+# from 1 to 999 would all behave like about 1000), up to 100 ms (a larger tick
+# would hold a busy stream's events that long).
+_FLUSH_TICK_MIN_US = 1000
+_FLUSH_TICK_MAX_US = 100_000
+
+
+def _env_flush_tick() -> Optional[int]:
+    name = "IK_BACKEND_FLUSH_TICK_US"
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    if not re.fullmatch(r"[0-9]+", raw) or not (
+        int(raw) == 0 or _FLUSH_TICK_MIN_US <= int(raw) <= _FLUSH_TICK_MAX_US
+    ):
+        raise BackendSetupError(
+            f"{name} must be 0 or an integer from {_FLUSH_TICK_MIN_US} to {_FLUSH_TICK_MAX_US}, got {raw!r}"
+        )
+    return int(raw)
+
+
 def _env_flag(name: str) -> bool:
     raw = os.environ.get(name, "").strip().lower()
     if raw in ("", "0", "false", "no", "off"):
@@ -682,11 +704,13 @@ def _native_options() -> Dict[str, Any]:
         ("IK_BACKEND_IO_THREADS", "io_threads", 1),
         ("IK_BACKEND_BACKLOG", "backlog", 1),
         ("IK_BACKEND_STREAM_MAX_BYTES", "stream_max_bytes", 1),
-        ("IK_BACKEND_FLUSH_TICK_US", "flush_tick_us", 0),
     ):
         value = _env_int(env, minimum)
         if value is not None:
             options[key] = value
+    flush_tick = _env_flush_tick()
+    if flush_tick is not None:
+        options["flush_tick_us"] = flush_tick
     if _env_flag("IK_SSE_CONNECTION_CLOSE"):
         options["sse_connection_close"] = True
     return options
@@ -846,7 +870,8 @@ def _transport_line(transport: _Transport, httpd: Any) -> str:
         server = httpd._server
         return (
             f"http transport: native (abi {_NATIVE_ABI}, io_threads={server.io_threads}, "
-            f"backlog={server.backlog}, max_inflight={server.max_inflight})"
+            f"backlog={server.backlog}, max_inflight={server.max_inflight}, "
+            f"flush_tick_us={server.flush_tick_us})"
         )
     return f"http transport: stdlib (reason: {transport.reason})"
 

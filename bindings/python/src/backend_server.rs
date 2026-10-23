@@ -119,7 +119,9 @@ fn os_error(err: io::Error) -> PyErr {
 /// The socket is bound and listening when the constructor returns, so slow
 /// setup can run afterwards while `/healthz` answers 503 from Rust.
 /// `flush_tick_us` is how far apart stream bodies are woken in batches while
-/// the server is busy (0 wakes them on every push).
+/// the server is busy (0 wakes them on every push). The timer has a 1 ms
+/// resolution, so a push waits up to the tick plus 1 ms, and ticks below
+/// 1000 behave like about 1000; `serve.py` accepts only 0 or 1000 to 100000.
 #[pyclass(frozen, weakref, module = "inferencekey._inferencekey")]
 pub struct BackendServer {
     handle: ServerHandle,
@@ -127,6 +129,7 @@ pub struct BackendServer {
     io_threads: usize,
     backlog: u32,
     max_inflight: usize,
+    flush_tick_us: u64,
 }
 
 #[pymethods]
@@ -190,7 +193,7 @@ impl BackendServer {
         let slot: AppSlot = Arc::new(Mutex::new(Some(app)));
         let app: Arc<dyn AppHandler> = Arc::new(PyApp { app: slot.clone() });
         let handle = py.allow_threads(|| start(cfg, app)).map_err(os_error)?;
-        Ok(BackendServer { handle, app: slot, io_threads, backlog, max_inflight })
+        Ok(BackendServer { handle, app: slot, io_threads, backlog, max_inflight, flush_tick_us })
     }
 
     /// The bound port (the real one when 0 was requested).
@@ -219,6 +222,11 @@ impl BackendServer {
     #[getter]
     fn max_inflight(&self) -> usize {
         self.max_inflight
+    }
+
+    #[getter]
+    fn flush_tick_us(&self) -> u64 {
+        self.flush_tick_us
     }
 
     /// Flip `/healthz` between 503 `loading` and 200 `ok`.

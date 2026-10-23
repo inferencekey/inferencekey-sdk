@@ -97,7 +97,7 @@ Fields of a result line:
 | `steady_tok_s` | median of the per-second token counts in the middle 80 % of the run (a chunk may carry several tokens; each stream's tokens are spread over its chunks by their length, successful streams only). The baseline harness counted one token per chunk, which was true there, so steady rates before and after are only roughly comparable; compare on `total_tok_s`, the same formula in both. Runs shorter than a few seconds have no steady rate (0). |
 | `per_stream_tok_s` | completion tokens / (last token - first token), p10, median, p90 |
 | `ttft_s` | time to first content token |
-| `added_ttft_ms` | null backend only: the TTFT the runtime adds over the backend's own first-yield latency, from wall-clock stamps the backend puts in its first token (`bench_t`): TTFT minus (first yield - first resume of the generator). `server_before_backend_p99` is the server's part (TCP connect done to generator first resumed), `client_connect_p99` the client's own (its event loop opening hundreds of connections at once), `backend_own_p99` the backend's first-yield latency, `delivery_*` first yield to client read |
+| `added_ttft_ms` | null backend only: the TTFT the runtime adds over the backend's own first-yield latency, from wall-clock stamps the backend puts in its first token (`bench_t`): TTFT minus (first yield - first resume of the generator). `server_before_backend_p99` is the server's part (request written out by the client, after `drain()`, to generator first resumed; rows before the "written stamp" ones measured it from the TCP connect, so they also include the client's write), `client_connect_p99` and `client_write_p99` the client's own (its event loop opening hundreds of connections at once, then writing the request), `backend_own_p99` the backend's first-yield latency, `delivery_*` first yield to client read |
 | `cpu_pct_mean` | mean CPU % between the first and the last token: `parent` (the backend process, 100 = one core), each rank, the clients |
 | `ranks_busy_tok_s`, `ranks_steps_per_s` | what the simulated ranks produced while busy, from their own counters (1 s resolution) |
 | `ranks_done_s`, `clients_done_s` | when the ranks produced their last token and when the clients received it; the gap is backlog queued in the parent |
@@ -382,7 +382,7 @@ Python with the native transport too.
 
 The same harness with `--transport native` (the Rust HTTP/SSE server of the
 SDK, commit 07db64a, which wakes stream bodies in batches; see "Tuning"
-below), next to the stdlib transport rerun with the same instrumentation.
+below; the "written stamp" rows run on the review-fix commit after 4e1f27e), next to the stdlib transport rerun with the same instrumentation.
 One run per row unless it says repeat; same shared 12-vCPU VM (load average
 3 to 5 from other work). Raw lines: `results/gate1-2026-10-23.jsonl` and
 `results/gate2-2026-10-23.jsonl`. Two measurements are new since the baseline
@@ -402,22 +402,32 @@ repeat twice).
 | Criterion (gate 1) | Target | Native, measured | Verdict |
 | --- | --- | --- | --- |
 | 400 streams delivered | >= 95 % (19,000 tok/s) | 100.0 / 99.6 / 99.9 % (19,994 / 19,921 / 19,973 tok/s) | PASS |
-| 800 streams delivered | >= 90 % (36,000 tok/s) | 100.1 / 99.7 / 100.3 % (40,032 / 39,890 / 40,112 tok/s) | PASS |
+| 800 streams delivered | >= 90 % (36,000 tok/s) | 100.1 / 99.7 / 100.3 % (40,032 / 39,890 / 40,112 tok/s; rerun 100.4 / 97.8 / 103.3 %) | PASS |
 | Connection errors at a burst of 800 | 0 | 0 in every run (stdlib: 0 too, the backlog of 1024 holds) | PASS |
-| `/healthz` dense prober p99 | < 50 ms | 400: 3.7 / 13.7 / 7.5 ms; 800: 31.9 / 4.1 / 6.3 ms (slowest answer 80 ms) | PASS |
+| `/healthz` dense prober p99 | < 50 ms | 400: 3.7 / 13.7 / 7.5 ms; 800: 31.9 / 4.1 / 6.3 ms (slowest answer 80 ms); rerun 400: 7.6 / 6.9 / 5.9 ms, 800: 6.1 / 43.5 / 16.7 ms (slowest 101 ms) | PASS |
 | `/healthz` misses, either prober | 0 | 0 in every native run (stdlib: 1 at 400, 3 + 3 at 800) | PASS |
-| Added TTFT over the backend's first yield, p99 | < 20 ms | burst: 400: 77 / 86 / 110 ms, 800: 275 / 348 / 303 ms; ramp 20 s: 5 to 10 ms at every level | **FAIL at burst** (PASS with a 20 s ramp) |
+| Added TTFT over the backend's first yield, p99 | < 20 ms | burst: 400: 77 / 86 / 110 ms, 800: 275 / 348 / 303 ms (rerun with the write stamp: 400: 104 / 105 / 130 ms, 800: 381 / 423 / 331 ms); ramp 20 s: 5 to 10 ms at every level | **FAIL at burst** (PASS with a 20 s ramp) |
 | Busiest OS thread | < 85 % of a core | 9 to 12 % (`ik-http-io-N`) | PASS |
-| GIL-held fraction | < 50 % | 400: 0.40 / 0.48 / 0.45; 800: 0.69 / 0.68 / 0.73 | PASS at 400 (margin 2 to 10 points), **FAIL at 800** |
+| GIL-held fraction | < 50 % | 400: 0.40 / 0.48 / 0.45; 800: 0.69 / 0.68 / 0.73 (rerun: 400: 0.43 / 0.45 / 0.47; 800: 0.67 / 0.79 / 0.78) | PASS at 400 (margin 2 to 10 points), **FAIL at 800** |
 | Every stream ends with `[DONE]` | 100 % | 100 % in every run | PASS |
 
 Against the stdlib rows of the same table, native turns 90.9 % and 39.3 %
 delivered (400 and 800 burst) into 100 %, first tokens 3.1 s and 9.6 s late
 into 0.08 to 0.35 s, and `/healthz` misses into none.
 
+**Gate 1 is not met, so T8 is not done.** Design 9.5 now says a gate 1
+failure stops the plan before T11 (the paid B200 run) and goes to phase 2,
+unless the owner records a decision that accepts or re-scopes the failing
+targets. That decision is pending.
+
 **Why added TTFT fails at burst.** Nearly all of it is on the server between
-the TCP connect and the backend's generator first running
-(`server_before_backend_p99`: 65 to 80 ms at 400, 245 to 326 ms at 800); the
+the request being written and the backend's generator first running. The
+first runs measured from the TCP connect (`server_before_backend_p99`: 65 to
+80 ms at 400, 245 to 326 ms at 800), which left the client's own request
+write in the server's share; the rows "native burst written stamp" stamp the
+request after `drain()`: the client's write is 0.1 ms at p99, and the server
+side is 90 to 114 ms at 400 and 314 to 382 ms at 800 (those three runs had
+load average 5.5 rising to 18 on the VM and came out slower overall). The
 backend's own first-yield latency is under 1 ms and the delivery of the first
 token is about 1 ms. Every request start runs Python (`prepare_chat`, the
 `json.loads` of the body, the generator's first resume) under the GIL, so a
@@ -473,6 +483,12 @@ lever for it.
 | native burst str chunks | 800 | 800 / 0 | 40,048 (100.1 %) | 100.0 / 337.0 [303.5] | 164.0 | 0.8 / 17.9 / 93.8 (0 of 113) | 0 of 12 | 274 (176) | 10.7 | 0.708 | 0.438 |
 | native burst unpinned | 400 | 400 / 0 | 20,006 (100.0 %) | 42.0 / 98.9 [87.0] | 73.7 | 0.7 / 7.9 / 26.8 (0 of 105) | 0 of 11 | 154 (83) | 9.9 | 0.485 | 0.907 |
 | native burst unpinned | 800 | 800 / 0 | 39,858 (99.6 %) | 115.7 / 319.2 [299.2] | 155.7 | 0.9 / 10.7 / 63.8 (0 of 113) | 0 of 12 | 306 (200) | 11.0 | 0.705 | 0.453 |
+| native burst written stamp | 400 | 400 / 0 | 20,004 (100.0 %) | 52.6 / 104.3 [94.4] | 30.4 | 0.6 / 7.6 / 11.4 (0 of 106) | 0 of 11 | 132 (74) | 9.6 | 0.425 | 0.983 |
+| native burst written stamp | 800 | 800 / 0 | 40,156 (100.4 %) | 86.7 / 380.8 [364.2] | 145.6 | 0.7 / 6.1 / 74.4 (0 of 112) | 0 of 12 | 267 (168) | 11.6 | 0.671 | 0.508 |
+| native burst written stamp | 400 | 400 / 0 | 20,000 (100.0 %) | 56.9 / 105.0 [89.9] | 26.4 | 0.6 / 6.9 / 28.9 (0 of 106) | 0 of 11 | 140 (80) | 9.8 | 0.454 | 0.988 |
+| native burst written stamp | 800 | 800 / 0 | 39,108 (97.8 %) | 107.5 / 422.8 [381.5] | 253.0 | 2.6 / 43.5 / 100.6 (0 of 110) | 0 of 12 | 252 (167) | 8.5 | 0.794 | 0.269 |
+| native burst written stamp | 400 | 400 / 0 | 20,026 (100.1 %) | 62.9 / 129.7 [113.9] | 39.7 | 0.7 / 5.9 / 36.4 (0 of 108) | 0 of 11 | 153 (88) | 10.3 | 0.472 | 0.975 |
+| native burst written stamp | 800 | 800 / 0 | 41,315 (103.3 %) | 107.2 / 331.3 [313.8] | 249.3 | 1.2 / 16.7 / 97.4 (0 of 111) | 0 of 12 | 264 (177) | 8.9 | 0.779 | 0.288 |
 
 
 ### Tuning (T8)
@@ -483,7 +499,10 @@ lever for it.
   a flusher task that wakes an idle server at once and, while pushes keep
   coming, wakes the pending bodies in one batch per 1 ms tick from an IO
   thread (`IK_BACKEND_FLUSH_TICK_US`, default 1000; 0 restores a wake per
-  push). Rows "flush tick 0" against the native burst rows: at 400 streams the
+  push; otherwise 1000 to 100000, since tokio's 1 ms timer rounds deadlines
+  up: a push waits up to the tick plus 1 ms, and a tick below 1000 would
+  behave like 1000). The startup transport line now ends with
+  `flush_tick_us=N`. Rows "flush tick 0" against the native burst rows: at 400 streams the
   GIL goes from 0.51 to 0.40 to 0.48, parent CPU from 180 % to 123 to 148 %,
   the busiest thread from 17 % to 10 %; at 800 the GIL from 0.73 to 0.68 to
   0.73 and parent CPU from 290 % to 267 to 277 %. The bytes on the wire are

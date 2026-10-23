@@ -17,11 +17,12 @@
 //! syscall at all. A tick of zero wakes each body from the producer, as a
 //! plain channel does.
 
+use std::future::Future;
 use std::io;
-use std::pin::Pin;
+use std::pin::{pin, Pin};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -39,8 +40,10 @@ pub const CHANNEL_CAPACITY: usize = 256;
 /// event taken).
 pub const COALESCE_CAP: usize = 64 * 1024;
 
-/// Default [`Flusher`] tick: the most a push waits for its body to be woken
-/// while the server is busy.
+/// Default [`Flusher`] tick: how far apart the batched wakes are while the
+/// server is busy. tokio's timer has a 1 ms resolution and rounds deadlines
+/// up, so a push waits at most the tick plus 1 ms (up to 2 ms by default), and
+/// any tick below 1 ms behaves like about 1 ms.
 pub const DEFAULT_FLUSH_TICK: Duration = Duration::from_millis(1);
 
 /// Wakes stream bodies on behalf of producers, in batches while busy (see the
@@ -151,12 +154,43 @@ pub struct PendingFrame {
     done: bool,
 }
 
+/// A waker that does nothing (`Waker::noop` needs Rust 1.85, above the MSRV).
+fn noop_waker() -> Waker {
+    const VTABLE: RawWakerVTable = RawWakerVTable::new(|_| RAW, |_| {}, |_| {}, |_| {});
+    const RAW: RawWaker = RawWaker::new(std::ptr::null(), &VTABLE);
+    // SAFETY: every vtable function ignores the data pointer and does nothing.
+    unsafe { Waker::from_raw(RAW) }
+}
+
+/// Take the next queued frame without blocking.
+///
+/// Not `Receiver::try_recv`: on a slot a sender has reserved but not written
+/// yet, `try_recv` parks the calling thread (an IO thread here) until that
+/// send completes, and the sender then pays a futex wake while it holds the
+/// GIL. `poll_recv` reports such a slot as pending instead. It runs with a
+/// no-op waker, because the body is woken by its producers (see
+/// [`SinkShared::waker`]), and outside tokio's cooperative budget, because a
+/// budget-forced `Pending` wakes only the waker passed in, here the no-op one,
+/// and the wake would be lost. Producers wake the body after each send, so an
+/// event that was pending here is not missed.
+fn recv_now(rx: &mut mpsc::Receiver<Bytes>) -> Result<Bytes, TryRecvError> {
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let recv = pin!(tokio::task::coop::unconstrained(std::future::poll_fn(|cx| rx.poll_recv(cx))));
+    match recv.poll(&mut cx) {
+        Poll::Ready(Some(frame)) => Ok(frame),
+        Poll::Ready(None) => Err(TryRecvError::Disconnected),
+        Poll::Pending => Err(TryRecvError::Empty),
+    }
+}
+
 /// Shared state between a sink and its body.
 struct SinkShared {
     head: Mutex<Option<oneshot::Sender<Head>>>,
     tx: Mutex<Option<mpsc::Sender<Bytes>>>,
-    /// The body's waker while it waits for an event. The body never registers
-    /// with the channel itself, so a send does not wake it: the producer takes
+    /// The body's waker while it waits for an event. The body registers only a
+    /// no-op waker with the channel (see [`recv_now`]), so a send does not
+    /// wake it: the producer takes
     /// this waker and hands it to the flusher.
     waker: Mutex<Option<Waker>>,
     flusher: Arc<Flusher>,
@@ -293,9 +327,18 @@ impl StreamSink {
             Some(tx) if !closed => tx.clone(),
             _ => return self.unqueue(len),
         };
-        match tx.blocking_send(pending.frame) {
+        let sent = tx.blocking_send(pending.frame);
+        // Drop the clone before waking: if `finish` ran while this send was
+        // blocked, this clone is the last sender, and the body has to see the
+        // channel disconnected on the poll this wake causes. Waking first would
+        // let the body find it merely empty and park, and nothing would wake
+        // it again once the clone is dropped.
+        drop(tx);
+        match sent {
             Ok(()) => {
                 self.wake_body();
+                #[cfg(test)]
+                tests::pause_after_wait_send_wake();
                 true
             }
             Err(_) => {
@@ -473,7 +516,7 @@ impl SseBody {
         if first.len() >= COALESCE_CAP {
             return first;
         }
-        let second = match self.rx.try_recv() {
+        let second = match recv_now(&mut self.rx) {
             Ok(next) => next,
             Err(_) => return first,
         };
@@ -481,7 +524,7 @@ impl SseBody {
         buf.extend_from_slice(&first);
         buf.extend_from_slice(&second);
         while buf.len() < COALESCE_CAP {
-            match self.rx.try_recv() {
+            match recv_now(&mut self.rx) {
                 Ok(next) => buf.extend_from_slice(&next),
                 Err(_) => break,
             }
@@ -501,15 +544,15 @@ impl Body for SseBody {
         if self.shared.aborted.load(Ordering::Acquire) {
             return Poll::Ready(Some(Err(io::Error::other("stream closed: client fell too far behind"))));
         }
-        match self.rx.try_recv() {
+        match recv_now(&mut self.rx) {
             Ok(first) => return Poll::Ready(Some(Ok(self.emit(first)))),
             Err(TryRecvError::Disconnected) => return self.end(),
             Err(TryRecvError::Empty) => {}
         }
         *lock(&self.shared.waker) = Some(cx.waker().clone());
-        // A producer that queued between the try_recv above and storing the
+        // A producer that queued between the receive above and storing the
         // waker found no waker to hand over, so look again.
-        match self.rx.try_recv() {
+        match recv_now(&mut self.rx) {
             Ok(first) => {
                 lock(&self.shared.waker).take();
                 Poll::Ready(Some(Ok(self.emit(first))))
@@ -555,6 +598,20 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt;
     use std::time::Duration;
+
+    thread_local! {
+        /// How long `wait_send` lingers after waking the body, on this thread.
+        static WAIT_SEND_PAUSE: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    }
+
+    /// Widens the window between `wait_send` waking the body and returning,
+    /// where a sender it still held would keep the channel open.
+    pub(super) fn pause_after_wait_send_wake() {
+        let pause = WAIT_SEND_PAUSE.with(|p| p.get());
+        if !pause.is_zero() {
+            std::thread::sleep(pause);
+        }
+    }
 
     fn new_channel(max_bytes: usize) -> (StreamSink, oneshot::Receiver<Head>, SseBody, Arc<Stats>) {
         let stats = Arc::new(Stats::default());
@@ -637,6 +694,49 @@ mod tests {
             assert!(!frame.data_ref().unwrap().is_empty());
         });
         assert!(waiter.join().unwrap());
+    }
+
+    #[test]
+    fn finish_while_a_clone_waits_for_room_still_ends_the_body() {
+        // A clone blocked in wait_send holds a sender after finish() took the
+        // shared one, so its send is the last thing before the channel
+        // disconnects. If it woke the body before dropping that sender, the
+        // body could find the channel empty but open, park, and never be woken
+        // again.
+        for i in 0..1000 {
+            let (sink, _head, body, _stats) = new_channel(8 << 20);
+            for _ in 0..CHANNEL_CAPACITY {
+                assert!(matches!(sink.try_push(b"1"), SendOutcome::Sent));
+            }
+            let clone = sink.clone();
+            let pusher = std::thread::spawn(move || {
+                // On odd iterations the window is wide open, so a wake that
+                // comes before the sender is dropped is caught every time.
+                if i % 2 == 1 {
+                    WAIT_SEND_PAUSE.with(|p| p.set(Duration::from_millis(2)));
+                }
+                clone.push(b"2")
+            });
+            let collected = runtime().block_on(async {
+                let mut body = body;
+                // Make room for the blocked push, then end the stream from
+                // the other handle while that push may still be in flight.
+                let first = body.frame().await.unwrap().unwrap();
+                sink.finish();
+                // Timeout polls the body once more when it fires, which would
+                // end a stuck body late instead of never: a late end fails too.
+                let started = std::time::Instant::now();
+                let rest = tokio::time::timeout(Duration::from_secs(1), body.collect()).await;
+                assert!(started.elapsed() < Duration::from_millis(500), "iteration {i}: the body ended only on the timeout's poll");
+                (first, rest)
+            });
+            let (first, rest) = collected;
+            let rest = rest.unwrap_or_else(|_| panic!("iteration {i}: the body never ended"));
+            let pushed = pusher.join().unwrap();
+            let total = first.into_data().unwrap().len() + rest.unwrap().to_bytes().len();
+            let expected = CHANNEL_CAPACITY * b"data: 1\n\n".len() + if pushed { b"data: 2\n\n".len() } else { 0 };
+            assert_eq!(total, expected, "iteration {i}");
+        }
     }
 
     #[test]
