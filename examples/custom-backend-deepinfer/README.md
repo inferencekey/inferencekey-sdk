@@ -25,6 +25,25 @@ as `reasoning_content`, text as `content`, and a `<｜DSML｜ calls>` block beco
 data-parallel replicas in its open release; the router here sends each request
 to the rank with the fewest requests in flight.
 
+The backend process serves every HTTP stream under one GIL, so the heavy work
+stays in the rank processes:
+
+- A rank tokenizes the prompts it receives on a small thread pool, off its
+  lockstep loop (the Hugging Face fast tokenizer releases the GIL while it
+  encodes, so a 137K-token prompt does not stall the other ranks).
+- A rank detokenizes its completions incrementally, per request. For
+  DeepSeek-V4.1's byte-level BPE tokenizer that is a token-to-bytes table plus
+  an incremental UTF-8 decoder, checked at startup against the tokenizer's own
+  `decode`; any other tokenizer gets the generic prefix/read window of vLLM and
+  TGI. A character split across tokens goes out once complete.
+- A rank sends at most one message per engine step, with the new text and the
+  token counts of every request that advanced (usage stays exact).
+- In the backend process a reader thread hands each item to its request, and
+  the request's thread sends everything that arrived since its last chunk as
+  one SSE chunk, at most every `stream_interval_ms` (longer when the number of
+  streams would exceed `stream_chunks_per_second` in total).
+- A client that disconnects frees its slot, and its rank aborts the request.
+
 ## Requirements (engine `deepinfer`)
 
 - NVIDIA SM100 GPUs (B200 or GB200). DeepInfer's README names SM100; B300
@@ -62,6 +81,10 @@ minor version (3.12). `requirements.txt` stays empty.
 | `max_model_len`, `max_num_seqs`, `max_num_batched_tokens`, `gpu_memory_utilization` | `262144`, `64`, `32768`, `0.85` | Engine limits. Untuned. |
 | `deepinfer_venv` | none | Prebuilt venv with DeepInfer (see above), e.g. `/workspace/di-venv`. |
 | `deepinfer_env`, `llm_kwargs` | none | Extra DeepInfer environment variables and `LLM(...)` arguments. |
+| `tokenizer_threads` | `2` | Prompt tokenization threads per rank. |
+| `stream_interval_ms` | `50` | Shortest time between two chunks of one stream: tokens that arrive meanwhile go out together. `0` sends every engine step on its own (more CPU in the backend process). |
+| `stream_chunks_per_second` | `8000` | Budget of SSE chunks per second over all streams: with more than 400 streams the interval grows (1,000 streams: 125 ms) so the backend process keeps up. `0` disables. |
+| `abort_on_disconnect` | `true` | Abort the request in DeepInfer when its client disconnects. |
 | `thinking_mode`, `reasoning_effort` | `thinking`, `high` | Prompt mode (`thinking` or `chat`) and effort (1 to 100, or `low` / `high` / `max`). |
 | `temperature`, `top_p`, `default_max_tokens` | `0.6`, `1.0`, `8192` | Sampling defaults when the request has none. |
 | `served_model_name` | `deepseek-v4.1-flash` | `model` field of the answers. |
@@ -121,8 +144,11 @@ with simulated ranks, no GPU: `bench/README.md`.
 3. A long-lived lockstep loop works: idle ranks keep calling `has_unfinished_requests()` (an all-reduce) and `step()` with no local work, for hours.
 4. Requests can be added between steps while others are in flight (the offline example adds all requests before the first step).
 5. `flush_inflight_reqs()` after the last step returns the remaining outputs and stays in lockstep.
-6. One `RequestOutput` per generated token (with DSpark on, accepted draft tokens arrive as separate outputs), and `prompt_len` is the prompt length.
-7. Decoding with the checkpoint's tokenizer, `skip_special_tokens=False`, yields the DSML and `</think>` markup the parser expects.
+6. One `RequestOutput` per generated token (with DSpark on, accepted draft tokens arrive as separate outputs), and `prompt_len` is the prompt length. Several outputs of one request in one step are handled.
+7. Decoding with the checkpoint's tokenizer, `skip_special_tokens=False`, yields the DSML and `</think>` markup the parser expects. (The rank's byte table reproduces that `decode` exactly for the DeepSeek-V4.1 `tokenizer.json` with transformers 4.50; checked offline, and again by every rank at startup.)
 8. The model actually emits DSML tool calls in the format of `dsv41_encoding.py` for Claude Code's tools, and Claude Code accepts the `reasoning_content` it does not use.
 9. The context length (`max_model_len`), batch limits and memory settings that fit 4 and 8 B200, and the time to load (to size `ready_timeout_secs`).
 10. Whether DeepInfer reuses prompt prefixes across requests (a cache). Without one, every agent turn reads its whole context again.
+11. `llm_engine.abort_request()` between steps, while other requests run and with DSpark in-flight steps, leaves the engine and the lockstep healthy. Set `abort_on_disconnect` to `false` if it does not.
+12. The tokenizer from `llm.get_tokenizer()` can encode on the rank's tokenizer threads while the loop steps (encode only; nothing changes its settings). With the Hugging Face fast tokenizer it releases the GIL, as measured offline.
+13. The rank's added CPU stays small next to a GPU step. On the dev VM, grouping and detokenizing one step of 128 requests takes about 0.24 ms (2 us per request), and building and checking the byte table takes about 0.5 s at startup. Not measured: `RequestOutput.clone` and the queue message on the real engine.

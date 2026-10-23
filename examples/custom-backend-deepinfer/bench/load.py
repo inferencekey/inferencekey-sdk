@@ -92,11 +92,12 @@ def request_body(user: int, prompt_chars: int, max_tokens: int) -> bytes:
 # --------------------------------------------------------------------------
 
 
-async def _stream(user: int, port: int, body: bytes, t0: float, buckets: Dict[int, int],
+async def _stream(user: int, port: int, body: bytes, t0: float, buckets: Dict[int, float],
                   timeout: float) -> Dict[str, Any]:
     rec: Dict[str, Any] = {"user": user, "ok": False, "chunks": 0, "completion_tokens": 0,
                            "prompt_tokens": 0, "first": None, "last": None, "error": ""}
     writer = None
+    chars: Dict[int, int] = {}
     try:
         rec["sent"] = time.time() - t0
         async with asyncio.timeout(timeout):
@@ -130,13 +131,14 @@ async def _stream(user: int, port: int, body: bytes, t0: float, buckets: Dict[in
                 choices = obj.get("choices")
                 if choices:
                     delta = choices[0].get("delta") or {}
-                    if delta.get("content") or delta.get("reasoning_content"):
+                    text = delta.get("content") or delta.get("reasoning_content")
+                    if text:
                         now = time.time()
                         rec["chunks"] += 1
                         rec["first"] = rec["first"] or now - t0
                         rec["last"] = now - t0
                         key = int((now - t0) / BUCKET_S)
-                        buckets[key] = buckets.get(key, 0) + 1
+                        chars[key] = chars.get(key, 0) + len(text)
                 elif obj.get("usage"):
                     rec["completion_tokens"] = obj["usage"]["completion_tokens"]
                     rec["prompt_tokens"] = obj["usage"]["prompt_tokens"]
@@ -146,6 +148,13 @@ async def _stream(user: int, port: int, body: bytes, t0: float, buckets: Dict[in
         rec["end"] = time.time() - t0
         if writer is not None:
             writer.close()
+    # A chunk carries one or more tokens (the backend may batch them), so the
+    # per-second token counts spread this stream's tokens over its text.
+    total_chars = sum(chars.values())
+    if rec["ok"] and total_chars:
+        scale = rec["completion_tokens"] / total_chars
+        for key, n in chars.items():
+            buckets[key] = buckets.get(key, 0) + n * scale
     return rec
 
 
@@ -154,7 +163,7 @@ def _client_main(users: List[int], n: int, port: int, prompt_chars: int, max_tok
     bodies = {u: request_body(u, prompt_chars, max_tokens) for u in users}
 
     async def run() -> Dict[str, Any]:
-        buckets: Dict[int, int] = {}
+        buckets: Dict[int, float] = {}
 
         async def one(u: int, delay: float) -> Dict[str, Any]:
             await asyncio.sleep(max(t0 + delay - time.time(), 0))
@@ -177,10 +186,12 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _cpu_ticks(pid: int) -> Optional[int]:
+def _cpu_ticks(pid: int, system_only: bool = False) -> Optional[int]:
     try:
         with open(f"/proc/{pid}/stat", encoding="ascii") as fh:
             fields = fh.read().rsplit(")", 1)[1].split()
+        if system_only:
+            return int(fields[12])  # stime: kernel work (socket writes, futexes)
         return int(fields[11]) + int(fields[12])  # utime + stime
     except (OSError, IndexError, ValueError):
         return None
@@ -213,7 +224,9 @@ class CpuSampler(threading.Thread):
         self.stop = threading.Event()
 
     def _ticks(self) -> Dict[str, int]:
-        return {name: sum(_cpu_ticks(p) or 0 for p in pids) for name, pids in self.groups.items()}
+        ticks = {name: sum(_cpu_ticks(p) or 0 for p in pids) for name, pids in self.groups.items()}
+        ticks["parent_sys"] = _cpu_ticks(self.groups["parent"][0], system_only=True) or 0
+        return ticks
 
     def run(self) -> None:
         last_t, last = time.time(), self._ticks()
@@ -234,6 +247,8 @@ def start_server(args: argparse.Namespace, port: int, stats_path: str) -> subpro
     cmd += ["--fake-tokenizer"] if args.fake_tokenizer else ["--tokenizer-dir", args.tokenizer_dir]
     if args.no_lockstep:
         cmd.append("--no-lockstep")
+    if args.backend_config:
+        cmd += ["--backend-config", args.backend_config]
     log = open(stats_path + ".server.log", "w", encoding="utf-8")  # noqa: SIM115
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     deadline = time.time() + 120
@@ -332,7 +347,7 @@ def run_level(args: argparse.Namespace, n: int, prompt_chars: int) -> Dict[str, 
         sampler.stop.set()
         sampler.join()
         records = [r for p in parts for r in p["records"]]
-        buckets: Dict[int, int] = {}
+        buckets: Dict[int, float] = {}
         for p in parts:
             for k, v in p["buckets"].items():
                 buckets[k] = buckets.get(k, 0) + v
@@ -396,6 +411,8 @@ def main() -> None:
     parser.add_argument("--prefill-rate", type=float, default=88000.0)
     parser.add_argument("--no-lockstep", action="store_true")
     parser.add_argument("--client-procs", type=int, default=4)
+    parser.add_argument("--backend-config", default="",
+                        help="JSON object merged into the backend config (e.g. stream_interval_ms, tokenizer_threads)")
     parser.add_argument("--ramp-s", type=float, default=0.0, help="spread the stream starts over this long")
     parser.add_argument("--timeout", type=float, default=900.0, help="per stream, seconds")
     parser.add_argument("--out", default="", help="append the results as JSON lines to this file")
@@ -408,7 +425,12 @@ def main() -> None:
         result = run_level(args, n, prompt_chars)
         result["tokenizer"] = "fake" if args.fake_tokenizer else "hf"
         result["step_rate"] = args.step_rate
+        result["tokens_per_step"] = args.tokens_per_step
+        result["prefill_rate"] = args.prefill_rate
+        result["ramp_s"] = args.ramp_s
         result["lockstep"] = not args.no_lockstep
+        if args.backend_config:
+            result["backend_config"] = json.loads(args.backend_config)
         print(json.dumps(result), flush=True)
         if args.out:
             with open(args.out, "a", encoding="utf-8") as fh:

@@ -67,6 +67,7 @@ def build_config(args: argparse.Namespace) -> dict:
         "thinking_mode": args.thinking_mode,
         "llm_kwargs": {"bench_sim": sim},
         "load_timeout_seconds": 120,
+        **json.loads(args.backend_config or "{}"),
     }
 
 
@@ -87,6 +88,8 @@ def main() -> None:
     parser.add_argument("--thinking-mode", default="thinking")
     parser.add_argument("--stats-path", default="", help="rank counters go to <path>.rank<N>")
     parser.add_argument("--no-lockstep", action="store_true", help="ranks step on independent clocks")
+    parser.add_argument("--backend-config", default="",
+                        help="JSON object merged into the backend config, e.g. '{\"stream_interval_ms\": 0}'")
     args = parser.parse_args()
     if not args.fake_tokenizer and not args.tokenizer_dir:
         parser.error("pass --tokenizer-dir (or BENCH_TOKENIZER_DIR) or --fake-tokenizer")
