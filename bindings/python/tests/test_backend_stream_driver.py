@@ -332,7 +332,10 @@ def test_stdlib_stream_marks_a_failed_head_closed_and_the_driver_closes_the_gene
 
 
 @pytest.fixture()
-def served():
+def served(monkeypatch):
+    # These tests are about the stdlib transport: pin it, so they keep testing
+    # it whatever the runtime's default transport is.
+    monkeypatch.setenv("IK_BACKEND_HTTP", "stdlib")
     started = []
 
     def start() -> Tuple[ScriptedBackend, int]:

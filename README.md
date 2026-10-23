@@ -273,6 +273,18 @@ python -m inferencekey.backend.package \
 The CLI prints the artifact path and its sha256 (one per line); verify with
 `tar tzf dist/echo-0.1.0.tar.gz` and `sha256sum dist/echo-0.1.0.tar.gz`.
 
+### Serving: the HTTP transport
+
+`python -m inferencekey.backend.serve` (what the worker runs) can serve a
+backend with the standard library `http.server` or with a native Rust HTTP/SSE
+server built into the Python wheel. Both run the same request handling, so
+routes, status codes, error bodies and SSE `data:` lines are identical. The
+`IK_BACKEND_HTTP` environment variable picks one: `stdlib` (the default in this
+release), `auto` (native when available, else stdlib) or `native` (exit code 2
+if unavailable). The runtime prints one `http transport: ...` line on stderr at
+startup. Settings, behaviour differences and the rollback are in the
+[custom backends guide](https://docs.inferencekey.com/en/guides/custom-backends/#7-the-http-transport).
+
 ## Architecture — one core, many bindings
 
 ```
@@ -282,6 +294,9 @@ inferencekey-sdk/
 │                (ensure / generate_text / embed). One source of truth.
 ├── capi/        inferencekey-capi — stable C ABI (extern "C") over the core,
 │                for FFI consumers (cgo, JNI/FFM, …). cbindgen → inferencekey.h.
+├── server/      inferencekey-backend-server: the native HTTP/SSE server for
+│                custom backends (tokio + hyper). Linked only into the Python
+│                binding; core, capi and node do not depend on it.
 └── bindings/
     ├── python/  pyo3 + maturin → the `inferencekey` PyPI package.
     └── node/    napi-rs → the `@inferencekey/sdk` npm package.
@@ -301,6 +316,21 @@ cargo test             # core unit tests
 # Node addon:    (cd bindings/node   && npx napi build --release)
 # C header:      (cd capi && cbindgen --config cbindgen.toml --output include/inferencekey.h)
 ```
+
+The Python wheel includes the native backend server (the `backend-server`
+cargo feature of `bindings/python`, on by default). After a local
+`maturin develop --release` in `bindings/python`, check that the module you
+import has it:
+
+```bash
+python -c "from inferencekey import _inferencekey; print(_inferencekey.BACKEND_SERVER_ABI)"   # 1
+```
+
+A native module built before the server existed has no `BACKEND_SERVER_ABI`:
+`IK_BACKEND_HTTP=auto` then falls back to the standard library server and says
+so on stderr, and `IK_BACKEND_HTTP=native` exits with code 2. Rebuild it to get
+the native transport. `cargo test -p inferencekey-backend-server` runs the
+server's own tests.
 
 ## Project status
 

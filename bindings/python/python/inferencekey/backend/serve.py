@@ -630,8 +630,10 @@ def _make_handler(state: _BackendState) -> type:
 #: The native server interface this runtime speaks (``_inferencekey.BACKEND_SERVER_ABI``).
 _NATIVE_ABI = 1
 
-#: ``IK_BACKEND_HTTP`` when it is unset. ``auto`` once the native transport is
-#: the default.
+#: ``IK_BACKEND_HTTP`` when it is unset. It stays ``stdlib`` until the native
+#: transport meets every target of its CPU load gate (simultaneous-burst
+#: time to first token and GIL share at 800 streams are not met yet), or the
+#: owner accepts the gap; then it becomes ``auto``.
 _DEFAULT_TRANSPORT = "stdlib"
 
 _TRANSPORT_MODES = ("auto", "native", "stdlib")
