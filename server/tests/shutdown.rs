@@ -68,9 +68,36 @@ fn a_producer_that_ignores_closed_is_aborted_after_the_grace() {
     server.close();
     let took = started.elapsed();
     println!("close with a stuck producer took {took:?}");
-    assert!(took >= Duration::from_millis(900) && took < Duration::from_secs(4), "{took:?}");
+    // The grace, and no extra wait for the stuck blocking thread.
+    assert!(took >= Duration::from_millis(900) && took < Duration::from_millis(1600), "{took:?}");
     let mut rest = Vec::new();
     let _ = stream.read_to_end(&mut rest);
+}
+
+#[test]
+fn a_stuck_json_call_does_not_hold_close_past_the_default_grace() {
+    // The worker sends SIGTERM and kills after 5 s; a sleeping /process must
+    // not keep close() (drain plus runtime teardown) anywhere near that.
+    assert_eq!(ServerConfig::default().shutdown_grace, Duration::from_secs(2));
+    let app = FakeApp::new(
+        |_route, _body| {
+            std::thread::sleep(Duration::from_secs(30));
+            JsonReply::new(200, "{}")
+        },
+        |_body, sink| {
+            sink.reply(200, &b"{}"[..]);
+        },
+    );
+    let server = serve_with(ServerConfig { shutdown_grace: ServerConfig::default().shutdown_grace, ..config() }, app);
+    let mut stream = connect(server.local_addr());
+    stream.write_all(b"POST /process HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").unwrap();
+    assert!(wait_until(Duration::from_secs(2), || stat(&server, "inflight") == 1), "call started");
+
+    let started = Instant::now();
+    server.close();
+    let took = started.elapsed();
+    println!("close with a sleeping /process took {took:?}");
+    assert!(took < Duration::from_millis(2600), "{took:?}");
 }
 
 #[test]

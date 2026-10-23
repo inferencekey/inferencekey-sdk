@@ -49,7 +49,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::{watch, Semaphore};
 
 pub use app::{AppHandler, JsonReply, Route};
-pub use errors::internal_error;
+pub use errors::{internal_error, ErrorPage};
 pub use sse::{PendingFrame, SendOutcome, StreamSink, CHANNEL_CAPACITY, COALESCE_CAP};
 
 use conn::Stopped;
@@ -59,6 +59,11 @@ use stats::Stats;
 pub const IO_THREAD_PREFIX: &str = "ik-http-io";
 /// Thread name of the blocking-pool threads that run application calls.
 pub const REQUEST_THREAD_NAME: &str = "ik-backend-req";
+
+/// Default [`ServerConfig::shutdown_grace`]. The worker sends SIGTERM and
+/// escalates to SIGKILL after 5 s, so drain plus runtime teardown must fit
+/// well inside that, or the backend's own cleanup never runs.
+pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// Server settings. [`ServerConfig::default`] gives the production defaults.
 #[derive(Clone, Debug)]
@@ -77,10 +82,13 @@ pub struct ServerConfig {
     pub stream_max_bytes: usize,
     /// Close-delimited SSE framing for every client, not only HTTP/1.0 ones.
     pub sse_connection_close: bool,
-    /// How long shutdown lets in-flight responses finish.
+    /// How long shutdown lets in-flight responses finish. Keep the whole stop
+    /// well under the worker's SIGTERM budget (5 s before SIGKILL).
     pub shutdown_grace: Duration,
     /// How long a client may take to send its request head.
     pub header_read_timeout: Duration,
+    /// The 501 page for methods other than GET and POST.
+    pub unsupported_method_page: ErrorPage,
 }
 
 impl ServerConfig {
@@ -100,8 +108,9 @@ impl Default for ServerConfig {
             max_body: 16 * 1024 * 1024,
             stream_max_bytes: 8 * 1024 * 1024,
             sse_connection_close: false,
-            shutdown_grace: Duration::from_secs(5),
+            shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
             header_read_timeout: Duration::from_secs(30),
+            unsupported_method_page: ErrorPage::default(),
         }
     }
 }
@@ -242,13 +251,16 @@ impl ServerHandle {
 
     /// Shut down and release the runtime. Application calls still running
     /// after the grace period are abandoned (their threads finish on their
-    /// own). Idempotent.
+    /// own, and are not waited for). Idempotent.
     pub fn close(&self) {
         self.shutdown();
         let runtime = self.runtime.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(runtime) = runtime {
-            if tokio::runtime::Handle::try_current().is_ok() {
-                // Dropping a runtime inside another one would panic.
+            if self.stopped.wait(Some(Duration::ZERO)) || tokio::runtime::Handle::try_current().is_ok() {
+                // Stopped: the listener and every connection are gone, so the
+                // only threads left are stuck application calls, which would
+                // be abandoned anyway; do not wait for them. Inside another
+                // runtime, dropping this one would panic.
                 runtime.shutdown_background();
             } else {
                 runtime.shutdown_timeout(Duration::from_secs(1));

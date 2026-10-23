@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use common::*;
-use inferencekey_backend_server::{start, JsonReply, Route, ServerConfig};
+use inferencekey_backend_server::{start, ErrorPage, JsonReply, Route, ServerConfig};
 
 #[test]
 fn unknown_paths_get_the_python_404_body() {
@@ -76,6 +76,27 @@ fn other_methods_get_501_with_the_http_server_page() {
     let head = exchange(addr, b"HEAD /healthz HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
     assert_eq!(head.status, 501);
     assert!(head.raw_body.is_empty());
+}
+
+#[test]
+fn the_501_page_comes_from_the_config() {
+    // What the Python binding passes on CPython 3.9 and 3.10, whose
+    // DEFAULT_ERROR_MESSAGE differs from 3.11+.
+    let page = ErrorPage {
+        template: "<!DOCTYPE HTML PUBLIC>\n<p>Error code: 501</p>\n<p>Message: %(message)s.</p>\n\
+                   <p>Error code explanation: HTTPStatus.NOT_IMPLEMENTED - Server does not support this operation.</p>\n"
+            .to_owned(),
+        content_type: "text/html; charset=latin-1".to_owned(),
+    };
+    let server = serve_with(ServerConfig { unsupported_method_page: page, ..config() }, FakeApp::echo());
+    let response = exchange(server.local_addr(), b"PUT /process HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    assert_eq!(response.status, 501);
+    assert_eq!(response.header("content-type"), Some("text/html; charset=latin-1"));
+    assert_eq!(
+        response.text(),
+        "<!DOCTYPE HTML PUBLIC>\n<p>Error code: 501</p>\n<p>Message: Unsupported method ('PUT').</p>\n\
+         <p>Error code explanation: HTTPStatus.NOT_IMPLEMENTED - Server does not support this operation.</p>\n"
+    );
 }
 
 #[test]

@@ -832,6 +832,28 @@ def test_shutdown_frees_the_port_for_an_immediate_rebind(monkeypatch, name) -> N
         socket.create_connection(("127.0.0.1", port), timeout=1).close()
 
 
+@pytest.mark.parametrize("name", TRANSPORTS)
+def test_server_close_releases_the_backend(monkeypatch, name) -> None:
+    """A REPL or a test suite restarting a backend must get its memory (weights, VRAM) back."""
+    import gc
+    import weakref
+
+    _select(name, monkeypatch)
+    refs = []
+    for _ in range(3):
+        backend = ProcessOnlyBackend()
+        refs.append(weakref.ref(backend))
+        httpd, state = serve_mod.serve_backend(backend, 0, block=False)
+        port = httpd.server_address[1]
+        reply = raw_request(port, "POST", "/process", json.dumps({"id": "j", "input": {}}).encode())
+        assert reply.status == 200, reply.body
+        _stop(httpd)
+        del backend, httpd, state
+        gc.collect()
+    alive = sum(ref() is not None for ref in refs)
+    assert alive == 0, f"{alive} of 3 backends still alive after server_close() and gc.collect()"
+
+
 def test_native_shutdown_closes_open_streams(monkeypatch) -> None:
     SlowStreamBackend.closed.clear()
     SlowStreamBackend.started.clear()
@@ -943,6 +965,66 @@ def test_cli_owns_its_listener_and_names_the_transport(tmp_path, name) -> None:
     assert len(lines) == 1 and lines[0].startswith(f"http transport: {name} ("), err
     assert out.count("model loaded") == 1
     assert f"serving on http://127.0.0.1:{port}" in out
+
+
+SLEEPY_CLI_BACKEND = textwrap.dedent(
+    '''
+    import sys
+    import time
+
+    from inferencekey.backend import CustomBackend, Result
+
+    class SleepyBackend(CustomBackend):
+        name = "sleepy"
+
+        def setup(self, ctx):
+            pass
+
+        def process(self, job):
+            print("process started", file=sys.stderr, flush=True)
+            time.sleep(30)
+            return Result(output={})
+    '''
+)
+
+
+@pytest.mark.parametrize("name", TRANSPORTS)
+def test_sigterm_with_a_call_in_flight_exits_within_the_worker_budget(tmp_path, name) -> None:
+    """The worker sends SIGTERM and kills 5 s later; the backend's own cleanup must get to run."""
+    if name == "native":
+        require_native()
+    proc, port = _spawn_cli(tmp_path, SLEEPY_CLI_BACKEND, "SleepyBackend", name)
+    client: Optional[threading.Thread] = None
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and _probe(port, 0.5)[0] != 200:
+            time.sleep(0.05)
+        assert _probe(port)[0] == 200
+
+        def post() -> None:
+            try:
+                raw_request(port, "POST", "/process", json.dumps({"id": "j", "input": {}}).encode(), timeout=40)
+            except OSError:
+                pass
+
+        client = threading.Thread(target=post, daemon=True)
+        client.start()
+        # Wait until the backend is inside process().
+        line = proc.stderr.readline()
+        while line and "process started" not in line:
+            line = proc.stderr.readline()
+        assert "process started" in line
+        started = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=20)
+        took = time.monotonic() - started
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.communicate(timeout=20)
+    print(f"\n[{name}] SIGTERM with one sleeping /process: exit after {took:.2f} s, rc={proc.returncode}")
+    assert proc.returncode == 0
+    assert took < 3.0, f"{name} took {took:.2f} s to exit after SIGTERM"
 
 
 # --------------------------------------------------------------------------

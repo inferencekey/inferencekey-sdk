@@ -14,7 +14,7 @@
 //! 4. Python owns SIGTERM and SIGINT; the runtime installs no signal handler.
 
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -23,8 +23,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use inferencekey_backend_server::{
-    internal_error, start, AppHandler, JsonReply, Route, SendOutcome, ServerConfig, ServerHandle,
-    StreamSink as Sink,
+    internal_error, start, AppHandler, ErrorPage, JsonReply, Route, SendOutcome, ServerConfig,
+    ServerHandle, StreamSink as Sink,
 };
 
 /// Bump when the Python side needs something the binding did not have before;
@@ -34,12 +34,26 @@ pub const BACKEND_SERVER_ABI: u32 = 1;
 /// How often a blocking `wait()` comes back to let Python run signal handlers.
 const SIGNAL_CHECK_INTERVAL: Duration = Duration::from_millis(200);
 
-/// The application object (`serve._NativeApp`) seen from the transport.
+/// The application object (`serve._NativeApp`), released by `close()`.
+///
+/// The app reaches the backend (model weights, VRAM), and `BackendServer` has
+/// no GC traversal, so a strong reference held until the server object dies
+/// would keep the backend alive through any reference cycle back to the
+/// server. `close()` takes it out once the runtime is gone.
+type AppSlot = Arc<Mutex<Option<Py<PyAny>>>>;
+
+/// The application object seen from the transport.
 struct PyApp {
-    app: Py<PyAny>,
+    app: AppSlot,
 }
 
 impl PyApp {
+    /// A new reference to the app, or `None` after `close()`. The lock is
+    /// only held for the refcount bump, never across a Python call.
+    fn app(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.app.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|app| app.clone_ref(py))
+    }
+
     /// Log an exception that escaped the Python application (a bug in
     /// `serve.py`, since backend errors are mapped there) with its traceback.
     fn report(py: Python<'_>, what: &str, err: PyErr) {
@@ -51,8 +65,10 @@ impl PyApp {
 impl AppHandler for PyApp {
     fn call_json(&self, route: Route, body: Bytes) -> JsonReply {
         Python::with_gil(|py| {
-            let result = self
-                .app
+            let Some(app) = self.app(py) else {
+                return JsonReply::new(500, internal_error(route, "server closed"));
+            };
+            let result = app
                 .call_method1(py, "handle_json", (route.path(), PyBytes::new_bound(py, &body)))
                 .and_then(|reply| {
                     let (status, body): (u16, Bound<'_, PyBytes>) = reply.extract(py)?;
@@ -67,9 +83,12 @@ impl AppHandler for PyApp {
 
     fn call_stream(&self, body: Bytes, sink: Sink) {
         Python::with_gil(|py| {
+            let Some(app) = self.app(py) else {
+                sink.reply(500, internal_error(Route::Chat, "server closed"));
+                return;
+            };
             let result = Py::new(py, StreamSink { inner: sink.clone() }).and_then(|py_sink| {
-                self.app
-                    .call_method1(py, "handle_stream", (PyBytes::new_bound(py, &body), py_sink))
+                app.call_method1(py, "handle_stream", (PyBytes::new_bound(py, &body), py_sink))
                     .map(drop)
             });
             if let Err(err) = result {
@@ -99,9 +118,10 @@ fn os_error(err: io::Error) -> PyErr {
 ///
 /// The socket is bound and listening when the constructor returns, so slow
 /// setup can run afterwards while `/healthz` answers 503 from Rust.
-#[pyclass(frozen, module = "inferencekey._inferencekey")]
+#[pyclass(frozen, weakref, module = "inferencekey._inferencekey")]
 pub struct BackendServer {
     handle: ServerHandle,
+    app: AppSlot,
     io_threads: usize,
     backlog: u32,
     max_inflight: usize,
@@ -118,7 +138,8 @@ impl BackendServer {
         max_inflight = 1024,
         stream_max_bytes = 8 << 20,
         sse_connection_close = false,
-        shutdown_grace = 5.0,
+        shutdown_grace = 2.0,
+        unsupported_method_page = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -131,10 +152,24 @@ impl BackendServer {
         stream_max_bytes: usize,
         sse_connection_close: bool,
         shutdown_grace: f64,
+        unsupported_method_page: Option<(String, String)>,
     ) -> PyResult<Self> {
         if !(shutdown_grace.is_finite() && shutdown_grace >= 0.0) {
             return Err(PyValueError::new_err("shutdown_grace must be a non-negative number of seconds"));
         }
+        // `(page, content_type)` rendered by the running interpreter's
+        // http.server with a `%(message)s` placeholder, so the 501 page matches
+        // it byte for byte.
+        let unsupported_method_page = match unsupported_method_page {
+            Some((template, content_type)) => {
+                let page = ErrorPage { template, content_type };
+                if !page.has_valid_content_type() {
+                    return Err(PyValueError::new_err("unsupported_method_page content type is not a valid header value"));
+                }
+                page
+            }
+            None => ErrorPage::default(),
+        };
         let cfg = ServerConfig {
             port,
             backlog: backlog.max(1),
@@ -143,12 +178,14 @@ impl BackendServer {
             stream_max_bytes: stream_max_bytes.max(1),
             sse_connection_close,
             shutdown_grace: Duration::from_secs_f64(shutdown_grace),
+            unsupported_method_page,
             ..ServerConfig::default()
         };
         let (io_threads, backlog, max_inflight) = (cfg.io_threads, cfg.backlog, cfg.max_inflight);
-        let app: Arc<dyn AppHandler> = Arc::new(PyApp { app });
+        let slot: AppSlot = Arc::new(Mutex::new(Some(app)));
+        let app: Arc<dyn AppHandler> = Arc::new(PyApp { app: slot.clone() });
         let handle = py.allow_threads(|| start(cfg, app)).map_err(os_error)?;
-        Ok(BackendServer { handle, io_threads, backlog, max_inflight })
+        Ok(BackendServer { handle, app: slot, io_threads, backlog, max_inflight })
     }
 
     /// The bound port (the real one when 0 was requested).
@@ -201,9 +238,11 @@ impl BackendServer {
         py.allow_threads(|| self.handle.shutdown());
     }
 
-    /// Shut down (if needed) and release the runtime. Idempotent.
+    /// Shut down (if needed), release the runtime and drop the reference to
+    /// `app`, so the backend can be freed. Idempotent.
     fn close(&self, py: Python<'_>) {
         py.allow_threads(|| self.handle.close());
+        self.release_app();
     }
 
     /// Block until the server stops, or `timeout` seconds pass; returns whether
@@ -236,13 +275,25 @@ impl BackendServer {
     }
 }
 
+impl BackendServer {
+    /// Drop the app reference (with the GIL held). Calls abandoned after the
+    /// grace period hold their own reference and finish normally.
+    fn release_app(&self) {
+        let app = self.app.lock().unwrap_or_else(|p| p.into_inner()).take();
+        drop(app);
+    }
+}
+
 impl Drop for BackendServer {
     fn drop(&mut self) {
         // Dropping a ServerHandle closes it, which waits for the shutdown
         // grace period. Application threads may be waiting for the GIL to
         // finish their calls, so release it while waiting; otherwise they
         // could not run and the wait would always last the whole grace.
-        Python::with_gil(|py| py.allow_threads(|| self.handle.close()));
+        Python::with_gil(|py| {
+            py.allow_threads(|| self.handle.close());
+            self.release_app();
+        });
     }
 }
 

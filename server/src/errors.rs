@@ -59,20 +59,61 @@ pub(crate) fn models_body(manifest: &[u8]) -> Bytes {
     Bytes::from(out)
 }
 
-/// Content type of [`unsupported_method_page`], as `http.server` sends it.
-pub(crate) const HTML_CONTENT_TYPE: &str = "text/html;charset=utf-8";
+/// The HTML error page `http.server.BaseHTTPRequestHandler.send_error` writes,
+/// used for the 501 a method without a handler gets.
+///
+/// The page differs between CPython versions (`DEFAULT_ERROR_MESSAGE` changed
+/// in 3.11, and so did `str()` of the `HTTPStatus` code it is formatted with),
+/// so the Python binding renders it with the running interpreter, leaving
+/// only the message as a [`ErrorPage::MESSAGE`] placeholder, and both
+/// transports send the same bytes. [`ErrorPage::default`] is the CPython 3.12
+/// page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ErrorPage {
+    /// The rendered page; every [`ErrorPage::MESSAGE`] is replaced by the
+    /// HTML-escaped message.
+    pub template: String,
+    /// The `Content-Type` header (`error_content_type`).
+    pub content_type: String,
+}
 
-/// The HTML page `http.server.BaseHTTPRequestHandler.send_error(501, ...)`
-/// writes (CPython 3.12) for a method without a `do_*` handler.
-pub(crate) fn unsupported_method_page(method: &str) -> Bytes {
-    let message = html_escape(&format!("Unsupported method ('{method}')"));
-    Bytes::from(format!(
-        "<!DOCTYPE HTML>\n<html lang=\"en\">\n    <head>\n        <meta charset=\"utf-8\">\n        \
-         <title>Error response</title>\n    </head>\n    <body>\n        <h1>Error response</h1>\n        \
-         <p>Error code: 501</p>\n        <p>Message: {message}.</p>\n        \
-         <p>Error code explanation: 501 - Server does not support this operation.</p>\n    \
-         </body>\n</html>\n"
-    ))
+impl Default for ErrorPage {
+    fn default() -> Self {
+        ErrorPage {
+            template: "<!DOCTYPE HTML>\n<html lang=\"en\">\n    <head>\n        <meta charset=\"utf-8\">\n        \
+                       <title>Error response</title>\n    </head>\n    <body>\n        <h1>Error response</h1>\n        \
+                       <p>Error code: 501</p>\n        <p>Message: %(message)s.</p>\n        \
+                       <p>Error code explanation: 501 - Server does not support this operation.</p>\n    \
+                       </body>\n</html>\n"
+                .to_owned(),
+            content_type: "text/html;charset=utf-8".to_owned(),
+        }
+    }
+}
+
+impl ErrorPage {
+    /// The placeholder for the message in [`ErrorPage::template`].
+    pub const MESSAGE: &'static str = "%(message)s";
+
+    /// Whether `content_type` can be sent as a header value.
+    pub fn has_valid_content_type(&self) -> bool {
+        hyper::header::HeaderValue::from_str(&self.content_type).is_ok()
+    }
+
+    /// The 501 page for `method`, as `send_error(501, "Unsupported method (%r)" % method)`.
+    pub(crate) fn unsupported_method(&self, method: &str) -> Bytes {
+        let message = html_escape(&format!("Unsupported method ({})", python_repr(method)));
+        Bytes::from(self.template.replace(Self::MESSAGE, &message))
+    }
+}
+
+/// `repr(text)` for the ASCII tokens hyper accepts as methods.
+fn python_repr(text: &str) -> String {
+    if text.contains('\'') && !text.contains('"') {
+        format!("\"{text}\"")
+    } else {
+        format!("'{}'", text.replace('\\', "\\\\").replace('\'', "\\'"))
+    }
 }
 
 /// `html.escape(text, quote=False)`.
@@ -112,8 +153,17 @@ mod tests {
     fn unsupported_method_page_matches_cpython_312() {
         // Printed by CPython 3.12 from http.server.DEFAULT_ERROR_MESSAGE.
         let expected = "<!DOCTYPE HTML>\n<html lang=\"en\">\n    <head>\n        <meta charset=\"utf-8\">\n        <title>Error response</title>\n    </head>\n    <body>\n        <h1>Error response</h1>\n        <p>Error code: 501</p>\n        <p>Message: Unsupported method ('PUT').</p>\n        <p>Error code explanation: 501 - Server does not support this operation.</p>\n    </body>\n</html>\n";
-        assert_eq!(std::str::from_utf8(&unsupported_method_page("PUT")).unwrap(), expected);
-        assert!(std::str::from_utf8(&unsupported_method_page("A<B&")).unwrap().contains("('A&lt;B&amp;')"));
+        let page = ErrorPage::default();
+        assert_eq!(std::str::from_utf8(&page.unsupported_method("PUT")).unwrap(), expected);
+        assert!(std::str::from_utf8(&page.unsupported_method("A<B&")).unwrap().contains("('A&lt;B&amp;')"));
+        // repr() switches to double quotes when the text has a single quote.
+        assert!(std::str::from_utf8(&page.unsupported_method("A'B")).unwrap().contains("(\"A'B\")"));
+    }
+
+    #[test]
+    fn unsupported_method_page_fills_only_the_message() {
+        let page = ErrorPage { template: "100% %(code)s|%(message)s|%(message)s".to_owned(), content_type: "text/plain".to_owned() };
+        assert_eq!(&page.unsupported_method("A<")[..], b"100% %(code)s|Unsupported method ('A&lt;')|Unsupported method ('A&lt;')");
     }
 
     #[test]

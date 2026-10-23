@@ -107,7 +107,7 @@ pub(crate) async fn handle(
             Some(route) => handle_post(route, req, shared).await,
             None => Ok(json(404, errors::not_found())),
         },
-        _ => Ok(unsupported_method(req.method())),
+        _ => Ok(unsupported_method(req.method(), &shared.cfg.unsupported_method_page)),
     }
 }
 
@@ -128,12 +128,12 @@ fn handle_get(path: &str, shared: &Shared) -> Response<AppBody> {
 }
 
 /// 501 for a method without a handler, as `BaseHTTPRequestHandler` answers it.
-fn unsupported_method(method: &Method) -> Response<AppBody> {
-    let mut response = Response::new(AppBody::Full(Some(errors::unsupported_method_page(method.as_str()))));
+fn unsupported_method(method: &Method, page: &errors::ErrorPage) -> Response<AppBody> {
+    let mut response = Response::new(AppBody::Full(Some(page.unsupported_method(method.as_str()))));
     *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static(errors::HTML_CONTENT_TYPE));
+    let content_type = HeaderValue::from_str(&page.content_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("text/html;charset=utf-8"));
+    response.headers_mut().insert(CONTENT_TYPE, content_type);
     response.headers_mut().insert(CONNECTION, HeaderValue::from_static("close"));
     response
 }

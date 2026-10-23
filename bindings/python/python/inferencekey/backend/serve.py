@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import html
 import importlib
 import json
 import os
@@ -78,6 +79,8 @@ import signal
 import sys
 import threading
 import traceback
+import weakref
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Iterator, Optional, Protocol, Tuple, Union
 
@@ -177,7 +180,8 @@ class _BackendState:
 
     def mark_ready(self) -> None:
         self._ready.set()
-        for hook in self._ready_hooks:
+        hooks, self._ready_hooks = self._ready_hooks, []
+        for hook in hooks:
             hook()
 
     def process(self, job: Job) -> Result:
@@ -752,7 +756,9 @@ class _NativeHttpd:
     ``server_address``, ``server_port``, ``serve_forever()``, ``shutdown()``
     and ``server_close()``. ``shutdown()`` stops accepting, closes open streams
     (their generators are closed at the next chunk) and lets in-flight
-    responses finish for up to 5 s; ``server_close()`` releases the runtime.
+    responses finish for up to 2 s (the worker kills a backend 5 s after
+    SIGTERM); ``server_close()`` releases the runtime and the reference to the
+    backend.
     Both wait with the GIL released and are safe to call more than once. An
     ``atexit`` hook closes a server nobody closed.
     """
@@ -783,10 +789,44 @@ class _NativeHttpd:
 
 
 def _start_native(state: _BackendState, port: int, transport: _Transport) -> _NativeHttpd:
-    server = transport.module.BackendServer(port, _NativeApp(state), **transport.options)
+    server = transport.module.BackendServer(
+        port,
+        _NativeApp(state),
+        unsupported_method_page=_unsupported_method_page(),
+        **transport.options,
+    )
     _set_native_manifest(server, state)
-    state.on_ready(lambda: server.set_ready(True))
+    # Weak: the server holds the app, the app holds the state, and a strong
+    # hook would close the cycle back to the server (whose native object the
+    # GC cannot traverse), leaking the backend after server_close().
+    # _NativeHttpd keeps the server alive while it is in use.
+    server_ref = weakref.ref(server)
+
+    def _set_ready() -> None:
+        live = server_ref()
+        if live is not None:
+            live.set_ready(True)
+
+    state.on_ready(_set_ready)
     return _NativeHttpd(server)
+
+
+def _unsupported_method_page() -> Tuple[str, str]:
+    """The 501 page this interpreter's ``http.server`` sends, with a ``%(message)s`` placeholder.
+
+    ``(page, content_type)`` for the native server. Rendered here because the
+    page differs between CPython versions (``DEFAULT_ERROR_MESSAGE`` changed in
+    3.11, and so did ``str()`` of the ``HTTPStatus`` it is formatted with).
+    Mirrors ``BaseHTTPRequestHandler.send_error``.
+    """
+    handler = BaseHTTPRequestHandler
+    code = HTTPStatus.NOT_IMPLEMENTED
+    page = handler.error_message_format % {
+        "code": code,
+        "message": "%(message)s",
+        "explain": html.escape(handler.responses[code][1], quote=False),
+    }
+    return page, handler.error_content_type
 
 
 def _set_native_manifest(server: Any, state: _BackendState) -> None:
