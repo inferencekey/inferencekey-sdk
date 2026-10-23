@@ -59,19 +59,24 @@ from __future__ import annotations
 
 import codecs
 import glob
+import hashlib
 import itertools
 import json
 import os
 import queue
+import re
 import site
 import sys
 import threading
 import time
 import traceback
-from collections import deque
+from array import array
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Deque, Dict, Iterator, List, Optional
+
+from prefix_cache import BLOCK, PrefixIndex, block_hashes, usable_hit
 
 
 @dataclass
@@ -83,6 +88,10 @@ class GenRequest:
     temperature: float = 0.6
     top_p: float = 1.0
     seed: Optional[int] = None
+    #: Identifies the conversation (the OpenAI ``user`` field, else a hash of
+    #: its first messages): its turns go to the rank that caches its prefix.
+    session_key: Optional[str] = None
+    ignore_eos: bool = False
 
 
 @dataclass
@@ -97,6 +106,8 @@ class GenEvent:
     #: Why the request failed, when the backend should answer something other
     #: than a server error: ``"context_length_exceeded"`` or ``"invalid_prompt"``.
     error_code: Optional[str] = None
+    #: Prompt tokens served from the prefix cache (None: the engine has no cache).
+    cached_tokens: Optional[int] = None
 
 
 class Engine:
@@ -365,6 +376,24 @@ def _rank_devices(visible: List[str], rank: int, cp_size: int) -> List[str]:
     return visible[start : start + cp_size]
 
 
+def _die_with_parent() -> None:
+    """Ask Linux to SIGKILL this process when its parent dies.
+
+    The ranks are separate processes holding GPU memory; when the backend
+    process goes away without stopping them (killed, or restarted by the
+    worker), orphaned ranks would keep their GPUs. The rank loop also checks
+    its parent between steps, for platforms without prctl.
+    """
+    try:
+        import ctypes  # noqa: PLC0415
+        import signal  # noqa: PLC0415
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(1, int(signal.SIGKILL), 0, 0, 0)  # PR_SET_PDEATHSIG
+    except Exception:  # noqa: BLE001 (best effort; the loop check remains)
+        pass
+
+
 def _rank_main(
     rank: int,
     settings: Dict[str, Any],
@@ -372,6 +401,7 @@ def _rank_main(
     results: Any,
 ) -> None:
     """One data-parallel rank: build an LLM, then loop in lockstep with the others."""
+    _die_with_parent()
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(settings["devices"][rank])
     os.environ.update(settings["env"])
 
@@ -412,19 +442,209 @@ def _rank_main(
             token_array=lambda ids: np.asarray(ids, dtype=np.int32),
             multi_modal_data=lambda: dict(image_bytes=[], image_sizes=[]) if needs_mm else None,
             vocab_size=vocab_size,
+            cache=_RankCache(rank, engine, settings) if settings.get("prefix_cache", True) else None,
         )
     finally:
         llm.close()
 
 
+#: Chat-template markers of DeepSeek-V4.1 prompts. They are added tokens, which
+#: the tokenizer splits out before anything else, so encoding the text between
+#: them piece by piece gives exactly the ids of encoding the whole prompt.
+_SEGMENT_MARKERS = ("<｜begin▁of▁sentence｜>", "<｜User｜>", "<｜Assistant｜>", "<｜end▁of▁sentence｜>",
+                    "<think>", "</think>")
+
+
+class SegmentTokenizer:
+    """Encodes a prompt piece by piece between chat-template markers, keeping the
+    ids of long pieces.
+
+    A coding agent resends its whole conversation every turn; with a 1M-token
+    context that is about 3 s of tokenizer CPU per request. Every turn repeats
+    the pieces of the previous one (the system prompt and repository context,
+    earlier turns), so with this cache only the new pieces are encoded. Used only
+    when the markers are added tokens of the tokenizer (DeepSeek-V4.1's are),
+    which is what makes the piecewise result identical to a full encode.
+    Thread-safe (the rank tokenizes on a few threads).
+    """
+
+    MIN_CACHED_CHARS = 4096
+
+    def __init__(self, tokenizer: Any, max_tokens: int) -> None:
+        self.tokenizer = tokenizer
+        self.max_tokens = max_tokens
+        added = set(getattr(tokenizer, "get_added_vocab", lambda: {})())
+        markers = [m for m in _SEGMENT_MARKERS if m in added]
+        self.enabled = bool(markers) and max_tokens > 0
+        self.split = re.compile("(?=" + "|".join(re.escape(m) for m in markers) + ")") if markers else None
+        self.cache: "OrderedDict[bytes, array]" = OrderedDict()
+        self.cached_tokens = 0
+        self.lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    def encode(self, prompt: str) -> Any:
+        """The prompt's ids: a list, or for long prompts an ``array("i")`` (a 1M-token
+        list of Python ints would cost about 36 MB)."""
+        encode = self.tokenizer.encode
+        if not self.enabled or len(prompt) < 4 * self.MIN_CACHED_CHARS:
+            return encode(prompt, add_special_tokens=False)
+        ids = array("i")
+        for piece in self.split.split(prompt):
+            if len(piece) < self.MIN_CACHED_CHARS:
+                if piece:
+                    ids.extend(encode(piece, add_special_tokens=False))
+                continue
+            key = hashlib.blake2b(piece.encode("utf-8"), digest_size=16).digest()
+            with self.lock:
+                hit = self.cache.get(key)
+                if hit is not None:
+                    self.cache.move_to_end(key)
+                    self.hits += 1
+            if hit is None:
+                hit = array("i", encode(piece, add_special_tokens=False))
+                with self.lock:
+                    self.misses += 1
+                    if key not in self.cache:
+                        self.cache[key] = hit
+                        self.cached_tokens += len(hit)
+                        while self.cached_tokens > self.max_tokens and self.cache:
+                            _, old = self.cache.popitem(last=False)
+                            self.cached_tokens -= len(old)
+            ids.extend(hit)
+        return ids
+
+
+class _RankCache:
+    """The GPU prefix cache of one rank: a :class:`PrefixIndex` and the engine calls around it.
+
+    Needs DeepInfer with the local prefix-cache patch
+    (``deepinfer-patch/0002-local-prefix-cache.patch``):
+    ``engine.enqueue_with_prefix(seq, blocks, num_cached, swa_valid_start)``
+    (which validates the blocks before pinning them and raises without side
+    effects) and ``Sequence.block_table``. Uses the engine's own ``block_manager``
+    (``pin_blocks`` / ``unpin_blocks`` / ``get_num_free_blocks``),
+    ``cache_config.num_gpu_blocks``, ``add_request(enqueue=False)`` and
+    ``finalize_seq``, which this class wraps to cache a finished prompt's blocks
+    before the engine frees them. Everything runs on the rank loop's thread.
+    """
+
+    def __init__(self, rank: int, engine: Any, settings: Dict[str, Any]) -> None:
+        self.rank = rank
+        self.engine = engine
+        block_size = int(getattr(engine.cache_config, "block_size", BLOCK))
+        if block_size != BLOCK:
+            raise ValueError(f"the prefix cache needs {BLOCK}-token KV blocks, the engine has {block_size}")
+        self.blocks = engine.block_manager
+        self.total_blocks = int(engine.cache_config.num_gpu_blocks)
+        self.index = PrefixIndex(self.blocks.pin_blocks, self.blocks.unpin_blocks)
+        # Free blocks kept on top of what waiting prompts need: DeepInfer stops
+        # admitting prefill above 90 % use (GPU_CACHE_PREFILL_WATERMARK), and a
+        # sequence that runs out of blocks during decode is preempted.
+        self.headroom = int((0.10 + float(settings.get("prefix_cache_free_fraction", 0.05))) * self.total_blocks)
+        self.waiting_len = getattr(engine.scheduler, "get_sum_prompt_len_waiting", None)
+        self.live: Dict[str, tuple] = {}  # request id -> (hashes, prompt_len, hashes the sequence reuses)
+        self.preempt_check = getattr(engine.scheduler, "get_num_preempted_seqs", None)
+        finalize = engine.finalize_seq
+
+        def finalize_seq(seq: Any) -> None:
+            try:
+                self._finished(seq)
+            except Exception:  # noqa: BLE001 (never break the engine step)
+                traceback.print_exc(file=sys.stderr)
+            finalize(seq)
+
+        engine.finalize_seq = finalize_seq
+        print(f"deepinfer rank {rank}: prefix cache on, {self.total_blocks} KV blocks of {BLOCK} tokens "
+              f"({self.total_blocks * BLOCK:,} tokens), headroom {self.headroom} blocks", file=sys.stderr, flush=True)
+
+    def add(self, add_request: Callable[..., Any], request_id: str, token_ids: Any, hashes: List[bytes],
+            max_tokens: int) -> "tuple[Any, int]":
+        """Add a request, starting from its longest cached prefix; returns (sequence, cached tokens)."""
+        prompt_len = len(token_ids)
+        blocks = self.index.lookup(hashes)
+        hit = usable_hit(len(blocks), prompt_len)
+        # The block [hit - BLOCK, hit) is recomputed with the new tokens (SWA
+        # bounded replay), so it gets a fresh block and the cached one is never written.
+        reused = hit // BLOCK - 1 if hit else 0
+        used = hashes[:reused]
+        self.index.protect(used)  # before making room, so the hit is not the block evicted
+        self.make_room(prompt_len - hit + max_tokens)
+        if not hit:
+            seq = add_request(enqueue=True)
+            if seq is not None:
+                self.live[request_id] = (hashes, prompt_len, [])
+            return seq, 0
+        seq = add_request(enqueue=False)
+        if seq is None:
+            self.index.unprotect(used)
+            return None, 0
+        try:
+            self.engine.enqueue_with_prefix(seq, blocks[:reused], hit - BLOCK, hit - BLOCK)
+        except Exception as exc:  # noqa: BLE001 (nothing was queued or pinned: admit it cold)
+            print(f"deepinfer rank {self.rank}: prefix admission of {request_id} failed ({exc}); "
+                  "running it without the cache", file=sys.stderr, flush=True)
+            self.index.unprotect(used)
+            self.engine.scheduler.add_sequence(seq)
+            self.live[request_id] = (hashes, prompt_len, [])
+            return seq, 0
+        self.index.hits += 1
+        self.index.hit_tokens += hit - BLOCK
+        self.live[request_id] = (hashes, prompt_len, used)
+        return seq, hit - BLOCK
+
+    def make_room(self, new_tokens: int) -> None:
+        want = -(-max(new_tokens, 0) // BLOCK) + self.headroom
+        free = int(self.blocks.get_num_free_blocks())
+        if free < want:
+            self.index.evict(want - free)
+
+    def tick(self) -> None:
+        """Between steps: evict for the prompts already waiting in the engine's queue."""
+        if not len(self.index) or self.waiting_len is None:
+            return
+        waiting, prompt_len = self.waiting_len()
+        if waiting:
+            self.make_room(min(int(prompt_len), self.total_blocks * BLOCK))
+
+    def forget(self, request_id: str) -> None:
+        """A request left without finishing in the engine (aborted): drop its protection."""
+        entry = self.live.pop(request_id, None)
+        if entry is not None:
+            self.index.unprotect(entry[2])
+
+    def _finished(self, seq: Any) -> None:
+        entry = self.live.pop(seq.request_id, None)
+        if entry is None:
+            return
+        hashes, prompt_len, used = entry
+        self.index.unprotect(used)
+        # Prompt blocks only, and never the last prompt token's block: with
+        # drop_thinking the next turn re-renders everything after the prompt.
+        n = min(len(hashes), (prompt_len - 1) // BLOCK)
+        table = list(seq.block_table)[:n]
+        if n and len(table) == n:
+            self.index.insert(hashes[:n], table)
+
+    def stats(self) -> Dict[str, Any]:
+        out = {"rank": self.rank, "total_blocks": self.total_blocks,
+               "free_blocks": int(self.blocks.get_num_free_blocks()), "live": len(self.live), **self.index.stats()}
+        if self.preempt_check is not None:
+            out["preempted"] = int(self.preempt_check())
+        return out
+
+
 class _Live:
     """A request this rank has handed to the engine."""
 
-    __slots__ = ("detokenizer", "tokens")
+    __slots__ = ("detokenizer", "tokens", "seq", "since", "warned")
 
-    def __init__(self, detokenizer: IncrementalDetokenizer) -> None:
+    def __init__(self, detokenizer: IncrementalDetokenizer, seq: Any = None) -> None:
         self.detokenizer = detokenizer
         self.tokens = 0
+        self.seq = seq
+        self.since = time.monotonic()  # added, or last output
+        self.warned = False
 
 
 def _rank_loop(
@@ -440,6 +660,7 @@ def _rank_loop(
     token_array: Callable[[List[int]], Any],
     multi_modal_data: Callable[[], Any],
     vocab_size: Optional[int] = None,
+    cache: Optional[_RankCache] = None,
 ) -> None:
     """The rank's serving loop, apart from building the engine (so tests can drive it).
 
@@ -451,6 +672,9 @@ def _rank_loop(
     with the text these tokens made final and the totals so far. A failed
     request's last item carries a seventh field, its error code (see
     ``CONTEXT_LENGTH_EXCEEDED`` and ``INVALID_PROMPT``) or ``None``.
+    With a prefix ``cache``: ``("meta", rank, [(request_id, cached_tokens), ...])``
+    for the requests added in an iteration (before their first output), and
+    ``("stats", rank, {...})`` every ``stats_interval_seconds``.
 
     The parent never sees a token id: prompts are tokenized here, on a few
     threads (the Hugging Face fast tokenizer releases the GIL while it encodes,
@@ -458,7 +682,12 @@ def _rank_loop(
     are detokenized here, incrementally, per request.
     """
     new_detokenizer = detokenizer_factory(tokenizer)
+    segments = SegmentTokenizer(tokenizer, int(settings.get("tokenizer_cache_tokens", 64_000_000)))
     idle_sleep = float(settings["idle_poll_seconds"])
+    stats_every = float(settings.get("stats_interval_seconds", 2.0))
+    next_stats = time.monotonic()
+    stuck_after = float(settings.get("stuck_request_seconds", 120.0))
+    next_stuck_check = time.monotonic() + 10.0
     abort_on_disconnect = bool(settings.get("abort_on_disconnect", True))
     pool = ThreadPoolExecutor(
         max_workers=max(1, int(settings.get("tokenizer_threads", 2))),
@@ -472,9 +701,9 @@ def _rank_loop(
         try:
             # The encoded prompt starts with the BOS text already; the release
             # tokenizer would add a second BOS id otherwise.
-            ids = tokenizer.encode(prompt, add_special_tokens=False)
+            ids = segments.encode(prompt)
         except Exception as exc:  # noqa: BLE001 (report it on the request)
-            tokenized.append((request_id, None, params, (f"tokenization failed: {exc}", None)))
+            tokenized.append((request_id, None, params, (f"tokenization failed: {exc}", None), []))
             return
         if vocab_size is not None and ids and max(ids) >= vocab_size:
             # The release tokenizer registers multimodal placeholders as added
@@ -483,11 +712,14 @@ def _rank_loop(
             bad = next(i for i in ids if i >= vocab_size)
             error = (f"the prompt holds token id {bad}, outside the model vocabulary ({vocab_size}); "
                      f"the messages contain reserved special-token text: {tokenizer.decode([bad])!r}")
-            tokenized.append((request_id, None, params, (error, INVALID_PROMPT)))
+            tokenized.append((request_id, None, params, (error, INVALID_PROMPT), []))
             return
-        tokenized.append((request_id, token_array(ids), params, None))
+        hashes = block_hashes(ids) if cache is not None else []
+        tokenized.append((request_id, token_array(ids), params, None, hashes))
 
     results.put(("ready", rank, None))
+    parent = os.getppid()
+    next_parent_check = time.monotonic() + 1.0
     pending_flush = False
     try:
         while True:
@@ -509,6 +741,8 @@ def _rank_loop(
                     if request_id in tokenizing:
                         tokenizing[request_id] = True
                     elif live.pop(request_id, None) is not None and abort_on_disconnect:
+                        if cache is not None:
+                            cache.forget(request_id)
                         try:
                             # UNVERIFIED: aborting between steps while other requests run.
                             engine.abort_request(request_id)
@@ -517,21 +751,32 @@ def _rank_loop(
                                   file=sys.stderr, flush=True)
 
             # Prompts tokenized since the last iteration go to the engine.
+            metas: List[tuple] = []
             while tokenized:
-                request_id, token_ids, params, error = tokenized.popleft()
+                request_id, token_ids, params, error, hashes = tokenized.popleft()
                 if tokenizing.pop(request_id, False):
                     continue  # the client left while its prompt was being tokenized
                 if error is None:
+                    params = dict(params)
+                    user_id = (params.pop("session_key", None) or "0")[:64]
                     try:
                         # UNVERIFIED: adding requests between steps while others are in flight
                         # (the offline example adds them all before the first step).
-                        seq = engine.add_request(
-                            user_id="0",
-                            request_id=request_id,
-                            sampling_params=sampling_params(**params),
-                            prompt_token_ids=token_ids,
-                            multi_modal_data=multi_modal_data(),
-                        )
+                        def add(enqueue: bool = True) -> Any:
+                            return engine.add_request(
+                                user_id=user_id,
+                                request_id=request_id,
+                                sampling_params=sampling_params(**params),
+                                prompt_token_ids=token_ids,
+                                multi_modal_data=multi_modal_data(),
+                                **({} if enqueue else {"enqueue": False}),
+                            )
+
+                        if cache is not None:
+                            seq, cached = cache.add(add, request_id, token_ids, hashes, int(params["max_tokens"]))
+                            metas.append((request_id, cached))
+                        else:
+                            seq = add()
                         if seq is None:
                             # Dropped without an exception (a token id out of range): it
                             # would never produce an output, so it must not wait for one.
@@ -539,13 +784,24 @@ def _rank_loop(
                     except Exception as exc:  # noqa: BLE001 (report and keep the rank alive)
                         error = (str(exc), None)
                 if error is None:
-                    live[request_id] = _Live(new_detokenizer())
+                    live[request_id] = _Live(new_detokenizer(), seq)
                 else:
                     items.append((request_id, "", 0, 0, True, *error))
+
+            if time.monotonic() >= next_parent_check:
+                next_parent_check = time.monotonic() + 1.0
+                if os.getppid() != parent:
+                    print(f"deepinfer rank {rank}: the backend process is gone; exiting", file=sys.stderr, flush=True)
+                    return
+            if stuck_after and time.monotonic() >= next_stuck_check:
+                next_stuck_check = time.monotonic() + 10.0
+                _warn_stuck(rank, live, tokenizing, stuck_after)
 
             # Collective across the data-parallel group: every rank calls it.
             # UNVERIFIED: that idle ranks may keep calling it (and step() with an
             # empty local batch) indefinitely, as a long-lived server needs.
+            if cache is not None:
+                cache.tick()
             unfinished = engine.has_unfinished_requests()
             if unfinished:
                 outputs = engine.step()
@@ -555,17 +811,48 @@ def _rank_loop(
                 outputs = engine.flush_inflight_reqs()
                 pending_flush = False
             else:
+                if metas:
+                    results.put(("meta", rank, metas))
                 if items:
                     results.put(("out", rank, items))
+                if cache is not None and time.monotonic() >= next_stats:
+                    next_stats = time.monotonic() + stats_every
+                    results.put(("stats", rank, {**cache.stats(), "tokenizer_cache_hits": segments.hits, "tokenizer_cache_misses": segments.misses}))
                 time.sleep(idle_sleep)
                 continue
 
             if outputs:
                 _collect_step(outputs, clone, live, items)
+            if metas:
+                results.put(("meta", rank, metas))
             if items:
                 results.put(("out", rank, items))
+            if cache is not None:
+                for item in items:
+                    if item[4]:
+                        cache.forget(item[0])  # finished or failed: no-op once finalize ran
+                if time.monotonic() >= next_stats:
+                    next_stats = time.monotonic() + stats_every
+                    results.put(("stats", rank, {**cache.stats(), "tokenizer_cache_hits": segments.hits, "tokenizer_cache_misses": segments.misses}))
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _warn_stuck(rank: int, live: Dict[str, _Live], tokenizing: Dict[str, bool], after: float) -> None:
+    """Log, once per request, a request with no output for ``after`` seconds and
+    where it sits, so a lost or starved request shows up in the backend log."""
+    now = time.monotonic()
+    for request_id, state in live.items():
+        if state.warned or now - state.since < after:
+            continue
+        state.warned = True
+        seq = state.seq
+        status = getattr(seq, "status", None)
+        where = ("waiting for its first token (queued or prefilling)" if state.tokens == 0
+                 else f"no new token after {state.tokens}")
+        print(f"deepinfer rank {rank}: request {request_id} {where} for {now - state.since:.0f} s"
+              f"{f', engine status {status}' if status is not None else ''}; {len(live)} live, "
+              f"{len(tokenizing)} tokenizing", file=sys.stderr, flush=True)
 
 
 def _collect_step(outputs: Any, clone: Callable[[Any], Any], live: Dict[str, _Live], items: List[tuple]) -> None:
@@ -596,6 +883,7 @@ def _collect_step(outputs: Any, clone: Callable[[Any], Any], live: Dict[str, _Li
         if state is None:
             continue  # aborted
         state.tokens += len(token_ids)
+        state.since = time.monotonic()
         text = state.detokenizer.feed(token_ids) if token_ids else ""
         if finished:
             text += state.detokenizer.flush()
@@ -612,9 +900,10 @@ def _collect_step(outputs: Any, clone: Callable[[Any], Any], live: Dict[str, _Li
 class _Stream:
     """Parent-side mailbox of one request: the reader appends, the request's thread drains."""
 
-    __slots__ = ("items", "wake", "done")
+    __slots__ = ("items", "wake", "done", "cached")
 
     def __init__(self) -> None:
+        self.cached: Optional[int] = None
         self.items: "Deque[tuple]" = deque()
         self.wake = threading.Event()  # items arrived
         self.done = threading.Event()  # the last item arrived
@@ -672,11 +961,15 @@ def use_deepinfer_venv(venv: Optional[str], ctx: Any) -> None:
 
 
 class DeepInferEngine(Engine):
-    """DeepInfer with one process per data-parallel rank and a least-loaded router.
+    """DeepInfer with one process per data-parallel rank and a session-affinity router.
 
     The open release of DeepInfer ships no load balancer across data-parallel
-    replicas; this router (fewest requests in flight wins) is ours and simple on
-    purpose.
+    replicas; this router is ours. With the prefix cache on (``prefix_cache``,
+    default), every turn of a conversation goes to the rank that holds its
+    prefix (a new conversation goes to the rank with the least KV in use), and
+    moves only when that rank already has ``session_migrate_inflight`` requests
+    in flight: a move costs a full cold prefill on the new rank. Without the
+    cache, the rank with the fewest requests in flight wins.
 
     The work is split so this process (one GIL for every HTTP stream) stays
     cheap: the ranks tokenize prompts, detokenize completions incrementally and
@@ -733,6 +1026,11 @@ class DeepInferEngine(Engine):
             "idle_poll_seconds": float(config.get("idle_poll_seconds", 0.005)),
             "tokenizer_threads": int(config.get("tokenizer_threads", 2)),
             "abort_on_disconnect": bool(config.get("abort_on_disconnect", True)),
+            "prefix_cache": bool(config.get("prefix_cache", True)),
+            "tokenizer_cache_tokens": int(config.get("tokenizer_cache_tokens", 64_000_000)),
+            "prefix_cache_free_fraction": float(config.get("prefix_cache_free_fraction", 0.05)),
+            "stats_interval_seconds": float(config.get("stats_interval_seconds", 2.0)),
+            "stuck_request_seconds": float(config.get("stuck_request_seconds", 120.0)),
             "llm_kwargs": {
                 "max_model_len": max_model_len,
                 "max_num_seqs": int(config.get("max_num_seqs", 64)),
@@ -763,6 +1061,14 @@ class DeepInferEngine(Engine):
         self._streams: Dict[str, _Stream] = {}
         self._owner: Dict[str, int] = {}
         self._in_flight = [0] * dp
+        self._affinity = bool(config.get("prefix_cache", True))
+        self._sessions: "OrderedDict[str, int]" = OrderedDict()  # session key -> rank, LRU
+        self._max_sessions = int(config.get("session_table_size", 100_000))
+        self._migrate_at = int(config.get("session_migrate_inflight", 4 * int(settings["llm_kwargs"]["max_num_seqs"])))
+        self._used_blocks = [0] * dp  # from the ranks' stats messages
+        self._assigned = [0] * dp  # estimated prompt blocks routed since the last stats message
+        self.rank_stats: List[Dict[str, Any]] = [{} for _ in range(dp)]
+        self.migrations = 0
         self._lock = threading.Lock()
         self._ids = itertools.count()
         self._closed = False
@@ -809,10 +1115,14 @@ class DeepInferEngine(Engine):
         }
         if request.seed is not None:
             params["seq_seed"] = request.seed
+        if request.ignore_eos:
+            params["ignore_eos"] = True
+        if request.session_key:
+            params["session_key"] = request.session_key
         with self._lock:
             failed = self._failed
             if not failed:
-                rank = min(range(len(self._in_flight)), key=lambda r: self._in_flight[r])
+                rank = self._route(request)
                 self._in_flight[rank] += 1
                 self._streams[request_id] = stream
                 self._owner[request_id] = rank
@@ -842,6 +1152,7 @@ class DeepInferEngine(Engine):
                     continue
                 last_item = time.monotonic()
                 event = _merge(items)
+                event.cached_tokens = stream.cached
                 finished = event.finished
                 yield event
                 if not finished:
@@ -858,6 +1169,29 @@ class DeepInferEngine(Engine):
                 # The consumer stopped early (client disconnected): free the slot.
                 self._cancel(request_id)
 
+    def _route(self, request: GenRequest) -> int:
+        """The rank for a request (called with the lock held)."""
+        ranks = range(len(self._in_flight))
+        if not self._affinity:
+            return min(ranks, key=lambda r: self._in_flight[r])
+        key = request.session_key
+        if key is not None:
+            rank = self._sessions.get(key)
+            if rank is not None:
+                if self._in_flight[rank] < self._migrate_at:
+                    self._sessions.move_to_end(key)
+                    return rank
+                self.migrations += 1
+        # Prompt characters / 3: a rough token count, refined by the next stats message.
+        rank = min(ranks, key=lambda r: (self._used_blocks[r] + self._assigned[r], self._in_flight[r]))
+        self._assigned[rank] += len(request.prompt) // 3 // BLOCK + 1
+        if key is not None:
+            self._sessions[key] = rank
+            self._sessions.move_to_end(key)
+            while len(self._sessions) > self._max_sessions:
+                self._sessions.popitem(last=False)
+        return rank
+
     def _read_results(self) -> None:
         streams = self._streams
         next_check = time.monotonic() + 1.0
@@ -872,7 +1206,18 @@ class DeepInferEngine(Engine):
                 now = time.monotonic()
                 if message or not streams:
                     self._last_message = now
-                if message and message[0] == "out":
+                if message and message[0] == "meta":
+                    for request_id, cached in message[2]:
+                        stream = streams.get(request_id)
+                        if stream is not None:
+                            stream.cached = cached
+                elif message and message[0] == "stats":
+                    rank, info = message[1], message[2]
+                    with self._lock:
+                        self.rank_stats[rank] = info
+                        self._used_blocks[rank] = int(info.get("total_blocks", 0)) - int(info.get("free_blocks", 0))
+                        self._assigned[rank] = 0
+                elif message and message[0] == "out":
                     for item in message[2]:
                         stream = streams.get(item[0])
                         if stream is None:

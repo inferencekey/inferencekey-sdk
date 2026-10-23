@@ -32,6 +32,7 @@ Config (the workload ``config``, received as ``ctx.config``): see the README.
 from __future__ import annotations
 
 import copy
+import hashlib
 import itertools
 import json
 import time
@@ -118,6 +119,25 @@ def to_dsv41_messages(request: Dict[str, Any]) -> List[Dict[str, Any]]:
             messages.insert(0, system)
         system["tools"] = tools
     return messages
+
+
+def session_key(request: Dict[str, Any]) -> str:
+    """The conversation a request belongs to, for the engine's prefix-cache routing.
+
+    The OpenAI ``user`` field when the client sends one; otherwise a hash of the
+    messages up to and including the first user message, which every turn of a
+    conversation repeats and two conversations rarely share.
+    """
+    user = request.get("user")
+    if isinstance(user, str) and user:
+        return "u:" + user
+    head: List[Any] = []
+    for message in request.get("messages") or []:
+        head.append(message)
+        if isinstance(message, dict) and message.get("role") == "user":
+            break
+    canonical = json.dumps(head, sort_keys=True, ensure_ascii=False, default=str)
+    return "h:" + hashlib.sha1(canonical.encode("utf-8")).hexdigest()
 
 
 class StreamSplitter:
@@ -214,6 +234,8 @@ class DeepInferBackend(CustomBackend):
             temperature=float(request.get("temperature", self.config.get("temperature", 0.6))),
             top_p=float(request.get("top_p", self.config.get("top_p", 1.0))),
             seed=request.get("seed"),
+            session_key=session_key(request),
+            ignore_eos=bool(request.get("ignore_eos", False)),
         )
 
     def chat(self, request: Dict[str, Any]) -> Dict[str, Any]:
@@ -313,12 +335,16 @@ class DeepInferBackend(CustomBackend):
         return message, "stop" if finished_by_eos else "length"
 
     @staticmethod
-    def _usage(last: GenEvent) -> Dict[str, int]:
-        return {
+    def _usage(last: GenEvent) -> Dict[str, Any]:
+        usage: Dict[str, Any] = {
             "prompt_tokens": last.prompt_tokens,
             "completion_tokens": last.completion_tokens,
             "total_tokens": last.prompt_tokens + last.completion_tokens,
         }
+        if last.cached_tokens is not None:
+            # OpenAI's field for prompt-cache hits.
+            usage["prompt_tokens_details"] = {"cached_tokens": last.cached_tokens}
+        return usage
 
     def _completion(self, message: Dict[str, Any], finish_reason: str, last: GenEvent) -> Dict[str, Any]:
         return {

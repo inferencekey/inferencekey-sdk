@@ -14,7 +14,8 @@ calls and usage. The workload's `/v1/chat/completions` and Anthropic
 | File | Role |
 | --- | --- |
 | `deepinfer_backend.py` | `DeepInferBackend`: implements `chat()` / `chat_stream()`. Maps OpenAI messages and tools to the DeepSeek-V4.1 prompt, streams reasoning and text, parses DSML tool calls back into OpenAI `tool_calls`, reports usage. |
-| `deepinfer_engines.py` | `DeepInferEngine` (one process per data-parallel rank, each with a DeepInfer `LLM`, plus a least-loaded router) and `FakeEngine` (deterministic, no GPU). |
+| `deepinfer_engines.py` | `DeepInferEngine` (one process per data-parallel rank, each with a DeepInfer `LLM`, plus a session-affinity router) and `FakeEngine` (deterministic, no GPU). |
+| `prefix_cache.py` | The GPU prefix cache of one rank: chain hashes of 128-token blocks, the index of cached blocks and its LRU eviction (pure Python, no torch). |
 | `dsv41_encoding.py` | The model's official prompt encoder and completion parser, vendored unmodified from the model repository (MIT, `LICENSE-dsv41-encoding.txt`). |
 
 Per request: the OpenAI request becomes a DeepSeek-V4.1 prompt (tools on the
@@ -95,6 +96,36 @@ through `deepinfer_venv`: its site-packages are appended to `sys.path` and the
 rank processes start with its interpreter. Both venvs must use the same Python
 minor version (3.12). `requirements.txt` stays empty.
 
+## Prefix cache
+
+A coding agent resends its whole conversation on every turn, and almost all of
+it is the previous turn. DeepInfer's open release frees every KV block when a
+request finishes, so each turn would prefill its whole context again (a 1M-token
+context is about 11 s of one rank). With `prefix_cache` on (the default):
+
+- Each rank keeps the KV blocks of finished prompts, pinned in the engine's
+  block manager and named by a chain hash of their tokens, and starts a new
+  request from its longest cached prefix. Only prompt blocks are kept: with
+  `drop_thinking`, the next turn renders the previous answer differently. The
+  last cached block is recomputed with the new tokens (SWA bounded replay), so
+  a hit is the prefix minus 128 tokens. Shared prefixes (one system prompt for
+  many sessions) are stored once.
+- Cached blocks are evicted least recently used first when new prompts need
+  room. The cache keeps free the engine's prefill watermark (10 % of the pool)
+  plus `prefix_cache_free_fraction`.
+- Every turn of a conversation goes to the rank that holds its prefix: the
+  session is the OpenAI `user` field, or else a hash of the messages up to the
+  first user message. A new session goes to the rank with the least KV in use.
+- The ranks tokenize a prompt piece by piece between chat-template markers and
+  keep the ids of long pieces, so a warm turn only tokenizes its new pieces
+  (the full encode of 1M tokens costs about 3 s of CPU).
+- `usage.prompt_tokens_details.cached_tokens` reports the prompt tokens served
+  from the cache; requests may set `ignore_eos`.
+
+It needs DeepInfer with a small patch that adds `LLMEngine.enqueue_with_prefix`,
+`Scheduler.add_sequence_with_prefix` and `Sequence.block_table` (only
+`deepinfer._C` is rebuilt). Without it, set `prefix_cache: false`.
+
 ## Workload config
 
 | Key | Default | Meaning |
@@ -111,6 +142,12 @@ minor version (3.12). `requirements.txt` stays empty.
 | `deepinfer_venv` | none | Prebuilt venv with DeepInfer (see above), e.g. `/workspace/di-venv`. |
 | `deepinfer_env`, `llm_kwargs` | none | Extra DeepInfer environment variables and `LLM(...)` arguments. |
 | `tokenizer_threads` | `2` | Prompt tokenization threads per rank. |
+| `prefix_cache` | `true` | GPU prefix cache and session routing (see "Prefix cache"). Needs the patched DeepInfer. |
+| `prefix_cache_free_fraction` | `0.05` | KV pool kept free by eviction on top of the 10 % prefill watermark. |
+| `session_migrate_inflight` | `4 * max_num_seqs` | A session moves to another rank (one cold turn) only when its rank has this many requests in flight. |
+| `session_table_size` | `100000` | Sessions remembered by the router (LRU). |
+| `tokenizer_cache_tokens` | `64000000` | Token ids of repeated prompt pieces kept per rank. `0` disables. |
+| `stats_interval_seconds` | `2.0` | How often each rank reports its KV and cache counters to the router. |
 | `stream_interval_ms` | `50` | Shortest time between two chunks of one stream: tokens that arrive meanwhile go out together. `0` sends every engine step on its own (more CPU in the backend process). |
 | `stream_chunks_per_second` | `8000` | Budget of SSE chunks per second over all streams: with more than 400 streams the interval grows (1,000 streams: 125 ms) so the backend process keeps up. `0` disables. |
 | `abort_on_disconnect` | `true` | Abort the request in DeepInfer when its client disconnects. |
