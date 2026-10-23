@@ -15,15 +15,33 @@ import pytest
 from inferencekey.backend import BackendContext
 
 _EXAMPLE_DIR = pathlib.Path(__file__).resolve().parents[3] / "examples" / "custom-backend-deepinfer"
-for path in (_EXAMPLE_DIR, _EXAMPLE_DIR / "bench" / "fake_modules"):
-    if str(path) not in sys.path:
-        sys.path.append(str(path))
+_FAKE_MODULES = _EXAMPLE_DIR / "bench" / "fake_modules"
+if str(_EXAMPLE_DIR) not in sys.path:
+    sys.path.insert(0, str(_EXAMPLE_DIR))
 
 import deepinfer_backend as db  # noqa: E402
 import deepinfer_engines as de  # noqa: E402
 import prefix_cache as pc  # noqa: E402
-from deepinfer.entrypoints.llm import SimEngine  # noqa: E402  (the bench's simulated rank)
-from deepinfer.sampling_params import SamplingParams  # noqa: E402
+
+
+def _import_sim():
+    """The bench's simulated rank, imported without leaving its stand-in torch
+    and deepinfer on sys.path or in sys.modules (other tests skip when torch
+    is missing and must keep doing so)."""
+    before = set(sys.modules)
+    sys.path.append(str(_FAKE_MODULES))
+    try:
+        from deepinfer.entrypoints.llm import SimEngine
+        from deepinfer.sampling_params import SamplingParams
+    finally:
+        sys.path.remove(str(_FAKE_MODULES))
+        for name in set(sys.modules) - before:
+            if name.split(".")[0] in ("deepinfer", "torch", "bench_fake_tokenizer"):
+                del sys.modules[name]
+    return SimEngine, SamplingParams
+
+
+SimEngine, SamplingParams = _import_sim()
 
 
 # --- the index ----------------------------------------------------------------
@@ -281,7 +299,7 @@ def test_usage_reports_cached_tokens_only_when_the_engine_has_a_cache() -> None:
 def test_two_turns_end_to_end_report_cached_tokens(tmp_path, monkeypatch) -> None:
     import multiprocessing as mp
 
-    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setattr(sys, "path", list(sys.path) + [str(_FAKE_MODULES)])  # spawned ranks inherit it
     try:
         import numpy  # noqa: F401
     except ImportError:
