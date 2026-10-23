@@ -110,8 +110,13 @@ def raw_request(
     version: str = "HTTP/1.1",
     content_length: Optional[str] = "auto",
     timeout: float = 10.0,
+    half_close: bool = False,
 ) -> Raw:
-    """Send one request with ``Connection: close`` and read the reply until EOF."""
+    """Send one request with ``Connection: close`` and read the reply until EOF.
+
+    ``half_close`` shuts the write side after sending, so a server draining a
+    declared body it refused sees EOF instead of waiting for its timeout.
+    """
     lines = [f"{method} {path} {version}", "Host: 127.0.0.1", "Connection: close"]
     for key, value in headers or []:
         lines.append(f"{key}: {value}")
@@ -123,6 +128,8 @@ def raw_request(
     request = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + (body or b"")
     with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
         sock.sendall(request)
+        if half_close:
+            sock.shutdown(socket.SHUT_WR)
         chunks = []
         while True:
             data = sock.recv(65536)
@@ -263,11 +270,11 @@ GOLDEN_CASES: List[Tuple[str, str, str, Optional[bytes], Dict[str, Any]]] = [
     ("process invalid input", "POST", "/process", json.dumps({"id": "j", "input": {"mode": "invalid"}}).encode(), {}),
     ("process raises", "POST", "/process", json.dumps({"id": "j", "input": {"mode": "boom"}}).encode(), {}),
     ("process not a Result", "POST", "/process", json.dumps({"id": "j", "input": {"mode": "not-result"}}).encode(), {}),
-    ("process too large", "POST", "/process", b"", {"content_length": str(16 * 1024 * 1024 + 1)}),
+    ("process too large", "POST", "/process", b"", {"content_length": str(16 * 1024 * 1024 + 1), "half_close": True}),
     ("forecast ok", "POST", "/forecast", json.dumps({"id": "f", "target": [1, 2, 3], "horizon": 2}).encode(), {}),
     ("forecast 501", "POST", "/forecast", json.dumps({"id": "f", "target": [0, 1], "horizon": 1}).encode(), {}),
     ("forecast bad horizon", "POST", "/forecast", json.dumps({"id": "f", "target": [1], "horizon": 0}).encode(), {}),
-    ("forecast too large", "POST", "/forecast", b"", {"content_length": "99999999999999"}),
+    ("forecast too large", "POST", "/forecast", b"", {"content_length": "99999999999999", "half_close": True}),
     ("chat ok", "POST", "/v1/chat/completions", _chat("ok", stream=False), {}),
     ("chat invalid input with code", "POST", "/v1/chat/completions", _chat("invalid", stream=False), {}),
     ("chat raises", "POST", "/v1/chat/completions", _chat("boom", stream=False), {}),
@@ -275,7 +282,7 @@ GOLDEN_CASES: List[Tuple[str, str, str, Optional[bytes], Dict[str, Any]]] = [
     ("chat 501", "POST", "/v1/chat/completions", _chat("not-implemented", stream=False), {}),
     ("chat no messages", "POST", "/v1/chat/completions", b'{"prompt": "x"}', {}),
     ("chat invalid json", "POST", "/v1/chat/completions", b"{", {}),
-    ("chat too large", "POST", "/v1/chat/completions", b"", {"content_length": str(16 * 1024 * 1024 + 1)}),
+    ("chat too large", "POST", "/v1/chat/completions", b"", {"content_length": str(16 * 1024 * 1024 + 1), "half_close": True}),
     ("stream default script", "POST", "/v1/chat/completions", _chat("default"), {}),
     ("stream empty", "POST", "/v1/chat/completions", _chat("empty"), {}),
     ("stream multi-line passthrough", "POST", "/v1/chat/completions", _chat("multi-line"), {}),
@@ -401,6 +408,19 @@ def test_known_difference_malformed_content_length(both, value) -> None:
         expected = b'{"error": "request body too large"}' if value == "-1" else b'{"error": "invalid Content-Length"}'
         assert stdlib.body == expected
         assert native.body == b"", "hyper's own 400 has no body"
+
+
+@pytest.mark.parametrize("path", ["/process", "/forecast", "/v1/chat/completions"])
+def test_too_large_body_sent_whole_gets_the_400_not_a_reset(both, path) -> None:
+    # The worker's reqwest sends the body whole. Both transports read and drop
+    # it before the 400, so the client gets the answer instead of a reset
+    # (which the worker would report as custom_backend_unreachable).
+    body = b"x" * (16 * 1024 * 1024 + 1)
+    for name, port in both.items():
+        reply = raw_request(port, "POST", path, body, timeout=30.0)
+        assert reply.status == 400, (name, path)
+        assert reply.body == b'{"error": "request body too large"}', (name, path)
+        assert reply.headers.get("connection") == "close", (name, path)
 
 
 @pytest.mark.parametrize("pad", [" {}", "  {}"])

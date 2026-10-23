@@ -145,7 +145,14 @@ async fn handle_post(
 ) -> Result<Response<AppBody>, io::Error> {
     let length = match body::declared_length(req.headers(), shared.cfg.max_body as u64) {
         Ok(length) => length,
-        Err(error) => return Ok(json(400, errors::plain_error(error.message()))),
+        Err(error) => {
+            if error == body::LengthError::TooLarge {
+                body::discard(req.into_body(), body::DISCARD_MAX, body::DISCARD_TIMEOUT).await;
+            }
+            let mut response = json(400, errors::plain_error(error.message()));
+            response.headers_mut().insert(CONNECTION, HeaderValue::from_static("close"));
+            return Ok(response);
+        }
     };
     let request_version = req.version();
     let body = body::collect(req.into_body(), length)

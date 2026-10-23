@@ -44,3 +44,8 @@ on PyPI; entries are listed newest first.
   left during an idle period.
 - **stdlib transport:** listen backlog raised from 5 to 1024, so a burst of new
   connections no longer gets resets.
+- **Request body over 16 MiB (both transports).** The `400 {"error": "request
+  body too large"}` now goes out after the body is read and dropped (up to
+  64 MiB, for at most 10 s), with `Connection: close`. Before, the connection
+  closed with the body unread and the kernel reset it, so a client sending the
+  body whole (the worker) saw a send error instead of the `400`.

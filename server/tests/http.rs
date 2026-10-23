@@ -36,6 +36,29 @@ fn unknown_post_path_is_404_before_the_body_rules() {
     assert_eq!(response.status, 404);
 }
 
+/// A body over the limit is read and dropped before the 400, so a client that
+/// sends it whole (reqwest in the worker) gets the answer instead of a reset.
+#[test]
+fn too_large_body_sent_whole_gets_the_400_not_a_reset() {
+    let server = serve(FakeApp::echo());
+    server.set_ready(true);
+    let addr = server.local_addr();
+    let body = vec![b'x'; 16 * 1024 * 1024 + 1];
+    for route in [Route::Process, Route::Forecast, Route::Chat] {
+        let mut stream = connect(addr);
+        stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        let head = format!("POST {} HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n", route.path(), body.len());
+        stream.write_all(head.as_bytes()).expect("head written");
+        stream.write_all(&body).expect("the whole body is accepted, not reset");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).expect("the answer, then a clean close");
+        let response = parse(&raw).expect("an answer");
+        assert_eq!(response.status, 400, "{route:?}");
+        assert_eq!(response.text(), r#"{"error": "request body too large"}"#, "{route:?}");
+        assert_eq!(response.header("connection"), Some("close"), "{route:?}");
+    }
+}
+
 #[test]
 fn query_string_is_stripped() {
     let server = serve(FakeApp::echo());

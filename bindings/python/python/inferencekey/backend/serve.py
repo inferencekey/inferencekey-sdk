@@ -79,6 +79,7 @@ import re
 import signal
 import sys
 import threading
+import time
 import traceback
 import weakref
 from http import HTTPStatus
@@ -217,6 +218,9 @@ JsonReply = Tuple[int, bytes]
 #: An acceptable ``Content-Length`` value (see :func:`content_length`).
 _CONTENT_LENGTH = re.compile(r"-?[0-9]+")
 
+#: The 400 body for a negative length or one above ``_MAX_BODY_BYTES``.
+_BODY_TOO_LARGE = json.dumps({"error": "request body too large"}).encode("utf-8")
+
 
 def _json_reply(status: int, payload: Any) -> JsonReply:
     return status, json.dumps(payload).encode("utf-8")
@@ -245,7 +249,7 @@ def content_length(header: Optional[str]) -> Tuple[int, Optional[JsonReply]]:
         return 0, _json_reply(400, {"error": "invalid Content-Length"})
     length = int(header)
     if length < 0 or length > _MAX_BODY_BYTES:
-        return 0, _json_reply(400, {"error": "request body too large"})
+        return 0, (400, _BODY_TOO_LARGE)
     return length, None
 
 
@@ -561,12 +565,56 @@ class _StdlibStream:
         self._write(b"data: [DONE]\n\n")
 
 
-def _send_body(handler: BaseHTTPRequestHandler, status: int, body: bytes) -> None:
+def _send_body(handler: BaseHTTPRequestHandler, status: int, body: bytes, close: bool = False) -> None:
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json")
     handler.send_header("Content-Length", str(len(body)))
+    if close:
+        # send_header also sets handler.close_connection.
+        handler.send_header("Connection", "close")
     handler.end_headers()
     handler.wfile.write(body)
+
+
+#: The most bytes of a refused (too large) body that are read and dropped.
+_DISCARD_MAX_BYTES = 64 * 1024 * 1024
+
+#: How long a refused body may take to arrive before the 400 goes out anyway.
+_DISCARD_TIMEOUT_S = 10.0
+
+
+def _discard_refused_body(handler: BaseHTTPRequestHandler, header: Optional[str]) -> None:
+    """Read and drop a too-large body before its 400 is sent.
+
+    Closing with the body unread makes the kernel reset the connection, and a
+    client that sends the body whole (reqwest in the worker) then reports a
+    send error instead of the 400. The drain stops at ``_DISCARD_MAX_BYTES``,
+    after ``_DISCARD_TIMEOUT_S``, at EOF or on any socket error; the caller
+    answers and closes either way.
+    """
+    if header is None or not header.isdigit():
+        return  # absent, invalid or negative: nothing declared to drain
+    remaining = min(int(header), _DISCARD_MAX_BYTES)
+    deadline = time.monotonic() + _DISCARD_TIMEOUT_S
+    connection = handler.connection
+    previous = connection.gettimeout()
+    try:
+        while remaining > 0:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            connection.settimeout(left)
+            chunk = handler.rfile.read1(min(remaining, 64 * 1024))
+            if not chunk:
+                return
+            remaining -= len(chunk)
+    except OSError:
+        return
+    finally:
+        try:
+            connection.settimeout(previous)
+        except OSError:
+            pass
 
 
 def _make_handler(state: _BackendState) -> type:
@@ -598,7 +646,9 @@ def _make_handler(state: _BackendState) -> type:
             """Read the request body, or send the 400 and return ``None``."""
             length, error = content_length(self.headers.get("Content-Length"))
             if error is not None:
-                _send_body(self, *error)
+                if error[1] == _BODY_TOO_LARGE:
+                    _discard_refused_body(self, self.headers.get("Content-Length"))
+                _send_body(self, *error, close=True)
                 return None
             return self.rfile.read(length) if length else b""
 
