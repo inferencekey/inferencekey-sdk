@@ -1,9 +1,23 @@
 """Runtime: serve a :class:`~inferencekey.backend.CustomBackend` over HTTP.
 
 Long-lived, single-process server bound to ``127.0.0.1`` (loopback only, never
-``0.0.0.0``). Built on the standard library :mod:`http.server` so the SDK
-runtime pulls in no HTTP framework and **no** ``torch`` — ``torch`` belongs to
-the developer's backend.
+``0.0.0.0``). The SDK runtime pulls in no HTTP framework and **no** ``torch``
+(``torch`` belongs to the developer's backend).
+
+Two transports serve the same request semantics (the functions below):
+
+* ``native``: the Rust server in the SDK's native module (``_inferencekey``).
+  It accepts, parses, answers ``/healthz``, ``/meta`` and ``/v1/models`` and
+  writes every byte without the GIL; Python only runs the backend methods.
+* ``stdlib``: the standard library :mod:`http.server`, one thread per
+  connection. It needs no native module.
+
+``IK_BACKEND_HTTP`` picks one: ``stdlib`` (the default for now), ``auto``
+(native when the native module has the server, else stdlib) or ``native``
+(exit code 2 when it is unavailable). One ``http transport: ...`` line on
+stderr names the transport in use. The native transport also reads
+``IK_BACKEND_MAX_INFLIGHT``, ``IK_BACKEND_IO_THREADS``, ``IK_BACKEND_BACKLOG``,
+``IK_BACKEND_STREAM_MAX_BYTES`` and ``IK_SSE_CONNECTION_CLOSE``.
 
 Run it::
 
@@ -55,6 +69,7 @@ sees it). On success exactly one ``model loaded`` line is logged. ``SIGTERM``
 from __future__ import annotations
 
 import argparse
+import atexit
 import importlib
 import json
 import os
@@ -150,13 +165,20 @@ class _BackendState:
     def __init__(self, backend: CustomBackend) -> None:
         self._backend = backend
         self._ready = threading.Event()
+        self._ready_hooks: list = []
 
     @property
     def ready(self) -> bool:
         return self._ready.is_set()
 
+    def on_ready(self, hook: Any) -> None:
+        """Call ``hook()`` when the backend becomes ready (the native transport's health flag)."""
+        self._ready_hooks.append(hook)
+
     def mark_ready(self) -> None:
         self._ready.set()
+        for hook in self._ready_hooks:
+            hook()
 
     def process(self, job: Job) -> Result:
         return self._backend.process(job)
@@ -596,6 +618,196 @@ def _make_handler(state: _BackendState) -> type:
 
     return _Handler
 
+# --------------------------------------------------------------------------
+# Native transport (Rust, in the SDK's native module)
+# --------------------------------------------------------------------------
+
+#: The native server interface this runtime speaks (``_inferencekey.BACKEND_SERVER_ABI``).
+_NATIVE_ABI = 1
+
+#: ``IK_BACKEND_HTTP`` when it is unset. ``auto`` once the native transport is
+#: the default.
+_DEFAULT_TRANSPORT = "stdlib"
+
+_TRANSPORT_MODES = ("auto", "native", "stdlib")
+
+
+class _Transport:
+    """The transport :func:`serve` uses, and why (see :func:`_select_transport`)."""
+
+    def __init__(
+        self,
+        kind: str,
+        reason: str = "",
+        module: Any = None,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.kind = kind
+        self.reason = reason
+        self.module = module
+        self.options = options or {}
+
+    def __repr__(self) -> str:
+        return f"_Transport({self.kind!r}, {self.reason!r})"
+
+
+def _env_int(name: str, minimum: int) -> Optional[int]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    if not re.fullmatch(r"[0-9]+", raw) or int(raw) < minimum:
+        raise BackendSetupError(f"{name} must be an integer >= {minimum}, got {raw!r}")
+    return int(raw)
+
+
+def _env_flag(name: str) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if raw in ("", "0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    raise BackendSetupError(f"{name} must be 0 or 1, got {raw!r}")
+
+
+def _native_options() -> Dict[str, Any]:
+    """The native server settings from the environment (unset ones keep the server's defaults)."""
+    options: Dict[str, Any] = {}
+    for env, key, minimum in (
+        ("IK_BACKEND_MAX_INFLIGHT", "max_inflight", 1),
+        ("IK_BACKEND_IO_THREADS", "io_threads", 1),
+        ("IK_BACKEND_BACKLOG", "backlog", 1),
+        ("IK_BACKEND_STREAM_MAX_BYTES", "stream_max_bytes", 1),
+    ):
+        value = _env_int(env, minimum)
+        if value is not None:
+            options[key] = value
+    if _env_flag("IK_SSE_CONNECTION_CLOSE"):
+        options["sse_connection_close"] = True
+    return options
+
+
+def _load_native() -> Tuple[Any, str]:
+    """``(module, "")`` when the native server is usable, else ``(None, reason)``."""
+    try:
+        from .. import _inferencekey as module
+    except (ImportError, OSError) as exc:
+        return None, f"_inferencekey could not be imported ({type(exc).__name__}: {exc})"
+    abi = getattr(module, "BACKEND_SERVER_ABI", None)
+    if abi is None:
+        return None, "_inferencekey has no BACKEND_SERVER_ABI"
+    if abi != _NATIVE_ABI:
+        return None, f"_inferencekey BACKEND_SERVER_ABI is {abi!r}, this runtime needs {_NATIVE_ABI}"
+    return module, ""
+
+
+def _select_transport() -> _Transport:
+    """Pick the HTTP transport from ``IK_BACKEND_HTTP`` (``auto``, ``native`` or ``stdlib``).
+
+    ``auto`` uses the native server when the native module imports and has a
+    matching ``BACKEND_SERVER_ABI``, and the standard library otherwise.
+    ``native`` raises :class:`~inferencekey.errors.BackendSetupError` when it
+    is unavailable (the CLI exits 2). Invalid knob values raise the same.
+    """
+    raw = os.environ.get("IK_BACKEND_HTTP", "").strip().lower()
+    mode = raw or _DEFAULT_TRANSPORT
+    if mode not in _TRANSPORT_MODES:
+        raise BackendSetupError(
+            f"IK_BACKEND_HTTP must be one of {', '.join(_TRANSPORT_MODES)}, got {raw!r}"
+        )
+    if mode == "stdlib":
+        return _Transport("stdlib", "IK_BACKEND_HTTP=stdlib" + ("" if raw else " (default)"))
+    module, why_not = _load_native()
+    if module is None:
+        if mode == "native":
+            raise BackendSetupError(f"IK_BACKEND_HTTP=native but the native transport is unavailable: {why_not}")
+        return _Transport("stdlib", why_not)
+    return _Transport("native", module=module, options=_native_options())
+
+
+class _NativeApp:
+    """What the Rust server calls for each POST request (on its request threads)."""
+
+    def __init__(self, state: _BackendState) -> None:
+        self._state = state
+
+    def handle_json(self, route: str, body: bytes) -> JsonReply:
+        if route == "/process":
+            return handle_process(self._state, body)
+        if route == "/forecast":
+            return handle_forecast(self._state, body)
+        return _json_reply(404, {"error": "not found"})
+
+    def handle_stream(self, body: bytes, sink: Any) -> None:
+        """``POST /v1/chat/completions``: a plain JSON reply or an event stream, through ``sink``."""
+        prepared = prepare_chat(self._state, body)
+        if prepared[0] == "stream":
+            drive_chat_stream(self._state, prepared[1], sink)
+        else:
+            sink.reply(prepared[1], prepared[2])
+
+
+class _NativeHttpd:
+    """The native server with the parts of :class:`ThreadingHTTPServer` callers use.
+
+    ``server_address``, ``server_port``, ``serve_forever()``, ``shutdown()``
+    and ``server_close()``. ``shutdown()`` stops accepting, closes open streams
+    (their generators are closed at the next chunk) and lets in-flight
+    responses finish for up to 5 s; ``server_close()`` releases the runtime.
+    Both wait with the GIL released and are safe to call more than once. An
+    ``atexit`` hook closes a server nobody closed.
+    """
+
+    def __init__(self, server: Any) -> None:
+        self._server = server
+        self.server_address = tuple(server.server_address)
+        self.server_port = self.server_address[1]
+        atexit.register(self._close_at_exit)
+
+    def serve_forever(self, poll_interval: float = 0.5) -> None:
+        del poll_interval  # the native server needs no polling
+        self._server.wait()
+
+    def shutdown(self) -> None:
+        self._server.shutdown()
+
+    def server_close(self) -> None:
+        self._server.close()
+        atexit.unregister(self._close_at_exit)
+
+    def stats(self) -> Dict[str, Any]:
+        """The ``/debug/stats`` counters."""
+        return json.loads(self._server.stats())
+
+    def _close_at_exit(self) -> None:
+        self._server.close()
+
+
+def _start_native(state: _BackendState, port: int, transport: _Transport) -> _NativeHttpd:
+    server = transport.module.BackendServer(port, _NativeApp(state), **transport.options)
+    _set_native_manifest(server, state)
+    state.on_ready(lambda: server.set_ready(True))
+    return _NativeHttpd(server)
+
+
+def _set_native_manifest(server: Any, state: _BackendState) -> None:
+    try:
+        manifest = json.dumps(state.manifest()).encode("utf-8")
+    except Exception:  # noqa: BLE001 (keep serving; /meta then shows {})
+        _log_err("manifest() failed:")
+        traceback.print_exc(file=sys.stderr)
+        return
+    server.set_manifest(manifest)
+
+
+def _transport_line(transport: _Transport, httpd: Any) -> str:
+    if transport.kind == "native":
+        server = httpd._server
+        return (
+            f"http transport: native (abi {_NATIVE_ABI}, io_threads={server.io_threads}, "
+            f"backlog={server.backlog}, max_inflight={server.max_inflight})"
+        )
+    return f"http transport: stdlib (reason: {transport.reason})"
+
 
 def _parse_config(args: argparse.Namespace) -> Dict[str, Any]:
     """Resolve model config from ``--config-json`` or ``IK_BACKEND_CONFIG``."""
@@ -649,23 +861,36 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def serve(
-    backend: CustomBackend, port: int, config: Dict[str, Any]
-) -> Tuple[ThreadingHTTPServer, _BackendState]:
+    backend: CustomBackend,
+    port: int,
+    config: Dict[str, Any],
+    *,
+    transport: Optional[_Transport] = None,
+) -> Tuple[Any, _BackendState]:
     """Bind the server, run :meth:`setup`, then return the running server.
 
     Binding happens *before* :meth:`setup` so ``GET /healthz`` answers ``503``
     while the model loads. Returns the bound, already-serving server and its
-    state so callers (and tests) can drive shutdown. Raises
-    :class:`~inferencekey.errors.BackendSetupError` if :meth:`setup` raises.
+    state so callers (and tests) can drive shutdown: a
+    :class:`ThreadingHTTPServer` on the stdlib transport, or an object with
+    the same ``server_address``, ``shutdown()`` and ``server_close()`` on the
+    native one. Raises :class:`~inferencekey.errors.BackendSetupError` if
+    :meth:`setup` raises, or if ``IK_BACKEND_HTTP`` asks for a transport that
+    is unavailable. ``transport`` (private) is an already-selected transport.
     """
+    if transport is None:
+        transport = _select_transport()
     state = _BackendState(backend)
-    handler_cls = _make_handler(state)
-    httpd = _HTTPServer((HOST, port), handler_cls)
-
-    serve_thread = threading.Thread(
-        target=httpd.serve_forever, name="ik-backend-http", daemon=True
-    )
-    serve_thread.start()
+    httpd: Any
+    if transport.kind == "native":
+        httpd = _start_native(state, port, transport)
+    else:
+        httpd = _HTTPServer((HOST, port), _make_handler(state))
+        serve_thread = threading.Thread(
+            target=httpd.serve_forever, name="ik-backend-http", daemon=True
+        )
+        serve_thread.start()
+    _log_err(_transport_line(transport, httpd))
 
     ctx = BackendContext(config=config, port=httpd.server_address[1])
     try:
@@ -675,6 +900,9 @@ def serve(
         httpd.server_close()
         raise BackendSetupError(str(exc)) from exc
 
+    if transport.kind == "native":
+        # In case setup() changed what manifest() returns.
+        _set_native_manifest(httpd._server, state)
     state.mark_ready()
     # Exactly one 'model loaded' line, per the contract.
     _log("model loaded")
@@ -687,7 +915,7 @@ def serve_backend(
     config: Optional[Dict[str, Any]] = None,
     *,
     block: bool = True,
-) -> Tuple[ThreadingHTTPServer, _BackendState]:
+) -> Tuple[Any, _BackendState]:
     """Start a backend from code — the ergonomic alternative to the CLI.
 
     Accepts either a :class:`CustomBackend` instance or its class (instantiated
@@ -720,7 +948,7 @@ def serve_backend(
     return httpd, state
 
 
-def _run_until_signalled(httpd: ThreadingHTTPServer) -> None:
+def _run_until_signalled(httpd: Any) -> None:
     """Block until SIGTERM/SIGINT, then shut the server down cleanly."""
     stop = threading.Event()
 
@@ -744,13 +972,16 @@ def main(argv: Optional[list] = None) -> int:
     try:
         entrypoint = _resolve_entrypoint(args)
         config = _parse_config(args)
+        # Before loading the backend: an unavailable transport is a
+        # configuration error (exit 2), not a setup failure.
+        transport = _select_transport()
         backend = load_backend(entrypoint)
     except (BackendEntrypointError, BackendSetupError) as exc:
         _log_err(f"backend startup failed: {exc}")
         return 2
 
     try:
-        httpd, _state = serve(backend, args.port, config)
+        httpd, _state = serve(backend, args.port, config, transport=transport)
     except BackendSetupError as exc:
         # setup() failed: traceback already chained; surface it to stderr and
         # exit non-zero so the supervisor knows the backend never came up.

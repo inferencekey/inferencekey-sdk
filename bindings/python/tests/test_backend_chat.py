@@ -246,6 +246,10 @@ def test_missing_messages_is_400(server) -> None:
     assert _post_raw(port, {"prompt": "x"})[0] == 400
 
 
+#: A 200 status line on either transport (stdlib speaks HTTP/1.0, native HTTP/1.1).
+OK_STATUS_LINES = (b"HTTP/1.0 200", b"HTTP/1.1 200")
+
+
 def test_server_listens_with_a_large_backlog_and_daemon_threads(server) -> None:
     port = server(ToolChatBackend)
     assert serve_mod.LISTEN_BACKLOG >= 1024
@@ -261,7 +265,8 @@ def test_server_listens_with_a_large_backlog_and_daemon_threads(server) -> None:
                 + f"Content-Length: {len(body)}\r\n\r\n".encode() + body
             )
         for s in socks:
-            assert s.recv(64).startswith(b"HTTP/1.0 200")
+            # stdlib answers with an HTTP/1.0 status line, native with HTTP/1.1.
+            assert s.recv(64).startswith(OK_STATUS_LINES)
     finally:
         for s in socks:
             s.close()
@@ -277,7 +282,7 @@ def test_client_disconnect_closes_the_backend_stream(server) -> None:
         b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
         + f"Content-Length: {len(body)}\r\n\r\n".encode() + body
     )
-    assert s.recv(64).startswith(b"HTTP/1.0 200")
+    assert s.recv(64).startswith(OK_STATUS_LINES)
     s.close()
     assert EndlessStreamBackend.closed.wait(5)
 
