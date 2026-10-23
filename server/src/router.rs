@@ -67,12 +67,22 @@ fn json(status: u16, body: impl Into<Bytes>) -> Response<AppBody> {
 
 /// The path a route is matched on: the query string is stripped. An
 /// absolute-form target (`GET http://host/healthz`) matches nothing, as in the
-/// stdlib transport, where the whole target is the path.
-fn route_path(uri: &Uri) -> &str {
+/// stdlib transport, where the whole target is the path. Leading slashes
+/// collapse to one (`//healthz` is `/healthz`), as CPython's
+/// `BaseHTTPRequestHandler.parse_request` does (gh-87389).
+///
+/// One difference cannot be mirrored: the `http` crate drops a `#fragment`
+/// from the target, while stdlib compares it as part of the path, so
+/// `/healthz#x` is 200 here and 404 there. Clients never send fragments.
+fn route_path(uri: &Uri) -> String {
     if uri.scheme().is_some() {
-        ""
+        return String::new();
+    }
+    let path = uri.path();
+    if path.starts_with("//") {
+        format!("/{}", path.trim_start_matches('/'))
     } else {
-        uri.path()
+        path.to_owned()
     }
 }
 
@@ -90,7 +100,7 @@ pub(crate) async fn handle(
     shared: Arc<Shared>,
 ) -> Result<Response<AppBody>, io::Error> {
     stats::inc(&shared.stats.requests);
-    let path = route_path(req.uri()).to_owned();
+    let path = route_path(req.uri());
     match *req.method() {
         Method::GET => Ok(handle_get(&path, &shared)),
         Method::POST => match post_route(&path) {
@@ -146,12 +156,12 @@ async fn handle_post(
     // never with a 429/503.
     let permit = {
         let _queued = GaugeGuard::new(&shared.stats.queued);
-        shared
-            .admission
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| io::Error::other("server shutting down"))?
+        match shared.admission.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            // Shutdown closed admission: answer instead of resetting, in the
+            // route's "backend not ready" shape.
+            Err(_) => return Ok(json(503, errors::internal_error(route, "backend not ready"))),
+        }
     };
 
     let app = shared.app.clone();

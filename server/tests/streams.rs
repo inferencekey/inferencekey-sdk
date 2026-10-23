@@ -124,6 +124,8 @@ fn push_returns_false_soon_after_the_client_drops() {
     let (after, sends) = disconnect_detection(false);
     println!("push noticed the disconnect after {after:?} ({sends} sends)");
     assert!(after < Duration::from_secs(1), "{after:?}");
+    // Within a write or two (RST, then EPIPE on loopback), not just "soon".
+    assert!(sends <= 3, "{sends} sends before the disconnect was noticed");
 }
 
 #[test]
@@ -131,6 +133,8 @@ fn keepalive_returns_false_soon_after_the_client_drops() {
     let (after, sends) = disconnect_detection(true);
     println!("keepalive noticed the disconnect after {after:?} ({sends} sends)");
     assert!(after < Duration::from_secs(1), "{after:?}");
+    // Within a write or two (RST, then EPIPE on loopback), not just "soon".
+    assert!(sends <= 3, "{sends} sends before the disconnect was noticed");
 }
 
 #[test]

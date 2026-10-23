@@ -97,6 +97,9 @@ pub(crate) async fn serve(
 
     drop(listener);
     shared.closing.store(true, Ordering::Release);
+    // Requests still waiting for a permit end now instead of starting new
+    // application calls during the grace period.
+    shared.admission.close();
     if tokio::time::timeout(shared.cfg.shutdown_grace, graceful.shutdown()).await.is_err() {
         tracing::warn!("shutdown grace period expired; aborting open connections");
     }

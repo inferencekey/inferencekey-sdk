@@ -56,6 +56,9 @@ pub enum SendOutcome {
 #[derive(Debug)]
 pub struct PendingFrame {
     frame: Bytes,
+    /// The terminal `[DONE]` event, which is still delivered while the
+    /// server drains.
+    done: bool,
 }
 
 /// Shared state between a sink and its body.
@@ -186,8 +189,10 @@ impl StreamSink {
     /// Blocks the calling thread; never call it from an async context.
     pub fn wait_send(&self, pending: PendingFrame) -> bool {
         let len = pending.frame.len();
+        let closed = self.shared.closed.load(Ordering::Acquire)
+            || (!pending.done && self.shared.server_closing.load(Ordering::Acquire));
         let tx = match lock(&self.shared.tx).as_ref() {
-            Some(tx) if !self.is_closed() => tx.clone(),
+            Some(tx) if !closed => tx.clone(),
             _ => return self.unqueue(len),
         };
         match tx.blocking_send(pending.frame) {
@@ -273,7 +278,7 @@ impl StreamSink {
             }
             Err(mpsc::error::TrySendError::Full(frame)) => {
                 kind.count(&self.shared.stats);
-                SendOutcome::Full(PendingFrame { frame })
+                SendOutcome::Full(PendingFrame { frame, done: matches!(kind, Kind::Done) })
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.shared.closed.store(true, Ordering::Release);
@@ -543,6 +548,26 @@ mod tests {
         sink.done();
         let bytes = runtime().block_on(async { body.collect().await.unwrap().to_bytes() });
         assert_eq!(&bytes[..], b"data: {}\n\ndata: [DONE]\n\n");
+    }
+
+    #[test]
+    fn done_waits_for_room_during_shutdown() {
+        let stats = Arc::new(Stats::default());
+        let closing = Arc::new(AtomicBool::new(false));
+        let (sink, _head, body) = channel(8 << 20, closing.clone(), stats);
+        for _ in 0..CHANNEL_CAPACITY {
+            assert!(matches!(sink.try_push(b"1"), SendOutcome::Sent));
+        }
+        closing.store(true, Ordering::Release);
+        let producer = std::thread::spawn(move || sink.done());
+        let bytes = runtime().block_on(async {
+            // Drain slowly, so done() finds the channel full and has to wait.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            body.collect().await.unwrap().to_bytes()
+        });
+        producer.join().unwrap();
+        assert!(bytes.ends_with(DONE_EVENT), "the [DONE] event was dropped");
+        assert_eq!(bytes.len(), CHANNEL_CAPACITY * b"data: 1\n\n".len() + DONE_EVENT.len());
     }
 
     #[test]

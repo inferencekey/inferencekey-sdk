@@ -47,6 +47,19 @@ fn query_string_is_stripped() {
 }
 
 #[test]
+fn leading_slashes_collapse_like_cpython() {
+    let server = serve(FakeApp::echo());
+    server.set_ready(true);
+    let addr = server.local_addr();
+    assert_eq!(get(addr, "//healthz").status, 200);
+    assert_eq!(get(addr, "///healthz?x=1").status, 200);
+    let response = post(addr, "//process", b"{}");
+    assert_eq!(response.text(), r#"{"route": "/process", "len": 2}"#);
+    // Inner double slashes stay, as in stdlib.
+    assert_eq!(get(addr, "/v1//models").status, 404);
+}
+
+#[test]
 fn other_methods_get_501_with_the_http_server_page() {
     let server = serve(FakeApp::echo());
     let addr = server.local_addr();

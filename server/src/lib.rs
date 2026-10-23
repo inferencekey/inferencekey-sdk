@@ -224,6 +224,7 @@ impl ServerHandle {
     /// connections are aborted). Blocks; idempotent.
     pub fn shutdown(&self) {
         self.shared.closing.store(true, Ordering::Release);
+        self.shared.admission.close();
         let _ = self.shutdown_tx.send(true);
         self.stopped.wait(Some(self.shared.cfg.shutdown_grace + Duration::from_secs(2)));
     }

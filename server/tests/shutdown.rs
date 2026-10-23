@@ -84,3 +84,39 @@ fn idle_keep_alive_connections_do_not_delay_shutdown() {
     server.shutdown();
     assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
 }
+
+#[test]
+fn requests_waiting_for_admission_end_at_shutdown_instead_of_after_the_grace() {
+    let app = FakeApp::new(
+        |_route, _body| {
+            // The one permitted call is stuck for longer than the grace.
+            std::thread::sleep(Duration::from_secs(4));
+            JsonReply::new(200, "{}")
+        },
+        |_body, sink| {
+            sink.reply(200, &b"{}"[..]);
+        },
+    );
+    let cfg = ServerConfig { max_inflight: 1, shutdown_grace: Duration::from_secs(2), ..config() };
+    let server = std::sync::Arc::new(serve_with(cfg, app));
+    let addr = server.local_addr();
+    let blocked = std::thread::spawn(move || post(addr, "/process", b"{}"));
+    assert!(wait_until(Duration::from_secs(2), || stat(&server, "inflight") == 1));
+    let queued = std::thread::spawn(move || {
+        let started = Instant::now();
+        (post(addr, "/v1/chat/completions", b"{}"), started.elapsed())
+    });
+    assert!(wait_until(Duration::from_secs(2), || stat(&server, "queued") == 1));
+
+    let stopper = {
+        let server = server.clone();
+        std::thread::spawn(move || server.shutdown())
+    };
+    let (response, waited) = queued.join().unwrap();
+    println!("the queued request ended after {waited:?}");
+    assert_eq!(response.status, 503);
+    assert_eq!(response.body, br#"{"error": {"message": "backend not ready", "type": "server_error"}}"#);
+    assert!(waited < Duration::from_secs(1), "{waited:?}");
+    stopper.join().unwrap();
+    drop(blocked);
+}
