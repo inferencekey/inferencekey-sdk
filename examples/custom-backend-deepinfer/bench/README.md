@@ -82,7 +82,7 @@ Fields of a result line:
 | Field | Meaning |
 | --- | --- |
 | `total_tok_s` | completion tokens of the successful streams / wall time |
-| `steady_tok_s` | median of the per-second token counts in the middle 80 % of the run (a chunk may carry several tokens; each stream's tokens are spread over its chunks by their length) |
+| `steady_tok_s` | median of the per-second token counts in the middle 80 % of the run (a chunk may carry several tokens; each stream's tokens are spread over its chunks by their length, successful streams only). The baseline harness counted one token per chunk, which was true there, so steady rates before and after are only roughly comparable; compare on `total_tok_s`, the same formula in both. Runs shorter than a few seconds have no steady rate (0). |
 | `per_stream_tok_s` | completion tokens / (last token - first token), p10, median, p90 |
 | `ttft_s` | time to first content token |
 | `cpu_pct_mean` | mean CPU % between the first and the last token: `parent` (the backend process, 100 = one core), each rank, the clients |
@@ -177,22 +177,53 @@ share in parentheses (socket writes and thread wake-ups).
 | 1,024 new tokens, burst (full batch: 4 x 128) | 512 | 512 | 33,819 | 35,862 | 70 / 70 / 70 | 0.25 / 0.87 | 108 / 132 (48) | 7 to 7 | 14.8 / 15.5 | 68.1 | 35,840 |
 | 1,024 new tokens, burst, `--dp 8` | 1024 | 1024 | 53,304 | 57,906 | 59 / 60 / 68 | 1.10 / 5.57 | 138 / 182 (62) | 7 to 7 | 19.6 / 19.7 | 68.2 | 71,680 |
 
-Before and after, at the same settings:
+Before and after, same scenario on both sides (`total_tok_s`):
 
-| Run | N | Total tok/s before | after | Per stream (median) before | after | Notes |
+| Run | N | Total tok/s before | after | Per stream (median) before | after | What limits the after run |
 | --- | --- | --- | --- | --- | --- | --- |
-| burst | 200 | 341 (57 reset) | 13,395 | 35 | 70 | x39, no resets, ceiling 14,000 |
-| burst | 400 | 320 (266 reset) | 24,914 | 26 | 70 | x78, no resets, steady 28,034 of 28,000 |
-| ramp 20 s | 400 | 1,923 | 4,332 | 28 | 70 | now bound by arrivals, TTFT median 11.4 s to 0.04 s |
-| 2,048 new tokens, burst | 50 | 320 | 3,491 | 6.6 | 70 | x10.9, clients done at 29 s instead of 320 s |
-| 137K-token prompts, prefill free | 50 | 542 | 543 | 23 | 70 | ranks back at 69 steps/s (was 24) |
+| burst | 200 | 341 (57 reset) | 13,395 | 35 | 70 | the simulator (ceiling 14,000) |
+| burst | 400 | 320 (266 reset) | 24,914 | 26 | 70 | the simulator (steady 28,034 of 28,000) |
+| ramp 20 s | 200 | 1,892 | 2,171 | 57 | 70 | arrivals (200 x 256 tokens in about 23 s) |
+| ramp 20 s | 400 | 1,923 | 4,332 | 28 | 70 | arrivals; TTFT median 11.4 s to 0.04 s |
+| 2,048 new tokens, burst | 50 | 320 | 3,491 | 6.6 | 70 | the simulator; clients done at 29 s instead of 320 s |
+| 137K-token prompts, prefill free | 50 | 542 | 543 | 23 | 70 | arrivals; ranks back at 69 steps/s (was 24) |
 
-1. **The parent is no longer the limiter.** Every short-prompt run delivers
-   what the simulated ranks produce: the steady rate equals the ceiling, every
-   stream gets the full 70 tok/s, and the clients finish when the ranks do
-   (within about a second; the rank counters tick once a second). At 400
-   streams the best baseline (1,923 tok/s) becomes 24,900 to 27,600 tok/s (x13
-   to x14); in the burst runs that dropped connections before, x39 to x78.
+None of these ratios measures the parent. In the burst rows most of the gain
+is the connections the baseline lost (its listen backlog of 5), the ramp rows
+are bound by how fast streams arrive, and at the default 70 steps/s every
+after-run lands on the simulator's ceiling, so the default harness measures the
+simulated ranks. The capacity runs below raise the step rate to find the
+parent's limit instead.
+
+### Capacity (2026-10-23)
+
+The baseline's capacity is its saturated rate: with the step rate raised it
+still delivers about 2,100 tok/s with the parent at 103 to 108 % CPU (ramp
+20 s, 256 new tokens; the burst runs lose connections). After the fix the same
+step rates are run as bursts, with 1,024 new tokens so that the steady state
+lasts several seconds. Raw lines: `results/baseline-capacity-2026-10-23.jsonl`
+and `results/review-fixes-2026-10-23.jsonl` (these runs also include the
+review fixes: stream keepalives, failure handling, single BOS).
+
+| Run | N | Step rate | Total tok/s | Steady tok/s | Per stream tok/s (p10 / median / p90) | Parent CPU % mean / max (kernel) | Clients CPU % | Ranks done / clients done (s) | Sim ceiling tok/s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| before, ramp 20 s, 256 tokens | 200 | 200 | 2,100 | 2,117 | 153 / 165 / 189 | 103 / 110 | 17 | 22.0 / 24.4 | 40,000 |
+| before, ramp 20 s, 256 tokens | 400 | 140 | 2,060 | 2,087 | 53 / 58 / 67 | 108 / 112 | 18 | 22.7 / **49.7** | 56,000 |
+| after, burst, 1,024 tokens | 200 | 200 | 38,429 | 39,959 | 199 / 199 / 200 | 57 / 74 (21) | 34 | 4.8 / 5.3 | 40,000 |
+| after, burst, 1,024 tokens | 400 | 140 | 50,046 | 56,025 | 139 / 139 / 140 | 117 / 132 (51) | 64 | 7.9 / 8.2 | 56,000 |
+| after, burst, 256 tokens | 400 | 140 | 42,636 | 54,682 | 133 / 135 / 139 | 116 / 124 (49) | 60 | 1.8 / 2.4 | 56,000 |
+
+Against the baseline's about 2,060 to 2,100 tok/s that is at least 18x at
+200 streams (the after run is still on the simulator's ceiling, with the parent
+at 57 %) and 24x at 400 streams (27x on the steady rate, which also sits on the
+ceiling). The 400-stream runs are close to the parent's limit, see point 7.
+
+1. **The parent is no longer the limiter at the default rates.** Every
+   short-prompt run delivers what the simulated ranks produce: the steady rate
+   equals the ceiling, every stream gets the full 70 tok/s, and the clients
+   finish when the ranks do (within about a second; the rank counters tick once
+   a second). The capacity runs above put the parent's own limit at about
+   50,000 to 56,000 tok/s with 400 streams on this VM.
 2. **Answer length no longer matters.** Detokenization is incremental in the
    ranks (about 2 us per request and step), so 2,048-token answers stream at
    70 tok/s like 256-token ones.
@@ -215,3 +246,33 @@ Before and after, at the same settings:
 6. The ranks now do more work (detokenization): 4 to 8 % CPU each instead of
    3 %, 17 % with the fake tokenizer, which has no byte table and uses the
    generic window path at the measured cost of the real `decode`.
+7. **400 streams is close to the limit of one parent process.** At 400
+   streams the parent stays at about 103 to 117 % CPU on average (120 to 132 %
+   peak, about half of it kernel time: socket writes and thread wake-ups) both
+   at 28,000 and at 56,000 tok/s. The cost is per chunk and per stream, not per
+   token: with 50 ms pacing that is about 8,000 chunk writes per second. It does
+   not limit the simulator, but the margin is small, and production adds the
+   `/v1/messages` adapter and proxy hops, which are not modelled. Above about
+   400 streams the chunk budget stretches the interval, so per-stream latency
+   rises. Check the parent's CPU on the B200 host with 200 to 400 streams; if it
+   is near 100 %, raise `stream_interval_ms`, lower
+   `stream_chunks_per_second`, or split the HTTP layer across processes.
+   Keepalives (`stream_heartbeat_seconds`) only fire on streams that have had
+   nothing to send for a second, so they add nothing while tokens flow.
+
+### What the simulation does not model
+
+- DeepInfer's own Python scheduler time in the ranks and the GPU step time:
+  one token per step at a fixed step rate. The rank CPU added by
+  detokenization (3 % before, 6 to 7 % at 400 streams, 11 % at 140 to 200
+  steps/s) is never charged against a GPU step.
+- Separate machines: the clients run on the same 12-vCPU VM and use 60 to 65 %
+  CPU at 400 streams, competing with the ranks for cores; the rank step rate
+  drops to 62 to 65 steps/s in the burst runs.
+- The real engine's `add_request` and `abort_request` paths, the
+  `finish_reason` of requests the scheduler gives up on, and dead-rank
+  behavior (the simulator never drops, ignores or preempts a request). These
+  are covered by unit tests against fakes only; `abort_on_disconnect` can be
+  turned off if aborting misbehaves on the real engine.
+- Prefix caching and DSpark's accepted draft tokens (approximated with
+  `--tokens-per-step`).
