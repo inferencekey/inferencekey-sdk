@@ -39,8 +39,8 @@ history.
 - **All 30 AIME 2026 problems at once** on the RTX 4090 (one try each,
   temperature 0.6, budget 126,976 tokens): 25 of the 26 answers that finished
   were right. Four were lost to a bug in our client script and rerun: 2 right,
-  1 wrong, 1 still running after 14 minutes. In total **27 right, 2 wrong,
-  1 unfinished**. vLLM peaked at about 3,600 generated tokens/s with 30
+  1 wrong, and 1 whose stream ended after about 111,000 tokens without an
+  answer. In total **27 right, 2 wrong, 1 with no answer**. vLLM peaked at about 3,600 generated tokens/s with 30
   requests running; answers ranged from about 3,000 to 101,000 tokens, so the
   whole batch took 16 minutes, set by the longest answer. Paradigma reports
   94.01 % on AIME 2026 averaged over 32 tries per problem; one try per problem
