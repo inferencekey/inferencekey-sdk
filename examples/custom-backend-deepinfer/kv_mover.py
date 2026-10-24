@@ -276,7 +276,33 @@ class TorchKVMover:
             pinned += size
         self.log(f"L1 pinned {pinned / 2**30:.1f} GiB in {len(self.segments)} segments "
                  f"in {time.perf_counter() - t0:.1f} s")
+        try:
+            self._warm_up()
+        except Exception as exc:  # noqa: BLE001 (an optimisation only: never fail the start for it)
+            self.log(f"L1 mover warm-up skipped ({exc})")
         return self.capacity_slots
+
+    def _warm_up(self) -> None:
+        """Run every kernel and copy kind of ``_issue`` once on the staging buffers
+        only (no KV block or host slot is touched), so CUDA's lazy module loading
+        is paid here and not by the first promotion (about 50 ms on a B200)."""
+        if not self.cuda or not self.segments:
+            return
+        torch = self.torch
+        t0 = time.perf_counter()
+        a, b = self.staging["h2d"], self.staging["d2h"]
+        idx = self.ring_dev["h2d"][:1]
+        idx.copy_(self.ring_host["h2d"][:1].zero_(), non_blocking=True)
+        for stream in self.streams.values():
+            with torch.cuda.stream(stream):
+                a[:1].copy_(self.segments[0][:1], non_blocking=True)
+                b[:1].copy_(a[:1], non_blocking=True)
+                torch.index_select(a, 0, idx, out=b[:1])
+                a.index_copy_(0, idx, b[:1])
+                self.sums_dev["h2d"][:1] = b[:1].sum(dim=1)
+                self.sums_host["h2d"][:1].copy_(self.sums_dev["h2d"][:1], non_blocking=True)
+        torch.cuda.synchronize(self.device)
+        self.log(f"L1 mover warmed up in {(time.perf_counter() - t0) * 1000:.0f} ms")
 
     def _numa_node(self) -> Optional[int]:
         """The GPU's NUMA node when this process is not bound to it (the segments are
