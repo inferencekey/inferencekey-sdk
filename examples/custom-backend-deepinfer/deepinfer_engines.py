@@ -1292,7 +1292,7 @@ def _rank_loop(
                 time.sleep(idle_sleep)
                 continue
 
-            if outputs:
+            if outputs is not None and len(outputs):  # np.ndarray: no truth value
                 _collect_step(outputs, clone, live, items)
             if metas:
                 results.put(("meta", rank, metas))

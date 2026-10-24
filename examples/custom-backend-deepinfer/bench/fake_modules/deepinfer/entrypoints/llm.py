@@ -61,6 +61,15 @@ from typing import Any, Deque, Dict, List, Optional, Sequence
 
 from deepinfer._C.engine import RequestOutput
 
+
+class StepOutputs(list):
+    """What ``step()`` / ``flush_inflight_reqs()`` return: the real engine returns a
+    numpy array, whose truth value raises when it is empty or has more than one
+    element. Mirror that so ``if outputs:`` fails here and not on a GPU."""
+
+    def __bool__(self) -> bool:
+        raise ValueError("The truth value of an array is ambiguous (DeepInfer returns np.ndarray): use len()")
+
 # Plain prose without markup characters, so the backend's stream splitter never
 # holds text back waiting for a possible </think> or DSML marker.
 _PASSAGE = (
@@ -325,7 +334,7 @@ class SimEngine:
         self.barrier.wait()
         return unfinished
 
-    def step(self) -> List[RequestOutput]:
+    def step(self) -> StepOutputs:
         while self.waiting and len(self.prefilling) + len(self.running) < self.max_num_seqs:
             if not self._admit(self.waiting[0]):
                 break  # FIFO: wait for blocks to free up
@@ -375,10 +384,10 @@ class SimEngine:
         self.steps += 1
         self.tokens += len(outputs)
         self.prefilled += prefill_tokens
-        return outputs
+        return StepOutputs(outputs)
 
-    def flush_inflight_reqs(self) -> List[RequestOutput]:
-        return []
+    def flush_inflight_reqs(self) -> StepOutputs:
+        return StepOutputs()
 
     def abort_request(self, request_id: Any) -> tuple:
         ids = {request_id} if isinstance(request_id, str) else set(request_id)
