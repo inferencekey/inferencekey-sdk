@@ -236,6 +236,8 @@ class L1:
         self.freeing_blocks = 0
         self.h2d_ms: Deque[float] = deque(maxlen=2048)
         self.d2h_ms: Deque[float] = deque(maxlen=2048)
+        # Cumulative since start: stats() has several callers (periodic log, health), so a
+        # window reset on read would hand each caller a partial or empty window.
         self._window = {"h2d_bytes": 0, "h2d_s": 0.0, "d2h_bytes": 0, "d2h_s": 0.0}
         self.counters: Dict[str, int] = {k: 0 for k in (
             "l1_hits", "l1_hit_tokens", "l1_promotions", "l1_promoted_blocks", "l1_rescued_blocks",
@@ -672,5 +674,4 @@ class L1:
             "l1_h2d_gbps": round(window["h2d_bytes"] / window["h2d_s"] / 1e9, 2) if window["h2d_s"] else 0.0,
             "l1_d2h_gbps": round(window["d2h_bytes"] / window["d2h_s"] / 1e9, 2) if window["d2h_s"] else 0.0,
         })
-        self._window = {"h2d_bytes": 0, "h2d_s": 0.0, "d2h_bytes": 0, "d2h_s": 0.0}
         return out
