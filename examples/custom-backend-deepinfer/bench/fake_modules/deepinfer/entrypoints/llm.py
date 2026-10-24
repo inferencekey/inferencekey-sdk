@@ -273,6 +273,7 @@ class SimEngine:
         self.waiting: Deque[_Seq] = deque()
         self.prefilling: List[_Seq] = []
         self.running: List[_Seq] = []
+        self.to_finalize: List[_Seq] = []  # finished, finalized at the start of the next step
         self.last_end = 0.0
         self.steps = 0
         self.tokens = 0
@@ -323,7 +324,8 @@ class SimEngine:
         return True
 
     def has_unfinished_requests(self) -> bool:
-        local = bool(self.waiting or self.prefilling or self.running)
+        # A finished sequence stays in the scheduler until the next step finalizes it.
+        local = bool(self.waiting or self.prefilling or self.running or self.to_finalize)
         self._maybe_stats()
         if self.barrier is None:
             return local
@@ -335,6 +337,7 @@ class SimEngine:
         return unfinished
 
     def step(self) -> StepOutputs:
+        self._finalize_pending()
         while self.waiting and len(self.prefilling) + len(self.running) < self.max_num_seqs:
             if not self._admit(self.waiting[0]):
                 break  # FIFO: wait for blocks to free up
@@ -387,6 +390,7 @@ class SimEngine:
         return StepOutputs(outputs)
 
     def flush_inflight_reqs(self) -> StepOutputs:
+        self._finalize_pending()
         return StepOutputs()
 
     def abort_request(self, request_id: Any) -> tuple:
@@ -421,9 +425,16 @@ class SimEngine:
             outputs.append(RequestOutput(seq.request_id, token, finished, seq.prompt_len,
                                          "length" if finished else ""))
             if finished:
-                self.finalize_seq(seq)
+                # DeepInfer (zero-overhead scheduling) finalizes a finished sequence in the
+                # NEXT step's pre_sampler_sync, after its last token went out: mirror that.
+                self.to_finalize.append(seq)
                 return True
         return False
+
+    def _finalize_pending(self) -> None:
+        pending, self.to_finalize = self.to_finalize, []
+        for seq in pending:
+            self.finalize_seq(seq)
 
     def _maybe_stats(self) -> None:
         if not self.stats_path:

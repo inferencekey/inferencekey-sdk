@@ -605,9 +605,16 @@ class _RankCache:
         self.min_promote = max(1, int(settings.get("l1_min_promote_blocks", 2)))
         self.promote_wait = float(settings.get("l1_promote_wait_seconds", 2.0))
         self.copy_timeout = float(settings.get("l1_copy_timeout_seconds", 10.0))
+        # Why finished sequences did (not) give blocks to the index: on the 4x B200
+        # run the index never got an insert while the 1-rank check did.
+        self.finish_stats = {"finalized": 0, "inserted": 0, "no_entry": 0, "short_table": 0, "no_blocks": 0,
+                             "reaped": 0}
+        self.done_at: Dict[str, float] = {}  # last output sent, finalize not seen yet
+        self._finish_notes = 0
         finalize = engine.finalize_seq
 
         def finalize_seq(seq: Any) -> None:
+            self.finish_stats["finalized"] += 1
             try:
                 self._finished(seq)
             except Exception:  # noqa: BLE001 (never break the engine step)
@@ -1024,6 +1031,24 @@ class _RankCache:
             self.make_room(min(need, self.total_blocks))
         return admitted
 
+    def output_finished(self, request_id: str) -> None:
+        """The request's last output went out. DeepInfer finalizes the sequence
+        later (zero-overhead scheduling: in the next step's pre_sampler_sync),
+        so keep its entry for ``_finished``; ``reap_finished`` drops entries whose
+        finalize never came."""
+        if request_id in self.live:
+            self.done_at.setdefault(request_id, time.monotonic())
+        else:
+            self.forget(request_id)
+
+    def reap_finished(self, after: float = 30.0) -> None:
+        now = time.monotonic()
+        for request_id, since in list(self.done_at.items()):
+            if now - since > after:
+                del self.done_at[request_id]
+                self.finish_stats["reaped"] += 1
+                self.forget(request_id)
+
     def forget(self, request_id: str) -> None:
         """A request left without finishing in the engine (aborted): drop its protection."""
         promo = self.promoting.get(request_id)
@@ -1037,17 +1062,35 @@ class _RankCache:
         if entry is not None:
             self.index.unprotect(entry[2])
 
+    def _finish_note(self, what: str) -> None:
+        if self._finish_notes < 5:
+            self._finish_notes += 1
+            print(f"deepinfer rank {self.rank}: finished sequence not cached: {what}", file=sys.stderr, flush=True)
+
     def _finished(self, seq: Any) -> None:
+        self.done_at.pop(seq.request_id, None)
         entry = self.live.pop(seq.request_id, None)
         if entry is None:
+            self.finish_stats["no_entry"] += 1
+            self._finish_note(f"request id {seq.request_id!r} ({type(seq.request_id).__name__}) not live; "
+                              f"live ids {list(self.live)[:3]!r}")
             return
         hashes, prompt_len, used, _ = entry
         self.index.unprotect(used)
         # Prompt blocks only, and never the last prompt token's block: with
         # drop_thinking the next turn re-renders everything after the prompt.
         n = min(len(hashes), (prompt_len - 1) // BLOCK)
-        table = list(seq.block_table)[:n]
+        full = list(seq.block_table)
+        table = full[:n]
+        if not n:
+            self.finish_stats["no_blocks"] += 1
+            self._finish_note(f"{seq.request_id}: no full prompt block ({len(hashes)} hashes, prompt {prompt_len} tokens)")
+        elif len(table) != n:
+            self.finish_stats["short_table"] += 1
+            self._finish_note(f"{seq.request_id}: block table has {len(full)} blocks, the prompt needs {n} "
+                              f"({prompt_len} tokens, {len(hashes)} hashes)")
         if n and len(table) == n:
+            self.finish_stats["inserted"] += 1
             self.index.insert(hashes[:n], table)
             l1 = self.l1
             if l1 is not None and l1.sample():
@@ -1058,7 +1101,8 @@ class _RankCache:
 
     def stats(self) -> Dict[str, Any]:
         out = {"rank": self.rank, "total_blocks": self.total_blocks,
-               "free_blocks": int(self.blocks.get_num_free_blocks()), "live": len(self.live), **self.index.stats()}
+               "free_blocks": int(self.blocks.get_num_free_blocks()), "live": len(self.live), **self.index.stats(),
+               **{f"finish_{k}": v for k, v in self.finish_stats.items()}}
         if self.preempt_check is not None:
             out["preempted"] = int(self.preempt_check())
         if self.l1 is not None:
@@ -1287,6 +1331,7 @@ def _rank_loop(
                 if items:
                     results.put(("out", rank, items))
                 if cache is not None and time.monotonic() >= next_stats:
+                    cache.reap_finished()
                     next_stats = time.monotonic() + stats_every
                     results.put(("stats", rank, {**cache.stats(), "tokenizer_cache_hits": segments.hits, "tokenizer_cache_misses": segments.misses}))
                 time.sleep(idle_sleep)
@@ -1301,8 +1346,9 @@ def _rank_loop(
             if cache is not None:
                 for item in items:
                     if item[4]:
-                        cache.forget(item[0])  # finished or failed: no-op once finalize ran
+                        cache.output_finished(item[0])  # finished or failed: finalize may come a step later
                 if time.monotonic() >= next_stats:
+                    cache.reap_finished()
                     next_stats = time.monotonic() + stats_every
                     results.put(("stats", rank, {**cache.stats(), "tokenizer_cache_hits": segments.hits, "tokenizer_cache_misses": segments.misses}))
     finally:
@@ -1794,7 +1840,11 @@ class DeepInferEngine(Engine):
                   f"({info.get('cached_blocks', 0)} cached blocks), hits {info.get('hits', 0)}/{info.get('lookups', 0)} "
                   f"({info.get('hit_tokens', 0):,} tokens), evicted {info.get('evicted', 0)} blocks, "
                   f"preempted {info.get('preempted', 0)}, tokenizer cache {info.get('tokenizer_cache_hits', 0)} hits; "
-                  f"migrations {migrations}{_l1_log_part(info)}", file=sys.stderr, flush=True)
+                  f"migrations {migrations}; finished {info.get('finish_finalized', 0)} (cached "
+                  f"{info.get('finish_inserted', 0)}, not live {info.get('finish_no_entry', 0)}, short table "
+                  f"{info.get('finish_short_table', 0)}, no block {info.get('finish_no_blocks', 0)}, "
+                  f"reaped {info.get('finish_reaped', 0)})"
+                  f"{_l1_log_part(info)}", file=sys.stderr, flush=True)
 
     def _check_ranks(self, now: float) -> None:
         """Fail the engine when a rank died or every rank went quiet with requests in flight.

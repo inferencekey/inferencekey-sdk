@@ -620,6 +620,7 @@ def test_verify_compares_restored_bytes_with_the_demoted_and_cached_ones() -> No
         engine.step()  # prefill writes the tags; finalize inserts into L0 and samples checksums
         if seq.generated >= 4:
             break
+    engine.flush_inflight_reqs()  # DeepInfer finalizes a step after the last token
     clock.t += 1.0
     cache.tick([])
     assert len(cache.l1.l0_sums) == 20
@@ -1006,7 +1007,7 @@ def _stress(seed: int, kv_blocks: int = 120, host_blocks: int = 150, sessions: i
             for out in engine.step():
                 if out.finished and out.request_id in live:
                     del live[out.request_id]
-                    cache.forget(out.request_id)
+                    cache.output_finished(out.request_id)  # as _rank_loop: finalize comes a step later
     for _ in range(20):
         clock.t += 100
         cache.tick([])
@@ -1284,3 +1285,27 @@ def test_index_ring_wraps_and_frees_in_order() -> None:
     ring.free(b)
     with pytest.raises(ValueError):
         ring.alloc(11)
+
+
+def test_finished_output_keeps_the_entry_until_finalize_or_reap() -> None:
+    # DeepInfer finalizes a finished sequence a step after its last token went out;
+    # the rank loop must not drop the entry in between (4x B200 run, 2026-10-24:
+    # the prefix index never got an insert).
+    engine = _engine(kv_blocks=100)
+    cache = _cache(engine)
+    ids = _ids(12, 20, 50)
+    seq, _ = cache.add(_adder(engine, "t1", ids, 2), "t1", ids, pc.block_hashes(ids), 2)
+    while seq.generated < 2:
+        engine.step()
+    cache.output_finished("t1")
+    assert "t1" in cache.live and cache.stats()["cached_blocks"] == 0
+    engine.flush_inflight_reqs()
+    assert "t1" not in cache.live and cache.stats()["cached_blocks"] == 20  # (20 * B + 50 - 1) // B
+    assert cache.finish_stats["inserted"] == 1 and not cache.done_at
+    # A finalize that never comes: the entry and its protection go after the wait.
+    seq2, _ = cache.add(_adder(engine, "t2", ids + [1] * 200, 2), "t2", ids + [1] * 200,
+                        pc.block_hashes(ids + [1] * 200), 2)
+    cache.output_finished("t2")
+    cache.done_at["t2"] -= 60
+    cache.reap_finished()
+    assert "t2" not in cache.live and cache.finish_stats["reaped"] == 1
