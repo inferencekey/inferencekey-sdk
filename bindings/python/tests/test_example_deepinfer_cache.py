@@ -144,7 +144,7 @@ def _run(requests, results, request_id: str, prompt: str, max_tokens: int = 8, t
     while True:
         kind, _, payload = results.get(timeout=max(deadline - time.time(), 0.01))
         if kind == "meta":
-            cached = dict(payload).get(request_id, cached)
+            cached = {item[0]: item[1] for item in payload}.get(request_id, cached)
         elif kind == "stats":
             stats = payload
         elif kind == "out":
