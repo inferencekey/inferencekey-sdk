@@ -103,6 +103,132 @@ def test_index_shares_prefixes_and_evicts_leaves_lru() -> None:
     assert all(n == 0 for n in pins.refs.values())
 
 
+def test_a_parent_that_becomes_a_leaf_keeps_its_own_recency() -> None:
+    """A shared prefix used a moment ago is not evicted ahead of colder leaves."""
+    unpinned: list = []
+    index = pc.PrefixIndex(lambda b: None, unpinned.extend)
+    a, b = pc.block_hashes([1] * (2 * pc.BLOCK))
+    c = pc.block_hashes([2] * pc.BLOCK)[0]
+    index.insert([a, b], [1, 2])
+    index.insert([c], [3])
+    index.lookup([a])  # a shorter prompt uses A
+    index.evict(1)
+    index.evict(1)
+    assert unpinned == [2, 3]  # B, then C (older than A), not A
+
+
+class _SortedIndex:
+    """The prefix index before the incremental LRU (a full sort per eviction),
+    kept as the reference order."""
+
+    def __init__(self) -> None:
+        self.nodes: dict = {}  # hash -> [block, parent, children, last_used]
+        self.clock = 0
+        self.protected: dict = {}
+        self.unpinned: list = []
+
+    def lookup(self, hashes) -> list:
+        self.clock += 1
+        out = []
+        for h in hashes:
+            node = self.nodes.get(h)
+            if node is None:
+                break
+            node[3] = self.clock
+            out.append(node[0])
+        return out
+
+    def insert(self, hashes, blocks) -> None:
+        self.clock += 1
+        parent = None
+        for h, block in zip(hashes, blocks):
+            node = self.nodes.get(h)
+            if node is None:
+                self.nodes[h] = [block, parent, 0, self.clock]
+                if parent is not None:
+                    self.nodes[parent][2] += 1
+            else:
+                node[3] = self.clock
+            parent = h
+
+    def protect(self, hashes) -> None:
+        for h in hashes:
+            self.protected[h] = self.protected.get(h, 0) + 1
+
+    def unprotect(self, hashes) -> None:
+        for h in hashes:
+            n = self.protected.get(h, 0) - 1
+            if n > 0:
+                self.protected[h] = n
+            else:
+                self.protected.pop(h, None)
+
+    def evict(self, wanted: int) -> None:
+        queue_ = [h for _, h in sorted((n[3], h) for h, n in self.nodes.items()
+                                        if n[2] == 0 and h not in self.protected)]
+        freed = []
+        i = 0
+        while len(freed) < wanted and i < len(queue_):
+            h = queue_[i]
+            i += 1
+            node = self.nodes.pop(h, None)
+            if node is None:
+                continue
+            freed.append(node[0])
+            if node[1] is not None and node[1] in self.nodes:
+                parent = self.nodes[node[1]]
+                parent[2] -= 1
+                if parent[2] == 0 and node[1] not in self.protected:
+                    queue_.insert(i, node[1])
+        self.unpinned.extend(freed)
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_l0_eviction_order_matches_the_full_sort(seed) -> None:
+    import random
+
+    rng = random.Random(seed)
+    unpinned: list = []
+    index = pc.PrefixIndex(lambda b: None, unpinned.extend)
+    ref = _SortedIndex()
+    ids: dict = {}
+
+    def chain() -> list:
+        path = [rng.randrange(3)]  # a shared root most of the time, as with system prompts
+        for _ in range(rng.randint(0, 7)):
+            path.append(rng.randrange(3))
+        return [bytes(path[: i + 1]) for i in range(len(path))]
+
+    protections: list = []
+    for _ in range(3000):
+        r = rng.random()
+        hashes = chain()
+        if r < 0.35:
+            blocks = [ids.setdefault(h, len(ids) + 1) for h in hashes]
+            index.insert(hashes, blocks)
+            ref.insert(hashes, blocks)
+        elif r < 0.6:
+            assert index.lookup(hashes) == ref.lookup(hashes)
+        elif r < 0.7:
+            used = hashes[: len(ref.lookup(hashes))]
+            index.lookup(hashes)
+            index.protect(used)
+            ref.protect(used)
+            protections.append(used)
+        elif r < 0.8 and protections:
+            used = protections.pop(rng.randrange(len(protections)))
+            index.unprotect(used)
+            ref.unprotect(used)
+        else:
+            k = rng.randint(1, 4)
+            index.evict(k)
+            ref.evict(k)
+            assert unpinned == ref.unpinned
+            for h in [h for h in ids if h not in ref.nodes]:
+                del ids[h]  # a later insert names the block afresh
+    assert len(index) == len(ref.nodes)
+
+
 # --- the rank, with the simulated engine ------------------------------------------
 
 
@@ -319,7 +445,8 @@ def test_two_turns_end_to_end_report_cached_tokens(tmp_path, monkeypatch) -> Non
     model.mkdir()
     (model / "config.json").write_text("{}")
     ctx = mp.get_context("spawn")
-    sim = {"step_rate": 400.0, "tokenizer": "fake", "kv_blocks": 5000,
+    # The ranks have a KV mover, yet a config that does not ask for L1 leaves it off.
+    sim = {"step_rate": 400.0, "tokenizer": "fake", "kv_blocks": 5000, "l1_pcie_gbps": 50.0, "l1_host_blocks": 100,
            "barrier": ctx.Barrier(2), "flags": ctx.Array("b", 2, lock=False)}
     backend = db.DeepInferBackend()
     backend.setup(BackendContext(config={
@@ -328,6 +455,7 @@ def test_two_turns_end_to_end_report_cached_tokens(tmp_path, monkeypatch) -> Non
     }))
     engine = backend.engine
     try:
+        assert engine.l1_ready == []  # l1_cache is off by default: no host memory pinned
         messages = [{"role": "system", "content": "repository " * 400}, {"role": "user", "content": "go"}]
         first = backend.chat({"messages": messages, "max_tokens": 10, "user": "dev-1"})
         assert first["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
@@ -340,6 +468,7 @@ def test_two_turns_end_to_end_report_cached_tokens(tmp_path, monkeypatch) -> Non
         while sum(s.get("hits", 0) for s in engine.rank_stats) < 1 and time.time() < deadline:
             time.sleep(0.05)
         assert sum(s.get("hits", 0) for s in engine.rank_stats) == 1
+        assert not any("l1_blocks" in s for s in engine.rank_stats)
     finally:
         engine.close()
 

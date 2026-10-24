@@ -653,7 +653,7 @@ class _RankCache:
             return {"l1": False, "reason": reason}
         self.l1 = L1(mover, self.blocks.unpin_blocks, rank=self.rank,
                      verify_fraction=float(self.settings.get("l1_verify_fraction", 0.0)),
-                     copy_timeout=self.copy_timeout)
+                     copy_timeout=self.copy_timeout, l0_block=self.index.block_of)
         bpb = int(mover.bytes_per_block)
         print(f"deepinfer rank {self.rank}: L1 host cache on, {slots * bpb / 2**30:.1f} GiB pinned ({slots:,} blocks "
               f"of {bpb:,} bytes = {slots * BLOCK / 1e6:.1f}M tokens), min promotion "
@@ -672,7 +672,14 @@ class _RankCache:
         l1 = self.l1
         hit_blocks = len(blocks)
         if l1 is not None and l1.enabled and len(hashes) > len(blocks):
-            started = self._promote(add_request, request_id, token_ids, hashes, max_tokens, blocks)
+            try:
+                started = self._promote(add_request, request_id, token_ids, hashes, max_tokens, blocks)
+            except Exception:
+                # Nobody would listen for it: drop the promotion and what it holds.
+                promo = self.promoting.get(request_id)
+                if promo is not None:
+                    self._abandon(promo)
+                raise
             if started:
                 return PROMOTING, 0
             blocks = self.index.lookup(hashes, count=False)
@@ -700,13 +707,16 @@ class _RankCache:
         used = hashes[:reused]
         self.index.protect(used)  # before making room, so the hit is not the block evicted
         new_blocks = -(-(prompt_len - hit + max_tokens) // BLOCK)
-        self.make_room(new_blocks)
+        try:
+            self.make_room(new_blocks)
+            seq = add_request(enqueue=True) if not hit else add_request(enqueue=False)
+        except Exception:
+            self.index.unprotect(used)
+            raise
         if not hit:
-            seq = add_request(enqueue=True)
             if seq is not None:
                 self.live[request_id] = (hashes, prompt_len, [], new_blocks)
             return seq, 0
-        seq = add_request(enqueue=False)
         if seq is None:
             self.index.unprotect(used)
             return None, 0
@@ -728,10 +738,14 @@ class _RankCache:
         want = max(new_blocks, 0) + self.headroom
         free = int(self.blocks.get_num_free_blocks())
         l1 = self.l1
-        if l1 is not None:
-            free += l1.pending_d2h_blocks  # free as soon as their copies complete
+        if l1 is not None and l1.enabled:
+            # Free as soon as their copies complete: only blocks L1 alone holds,
+            # in copies that are not stuck (rescued or adopted blocks stay in use).
+            free += l1.freeing_blocks
         if free < want:
-            if l1 is not None and l1.enabled:
+            if l1 is not None:
+                # Even when disabled: a block whose demotion copy still reads it
+                # must stay pinned until that copy completed.
                 self.index.evict(want - free, demote=l1.demote)
             else:
                 self.index.evict(want - free)
@@ -838,6 +852,18 @@ class _RankCache:
         self.promoting.pop(promo.request_id, None)
         self._wake(promo.request_id)
 
+    def _abandon(self, promo: _Promotion) -> None:
+        """Drop a promotion after an unexpected exception: never free what its copy may
+        still write (quarantine), release everything else."""
+        if self.promoting.get(promo.request_id) is not promo:
+            return
+        promo.aborted = True
+        if promo.ticket is not None:
+            self.l1.quarantine_copy(promo.ticket, promo.gpu_ids, [], [promo.hashes[pos] for pos, _ in promo.h2d])
+            self._release(promo, unpin_gpu=False, keep_busy=True)
+        else:
+            self._release(promo)
+
     def _wake(self, request_id: str) -> None:
         for other in self.promoting.values():
             other.waits_for.discard(request_id)
@@ -868,9 +894,14 @@ class _RankCache:
                     l1.counters["l1_verify_failures"] += 1
                     print(f"deepinfer rank {self.rank}: L1 verify FAILED for {promo.request_id}: block {bad[0]} "
                           f"of {len(sums)} differs; L1 disabled", file=sys.stderr, flush=True)
-                    l1.disable("verify failure")
+                    l1.disable("verify failure", suspect=True)
                     self._release(promo)
                     return self._admit_plain(promo)
+            elif l1.suspect:
+                # A verify failure since this copy was issued: what it restored is not trusted.
+                l1.counters["l1_fallbacks"] += 1
+                self._release(promo)
+                return self._admit_plain(promo)
         restored: List[int] = [0] * (reused - n0)
         for (pos, _), block in zip(promo.h2d, promo.gpu_ids):
             restored[pos - n0] = block
@@ -906,6 +937,9 @@ class _RankCache:
         return promo.request_id, seq, cached, l1_tokens
 
     def _tick_l1(self) -> List[tuple]:
+        """Poll L1 and handle every promotion; an exception in one of them becomes that
+        request's error item ``(request_id, None, 0, 0, message)``, never a request
+        left waiting for nothing."""
         l1 = self.l1
         l1.poll()
         admitted: List[tuple] = []
@@ -913,53 +947,63 @@ class _RankCache:
         for request_id, promo in list(self.promoting.items()):
             if self.promoting.get(request_id) is not promo:
                 continue  # restarted or released by an earlier one in this loop
-            item: Optional[tuple] = None
-            if promo.no_copy or promo.ticket is not None:
-                if promo.no_copy or l1.mover.done(promo.ticket):
-                    item = self._complete(promo)
-                elif now - promo.t_issue > self.copy_timeout:
-                    # Never free what the copy may still write: quarantine it, recompute.
-                    l1._stuck(len(promo.gpu_ids), "host to device")
-                    l1.quarantine_copy(promo.ticket, promo.gpu_ids, [],
-                                       [promo.hashes[pos] for pos, _ in promo.h2d])
-                    self._release(promo, unpin_gpu=False, keep_busy=True)
-                    item = self._admit_plain(promo)
-                else:
-                    continue
-            elif promo.waits_for:
-                if now - promo.t_start <= self.promote_wait:
-                    continue
-                l1.counters["l1_promote_timeouts"] += 1
-                self._release(promo)
-                item = self._admit_plain(promo)
-            elif promo.claimed:
-                if not self._issue(promo):
-                    item = self._admit_plain(promo)
-                elif promo.ticket is None and not promo.no_copy:
-                    if now - promo.t_start <= self.promote_wait:
-                        continue
-                    l1.counters["l1_promote_timeouts"] += 1
-                    self._release(promo)
-                    item = self._admit_plain(promo)
-                else:
-                    continue
-            else:
-                # The promotion it waited for is done: start over from the lookup.
-                self.promoting.pop(request_id, None)
-                if promo.aborted:
-                    continue
-                seq, cached = self.add(promo.add_request, request_id, promo.token_ids, promo.hashes,
-                                       promo.max_tokens, _count=False)
-                if seq is PROMOTING:
-                    continue
-                item = (request_id, seq, cached, 0)
+            try:
+                item = self._tick_promotion(l1, request_id, promo, now)
+            except Exception as exc:  # noqa: BLE001 (fail this request, keep the others going)
+                traceback.print_exc(file=sys.stderr)
+                self._abandon(promo)
+                item = (request_id, None, 0, 0, f"admission after the L1 copy failed: {exc}")
             if item is not None:
                 admitted.append(item)
         return admitted
 
+    def _tick_promotion(self, l1: L1, request_id: str, promo: _Promotion, now: float) -> Optional[tuple]:
+        """One promotion's step in ``_tick_l1``: its admission item, or None (not yet, or gone)."""
+        if not l1.enabled and promo.ticket is None and not promo.no_copy:
+            # L1 turned itself off: restore nothing more from it.
+            self._release(promo)
+            return self._admit_plain(promo)
+        if promo.no_copy or promo.ticket is not None:
+            if promo.no_copy or l1.mover.done(promo.ticket):
+                return self._complete(promo)
+            if now - promo.t_issue > self.copy_timeout:
+                # Never free what the copy may still write: quarantine it, recompute.
+                l1._stuck(len(promo.gpu_ids), "host to device")
+                l1.quarantine_copy(promo.ticket, promo.gpu_ids, [],
+                                   [promo.hashes[pos] for pos, _ in promo.h2d])
+                self._release(promo, unpin_gpu=False, keep_busy=True)
+                return self._admit_plain(promo)
+            return None
+        if promo.waits_for:
+            if now - promo.t_start <= self.promote_wait:
+                return None
+            l1.counters["l1_promote_timeouts"] += 1
+            self._release(promo)
+            return self._admit_plain(promo)
+        if promo.claimed:
+            if not self._issue(promo):
+                return self._admit_plain(promo)
+            if promo.ticket is None and not promo.no_copy:
+                if now - promo.t_start <= self.promote_wait:
+                    return None
+                l1.counters["l1_promote_timeouts"] += 1
+                self._release(promo)
+                return self._admit_plain(promo)
+            return None
+        # The promotion it waited for is done: start over from the lookup.
+        self.promoting.pop(request_id, None)
+        if promo.aborted:
+            return None
+        seq, cached = self.add(promo.add_request, request_id, promo.token_ids, promo.hashes,
+                               promo.max_tokens, _count=False)
+        if seq is PROMOTING:
+            return None
+        return request_id, seq, cached, 0
+
     def tick(self, pending: List[str]) -> List[tuple]:
         """Between steps: poll L1 copies and admit the promotions that completed
-        (returned as ``(request_id, seq, cached_tokens, l1_tokens)``), then keep
+        (returned as ``(request_id, seq, cached_tokens, l1_tokens)``, or
+        ``(request_id, None, 0, 0, message)`` when admitting one raised), then keep
         room for the requests not admitted yet (``pending``: no output so far),
         counting only the blocks each one still needs, not its whole prompt (a
         hit reuses most of it): counting whole prompts emptied the cache whenever
@@ -1213,15 +1257,19 @@ def _rank_loop(
             # UNVERIFIED: that idle ranks may keep calling it (and step() with an
             # empty local batch) indefinitely, as a long-lived server needs.
             if cache is not None:
-                for request_id, seq, cached, l1_tokens in cache.tick(
+                for admitted in cache.tick(
                         [request_id for request_id, state in live.items() if state.tokens == 0]):
+                    request_id, seq, cached, l1_tokens = admitted[:4]
                     state = live.get(request_id)
                     if state is None:
                         continue  # the client left while the promotion was finishing
                     if seq is None:
                         del live[request_id]
-                        items.append((request_id, "", 0, 0, True,
-                                      "the engine rejected the prompt (token id out of range)", INVALID_PROMPT))
+                        if len(admitted) > 4:  # admitting it raised
+                            items.append((request_id, "", 0, 0, True, admitted[4], None))
+                        else:
+                            items.append((request_id, "", 0, 0, True,
+                                          "the engine rejected the prompt (token id out of range)", INVALID_PROMPT))
                         continue
                     state.seq = seq
                     metas.append((request_id, cached, l1_tokens))
@@ -1485,7 +1533,7 @@ class DeepInferEngine(Engine):
                 proc.start()
             self._wait_ready(dp, float(config.get("load_timeout_seconds", 3600)))
             self.l1_ready: List[Dict[str, Any]] = []
-            if settings["prefix_cache"] and bool(config.get("l1_cache", True)):
+            if settings["prefix_cache"] and bool(config.get("l1_cache", False)):
                 self._start_l1(config, dp, model_path, float(config.get("load_timeout_seconds", 3600)))
         except BaseException:
             # The ranks that did start would keep their GPUs, and as non-daemon

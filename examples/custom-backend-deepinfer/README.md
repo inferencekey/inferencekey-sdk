@@ -139,8 +139,8 @@ HBM does not hold the KV of hundreds of long agent sessions (400 sessions of
 KV pool). When the GPU cache (L0) has to evict an idle session, the L1 host
 cache keeps a copy of its blocks in pinned host RAM, and the session's next
 turn copies them back (about 18 ms for a 1M-token session at 50 GB/s) instead
-of recomputing them (seconds of prefill that stall every rank). With
-`l1_cache` on (the default):
+of recomputing them (seconds of prefill that stall every rank). It is off by
+default; with `l1_cache: true`:
 
 - All paged KV of a rank is one GPU tensor (`cache_engine.gpu_blocks`, one row
   per block, about 111 KiB per block for the full model), so a block moves as
@@ -161,8 +161,10 @@ of recomputing them (seconds of prefill that stall every rank). With
   back to plain L0 behaviour (drop the block, or recompute); a copy that failed
   halfway or got stuck keeps its GPU blocks and host slots out of use until its
   event completed. `l1_verify_fraction` adds checksums of the bytes as the
-  prefill wrote them, as they were demoted and as they were restored; a
-  mismatch turns L1 off.
+  prefill wrote them, as they were demoted and as they were restored, each
+  compared only with a sum of the same physical block (a recompute of the
+  same prefix may give other bytes); a mismatch turns L1 off, and nothing
+  more is restored from it.
 - The host budget is computed once, after every rank is ready: the container's
   memory limit minus what cannot be reclaimed (`anon + shmem + unevictable`),
   a reserve of `max(32 GiB, 5 %)` and the Engram host storage, split over the
@@ -204,7 +206,7 @@ requests decoding and with zero-overhead scheduling on, and the copy bandwidth.
 | `tokenizer_threads` | `2` | Prompt tokenization threads per rank. |
 | `prefix_cache` | `true` | GPU prefix cache and session routing (see "Prefix cache"). Needs the patched DeepInfer. |
 | `prefix_cache_free_fraction` | `0.05` | KV pool kept free by eviction on top of the 10 % prefill watermark. |
-| `l1_cache` | `true` | L1 host cache (see "L1 host cache"). Needs `prefix_cache` and `cp` 1; turns itself off when the engine lacks what it needs. |
+| `l1_cache` | `false` | L1 host cache (see "L1 host cache"). Needs `prefix_cache` and `cp` 1; turns itself off when the engine lacks what it needs. |
 | `l1_host_gb` | `64` | Pinned host memory per rank, GiB, capped at startup by the node budget. |
 | `l1_prealloc_gb` | `l1_host_gb` | Pinned at startup (nothing is pinned while serving), so a smaller value only shrinks the pool. |
 | `l1_engram_host_gb` | from the model config | Engram host storage of the node to keep out of the budget (tables plus buffer storage). `0` when it is already counted in the process memory. |
@@ -280,8 +282,9 @@ Tests: `bindings/python/tests/test_example_deepinfer.py`, `test_example_deepinfe
 cache) and `test_example_deepinfer_l1.py` (L1 host cache).
 
 The simulated ranks of `bench/sim_server.py` model L1 too: `--l1-pcie-gbps 50`
-gives each rank a simulated mover (copies take `--l1-copy-latency-us` plus the
-bytes over that bandwidth, and admission waits for them), `--l1-host-blocks`
+gives each rank a simulated mover and turns `l1_cache` on (copies take
+`--l1-copy-latency-us` plus the bytes over that bandwidth, and admission waits
+for them), `--l1-host-blocks`
 sets its host slots, and `--kv-blocks` smaller than the sessions forces
 eviction. Content tags per block catch an early unpin or admission
 (`kv_mismatch` in the rank stats file).

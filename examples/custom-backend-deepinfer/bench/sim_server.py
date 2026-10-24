@@ -73,6 +73,8 @@ def build_config(args: argparse.Namespace) -> dict:
         "thinking_mode": args.thinking_mode,
         "llm_kwargs": {"bench_sim": sim},
         "load_timeout_seconds": 120,
+        # A simulated PCIe link means the run wants the L1 host cache (off by default).
+        "l1_cache": args.l1_pcie_gbps > 0,
         **json.loads(args.backend_config or "{}"),
     }
 

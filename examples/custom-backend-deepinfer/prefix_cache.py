@@ -28,9 +28,9 @@ call :func:`block_hashes`.
 from __future__ import annotations
 
 import hashlib
+import heapq
 from array import array
-from collections import OrderedDict
-from typing import Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 BLOCK = 128
 #: Tokens a cache hit must leave to recompute: the 128-token sliding window plus
@@ -61,29 +61,38 @@ def usable_hit(hit_blocks: int, prompt_len: int, block: int = BLOCK) -> int:
 
 
 class _Node:
-    __slots__ = ("block_id", "parent", "children", "depth")
+    __slots__ = ("block_id", "parent", "children", "depth", "last_used")
 
-    def __init__(self, block_id: int, parent: Optional[bytes], depth: int) -> None:
+    def __init__(self, block_id: int, parent: Optional[bytes], depth: int, last_used: int) -> None:
         self.block_id = block_id
         self.parent = parent
         self.children = 0
         self.depth = depth  # position of the block in its chain
+        self.last_used = last_used
 
 
 class PrefixIndex:
     """Chain hash -> GPU block, with leaf-only LRU eviction.
 
-    The evictable leaves (no children, not protected) are kept in an
-    ``OrderedDict``, oldest first, so eviction pops from the front instead of
-    sorting every node on each call (about 0.2 s for 226K nodes, on the
-    lockstep thread, and with the host tier eviction runs on almost every step).
+    Every node carries the tick of its last use (a lookup or insert touches the
+    whole chain), and eviction takes the evictable leaves (no children, not
+    protected) in ``(last_used, hash)`` order; a parent whose last child just
+    left goes next, so a chain is evicted deepest first. That is the order of
+    the original full sort, kept incrementally: a heap of ``(last_used, hash)``
+    with stale entries skipped, instead of sorting every node on each call
+    (about 0.2 s for 226K nodes, on the lockstep thread, and with the host tier
+    eviction runs on almost every step).
     """
 
     def __init__(self, pin: Callable[[List[int]], None], unpin: Callable[[List[int]], None]) -> None:
         self._pin = pin
         self._unpin = unpin
         self._nodes: Dict[bytes, _Node] = {}
-        self._leaves: "OrderedDict[bytes, None]" = OrderedDict()  # evictable leaves, least recently used first
+        self._leaves: Dict[bytes, None] = {}  # evictable leaves
+        #: (last_used, hash) of evictable leaves; an entry whose node is gone, not
+        #: an evictable leaf, or used since, is stale and skipped.
+        self._heap: List[Tuple[int, bytes]] = []
+        self._clock = 0
         self.protected: Dict[bytes, int] = {}  # node -> running sequences using it
         self.hits = 0
         self.hit_tokens = 0
@@ -97,18 +106,37 @@ class PrefixIndex:
     def __contains__(self, h: bytes) -> bool:
         return h in self._nodes
 
+    def block_of(self, h: bytes) -> Optional[int]:
+        """The GPU block cached for ``h``, or None."""
+        node = self._nodes.get(h)
+        return node.block_id if node is not None else None
+
+    def _tick(self) -> int:
+        self._clock += 1
+        return self._clock
+
+    def _push(self, h: bytes, node: _Node) -> None:
+        heap = self._heap
+        heapq.heappush(heap, (node.last_used, h))
+        if len(heap) > 2 * len(self._leaves) + 1024:
+            nodes = self._nodes
+            self._heap = [(nodes[k].last_used, k) for k in self._leaves]
+            heapq.heapify(self._heap)
+
     def lookup(self, hashes: Sequence[bytes], count: bool = True) -> List[int]:
         """GPU blocks of the longest cached prefix of ``hashes`` (touched as used)."""
         if count:
             self.lookups += 1
         blocks: List[int] = []
         leaves = self._leaves
+        now = self._tick()
         for h in hashes:
             node = self._nodes.get(h)
             if node is None:
                 break
+            node.last_used = now
             if h in leaves:
-                leaves.move_to_end(h)
+                self._push(h, node)
             blocks.append(node.block_id)
         return blocks
 
@@ -128,6 +156,7 @@ class PrefixIndex:
                 node = self._nodes.get(h)
                 if node is not None and node.children == 0:
                     self._leaves[h] = None
+                    self._push(h, node)
 
     def insert(self, hashes: Sequence[bytes], block_ids: Sequence[int], adopt_from: Optional[int] = None,
                duplicates: Optional[List[int]] = None) -> int:
@@ -146,11 +175,13 @@ class PrefixIndex:
         added = 0
         parent: Optional[bytes] = None
         nodes, leaves = self._nodes, self._leaves
+        now = self._tick()
+        touched: List[bytes] = []
         for i, (h, block_id) in enumerate(zip(hashes, block_ids)):
             adopted = adopt_from is not None and i >= adopt_from
             node = nodes.get(h)
             if node is None:
-                node = _Node(int(block_id), parent, i)
+                node = _Node(int(block_id), parent, i, now)
                 nodes[h] = node
                 if parent is not None:
                     parent_node = nodes[parent]
@@ -159,15 +190,19 @@ class PrefixIndex:
                     parent_node.children += 1
                 if h not in self.protected:
                     leaves[h] = None
+                touched.append(h)
                 if not adopted:
                     new_blocks.append(int(block_id))
                 added += 1
             else:
-                if h in leaves:
-                    leaves.move_to_end(h)
+                node.last_used = now
+                touched.append(h)
                 if adopted and node.block_id != int(block_id) and duplicates is not None:
                     duplicates.append(int(block_id))
             parent = h
+        for h in touched:
+            if h in leaves:
+                self._push(h, nodes[h])
         if new_blocks:
             self._pin(new_blocks)
         self.inserted += added
@@ -184,12 +219,22 @@ class PrefixIndex:
         """
         if blocks_wanted <= 0 or not self._leaves:
             return 0
-        nodes, leaves = self._nodes, self._leaves
+        nodes, leaves, heap = self._nodes, self._leaves, self._heap
         hashes: List[bytes] = []
         freed: List[int] = []
         depths: List[int] = []
-        while len(freed) < blocks_wanted and leaves:
-            h, _ = leaves.popitem(last=False)
+        following: Optional[bytes] = None  # a parent that just became a leaf: it goes next
+        while len(freed) < blocks_wanted:
+            if following is not None:
+                h, following = following, None
+            else:
+                if not leaves:
+                    break
+                tick, h = heapq.heappop(heap)
+                node = nodes.get(h)
+                if node is None or h not in leaves or node.last_used != tick:
+                    continue  # stale
+            del leaves[h]
             node = nodes.pop(h)
             hashes.append(h)
             freed.append(node.block_id)
@@ -199,10 +244,12 @@ class PrefixIndex:
                 if parent is not None:
                     parent.children -= 1
                     if parent.children == 0 and node.parent not in self.protected:
-                        # The parent became a leaf; it is older than anything
-                        # touched after it, so it goes next in line.
+                        # The parent became a leaf: evicted right after its child
+                        # (deepest first), as the full sort did.
                         leaves[node.parent] = None
-                        leaves.move_to_end(node.parent, last=False)
+                        following = node.parent
+        if following is not None:
+            self._push(following, nodes[following])  # not taken this time: back in LRU order
         if freed:
             self.evicted += len(freed)
             if demote is not None:
@@ -215,6 +262,7 @@ class PrefixIndex:
         blocks = [n.block_id for n in self._nodes.values()]
         self._nodes.clear()
         self._leaves.clear()
+        self._heap = []
         if blocks:
             self._unpin(blocks)
         return len(blocks)

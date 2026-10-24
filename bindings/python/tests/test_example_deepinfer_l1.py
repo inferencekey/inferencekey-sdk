@@ -645,6 +645,278 @@ def test_verify_compares_restored_bytes_with_the_demoted_and_cached_ones() -> No
     assert cached == 0 and cache.l1.counters["l1_verify_failures"] == 1 and not cache.l1.enabled
 
 
+def _recompute_into_l0(engine: SimEngine, cache: "de._RankCache", ids: list) -> list:
+    """Another request recomputes ``ids`` with other bytes (batch nondeterminism),
+    and L0 caches that block with a sampled checksum."""
+    hashes = pc.block_hashes(ids)
+    bm = engine.block_manager
+    blocks = bm.allocate(len(hashes))
+    for block, tag in zip(blocks, sim_llm._block_tags(ids)):
+        bm.kv_tag[block] = tag ^ 1
+    cache.index.insert(hashes, blocks)
+    bm.unpin_blocks(blocks)
+    cache.l1.checksum_l0(hashes, blocks)
+    return blocks
+
+
+def test_verify_never_compares_a_slot_with_another_block_of_the_same_hash() -> None:
+    engine = _engine(kv_blocks=100)
+    cache = _cache(engine)
+    clock = engine.l1_kv_mover.clock = _Clock()
+    l1 = cache.l1
+    ids = _ids(1, 20, 50)
+    _cached_chain(engine, cache, ids)  # turn 1, no checksum sampled
+    _evict_all(cache)
+    clock.t += 1.0
+    cache.tick([])  # demoted unsampled: the slots carry no checksum
+    assert len(l1.entries) == 20 and all(e.checksum is None for e in l1.entries.values())
+    _recompute_into_l0(engine, cache, ids)
+    clock.t += 1.0
+    cache.tick([])
+    assert len(l1.l0_sums) == 20
+    _evict_all(cache)  # L1 already holds these hashes: unpinned, and their L0 sums go with them
+    clock.t += 1.0
+    cache.tick([])
+    assert not l1.l0_sums
+    l1.verify_fraction = 1.0
+    assert _add(engine, cache, "t2", ids + [7] * 400)[0] is de.PROMOTING
+    clock.t += 1.0
+    (_, seq, cached, l1_tokens), = cache.tick([])
+    assert l1.counters["l1_verify_failures"] == 0 and l1.enabled
+    assert cached == 19 * B and l1_tokens == cached and engine.kv_mismatch == 0
+
+
+def test_verify_at_demotion_uses_the_l0_sum_of_the_copied_block_only() -> None:
+    engine = _engine(kv_blocks=100, host_blocks=20)
+    cache = _cache(engine)
+    clock = engine.l1_kv_mover.clock = _Clock()
+    l1 = cache.l1
+    ids = _ids(2, 20, 50)
+    first = _recompute_into_l0(engine, cache, ids)  # block X per hash, sum sampled
+    clock.t += 1.0
+    cache.tick([])
+    assert l1.l0_sums[pc.block_hashes(ids)[0]] == (first[0], engine.block_manager.kv_tag[first[0]])
+    _evict_all(cache)
+    clock.t += 1.0
+    cache.tick([])
+    assert all(e.checksum is not None for e in l1.entries.values())  # the L0 sum of the very block copied
+    # L1 loses the chain (another session takes its slots), and the prefix is
+    # recomputed with other bytes into L0, unsampled this time.
+    _cached_chain(engine, cache, _ids(3, 20, 50))
+    _evict_all(cache)
+    clock.t += 1.0
+    cache.tick([])
+    assert not any(h in l1.entries for h in pc.block_hashes(ids))
+    _cached_chain(engine, cache, ids)
+    l1.verify_fraction = 1.0
+    _evict_all(cache)  # sampled demotion: there is no L0 sum of this block to compare with
+    clock.t += 1.0
+    cache.tick([])
+    assert l1.counters["l1_verify_failures"] == 0 and l1.enabled
+    # A block that does not hold what the prefill wrote into it is still caught.
+    ids4 = _ids(4, 20, 50)
+    blocks4 = _recompute_into_l0(engine, cache, ids4)
+    clock.t += 1.0
+    cache.tick([])
+    engine.block_manager.kv_tag[blocks4[5]] ^= 2
+    _evict_all(cache)
+    clock.t += 1.0
+    cache.tick([])
+    assert l1.counters["l1_verify_failures"] == 1 and not l1.enabled and l1.suspect
+
+
+def test_make_room_counts_only_blocks_their_demotion_will_free() -> None:
+    engine = _engine(kv_blocks=100)
+    cache = _cache(engine)
+    clock = engine.l1_kv_mover.clock = _Clock()
+    l1 = cache.l1
+    ids = _ids(5, 20, 50)
+    _cached_chain(engine, cache, ids)
+    _evict_all(cache)
+    assert l1.pending_d2h_blocks == 20 and l1.freeing_blocks == 20
+    assert _add(engine, cache, "t2", ids + [1] * 300)[0] is de.PROMOTING
+    (_, seq, cached, _), = cache.tick([])  # 19 blocks rescued: L0 and the sequence hold them now
+    assert cached == 19 * B
+    assert l1.pending_d2h_blocks == 20 and l1.freeing_blocks == 1
+    # The sequence ends and L0 evicts the rescued blocks again: their copy unpins them.
+    cache.forget("t2")
+    engine.abort_request("t2")
+    _evict_all(cache)
+    assert l1.freeing_blocks == 20
+    clock.t += 1.0
+    cache.tick([])
+    assert l1.pending_d2h_blocks == 0 and l1.freeing_blocks == 0
+    # A stuck copy may never complete: its blocks are not counted either.
+    engine2 = _engine(kv_blocks=100)
+    cache2 = _cache(engine2, l1_copy_timeout_seconds=0.0)
+    clock2 = engine2.l1_kv_mover.clock = _Clock()
+    _cached_chain(engine2, cache2, ids)
+    _evict_all(cache2)
+    cache2.tick([])
+    assert cache2.l1.counters["l1_stuck"] == 1
+    assert cache2.l1.pending_d2h_blocks == 20 and cache2.l1.freeing_blocks == 0
+    clock2.t += 1.0
+    cache2.tick([])
+    assert cache2.l1.pending_d2h_blocks == 0 and cache2.l1.freeing_blocks == 0
+    assert engine2.block_manager.get_num_free_blocks() == 100
+
+
+def test_a_failing_promotion_start_leaves_nothing_held() -> None:
+    engine = _engine(kv_blocks=100)
+    cache = _cache(engine)
+    clock = engine.l1_kv_mover.clock = _Clock()
+    ids = _ids(6, 20, 50)
+    blocks = _cached_chain(engine, cache, ids)
+    cache.index.evict(12, demote=cache.l1.demote)
+    clock.t += 1.0
+    cache.tick([])
+    bm = engine.block_manager
+
+    def broken(n):
+        raise RuntimeError("allocator broke")
+
+    bm.allocate_nolock = broken
+    with pytest.raises(RuntimeError, match="allocator broke"):
+        _add(engine, cache, "t2", ids + [1] * 300)
+    assert not cache.promoting and not cache.l1.restoring and not cache.index.protected
+    assert all(e.busy == 0 for e in cache.l1.entries.values())
+    assert all(bm.refs[b] == 1 for b in blocks[:8]) and bm.get_num_free_blocks() == 92
+    del bm.allocate_nolock
+    assert cache.tick([]) == []  # nothing left to admit later
+
+
+def test_an_admission_that_raises_after_the_copy_is_reported_and_unprotected() -> None:
+    engine = _engine(kv_blocks=100)
+    cache = _cache(engine)
+    clock = engine.l1_kv_mover.clock = _Clock()
+    ids = _ids(7, 20, 50)
+    _cached_chain(engine, cache, ids)
+    _evict_all(cache)
+    clock.t += 1.0
+    cache.tick([])
+    turn2 = ids + [1] * 300
+
+    def raising(enqueue: bool = True):
+        raise RuntimeError("add_request broke")
+
+    assert cache.add(raising, "t2", turn2, pc.block_hashes(turn2), 4)[0] is de.PROMOTING
+    other = ids[: 6 * B] + [4] * 300  # waits for t2, then is admitted in the same tick
+    assert _add(engine, cache, "t3", other)[0] is de.PROMOTING
+    clock.t += 1.0
+    out = {item[0]: item for item in cache.tick([])}
+    assert out["t2"][:4] == ("t2", None, 0, 0) and "add_request broke" in out["t2"][4]
+    assert out["t3"][1] is not None and out["t3"][2] == 5 * B
+    assert not cache.promoting and "t2" not in cache.live
+    # Only the running t3 protects anything.
+    assert cache.index.protected == {h: 1 for h in cache.live["t3"][2]}
+    assert len(cache.index) == 19  # the restored chain stays for the next turn
+
+
+def test_rank_loop_reports_an_admission_that_raises_after_the_copy() -> None:
+    engine = _engine(kv_blocks=60, host_blocks=500)
+    requests, results, cache, _ = _start_rank(engine)
+    for i in range(6):
+        _run(requests, results, f"s{i}", chr(65 + i) * 2000)
+    original = engine.add_request
+
+    def add_request(**kwargs):
+        if kwargs["request_id"] == "back":
+            raise RuntimeError("add_request broke")
+        return original(**kwargs)
+
+    engine.add_request = add_request
+    requests.put(("add", "back", "A" * 2000 + "z" * 300, {"max_tokens": 8, "session_key": "s"}))
+    deadline = time.time() + 10
+    error = None
+    while error is None:
+        kind, _, payload = results.get(timeout=max(deadline - time.time(), 0.01))
+        if kind == "out":
+            error = next((item for item in payload if item[0] == "back" and item[4]), None)
+    assert "add_request broke" in error[5] and error[6] is None
+    assert cache.l1.counters["l1_promotions"] >= 1  # it went through L1 first
+    assert not cache.promoting and not cache.index.protected
+    engine.add_request = original
+    meta, _ = _run(requests, results, "again", "A" * 2000 + "z" * 300)
+    assert meta[1] == 14 * B
+    requests.put(None)
+
+
+def test_a_disabled_l1_never_unpins_a_block_its_copy_still_reads() -> None:
+    engine = _engine(kv_blocks=100)
+    cache = _cache(engine)
+    clock = engine.l1_kv_mover.clock = _Clock()
+    ids = _ids(8, 20, 50)
+    blocks = _cached_chain(engine, cache, ids)
+    _evict_all(cache)
+    assert _add(engine, cache, "t2", ids + [1] * 300)[0] is de.PROMOTING
+    cache.tick([])  # rescued into L0 while the demotion copy still reads them
+    cache.forget("t2")
+    engine.abort_request("t2")
+    cache.l1.disable("test")
+    _evict_all(cache)
+    bm = engine.block_manager
+    assert len(cache.index) == 0
+    assert all(bm.refs.get(b) == 1 for b in blocks[:19])  # held for the copy
+    bm.allocate(bm.get_num_free_blocks())  # nothing it could hand out is still being read
+    clock.t += 1.0
+    cache.tick([])
+    assert all(e.state == lc.READY and cache.l1.mover.host_tag[e.slot] != sim_llm.POISON
+               for e in cache.l1.entries.values())
+    assert not any(b in bm.refs for b in blocks)
+
+
+def test_eviction_scan_gives_up_when_nothing_is_evictable(monkeypatch) -> None:
+    monkeypatch.setattr(lc.L1, "SCAN_LIMIT", 3)
+    unpinned = []
+    l1 = lc.L1(_FakeMover(capacity=10, polls=100), unpinned.extend)
+    a = pc.block_hashes(_ids(9, 8))
+    l1.demote(a[::-1], list(range(18, 10, -1)), list(range(7, -1, -1)))  # 8 copies in flight
+    b = pc.block_hashes(_ids(10, 4))
+    l1.demote(b[::-1], [23, 22, 21, 20], [3, 2, 1, 0])
+    assert l1.counters["l1_dropped"] == 2 and l1.counters["l1_evicted"] == 0
+    assert sorted(unpinned) == [22, 23]
+
+
+def test_a_disabled_l1_restores_nothing_more() -> None:
+    engine = _engine(kv_blocks=100)
+    cache = _cache(engine, l1_promote_wait_seconds=60.0)
+    clock = engine.l1_kv_mover.clock = _Clock()
+    mover = engine.l1_kv_mover
+    ids = _ids(11, 20, 50)
+    _cached_chain(engine, cache, ids)
+    _evict_all(cache)
+    clock.t += 1.0
+    cache.tick([])
+    held = engine.block_manager.allocate(80)
+    assert _add(engine, cache, "t2", ids + [5] * 300)[0] is de.PROMOTING  # claimed, waiting for blocks
+    assert cache.tick([]) == []
+    cache.l1.disable("verify failure", suspect=True)
+    (_, seq, cached, l1_tokens), = cache.tick([])  # at once, not after l1_promote_wait_seconds
+    assert seq in engine.waiting and cached == 0 and l1_tokens == 0 and mover.copied["h2d"] == 0
+    assert not cache.promoting and not cache.l1.restoring
+    assert all(e.busy == 0 for e in cache.l1.entries.values())
+    engine.block_manager.unpin_blocks(held)
+
+
+def test_an_unchecked_copy_from_a_suspect_l1_is_not_used() -> None:
+    engine = _engine(kv_blocks=100)
+    cache = _cache(engine)
+    clock = engine.l1_kv_mover.clock = _Clock()
+    ids = _ids(12, 20, 50)
+    _cached_chain(engine, cache, ids)
+    _evict_all(cache)
+    clock.t += 1.0
+    cache.tick([])
+    assert _add(engine, cache, "t2", ids + [5] * 300)[0] is de.PROMOTING
+    assert cache.promoting["t2"].ticket is not None and not cache.promoting["t2"].checked
+    cache.l1.disable("verify failure", suspect=True)
+    clock.t += 1.0
+    (_, seq, cached, l1_tokens), = cache.tick([])
+    assert cached == 0 and l1_tokens == 0 and len(cache.index) == 0
+    assert engine.block_manager.get_num_free_blocks() == 100
+    assert all(e.busy == 0 for e in cache.l1.entries.values())
+
+
 def test_without_l1_eviction_is_the_old_behaviour() -> None:
     engine = _engine(kv_blocks=100)
     cache = _cache(engine, l1=False)
@@ -663,6 +935,127 @@ def test_start_l1_turns_itself_off_when_the_engine_lacks_a_mover() -> None:
     assert cache.l1 is None
     cp2 = de._RankCache(0, _engine(kv_blocks=100), {"cp": 2})
     assert cp2.start_l1(1 << 30)["reason"] == "L1 needs context_parallel_size 1"
+
+
+# --- randomized stress ------------------------------------------------------------------------
+
+
+def _stress(seed: int, kv_blocks: int = 120, host_blocks: int = 150, sessions: int = 10, iters: int = 1200,
+            fail: bool = True, timeout: float = 10.0, verify: float = 0.0, max_ticket=None, monkeypatch=None) -> dict:
+    """Random turns, aborts, copy failures (before and after issue), timeouts, index
+    ring splits and L1 eviction over the simulated rank; after draining, every
+    reference and every content tag must balance."""
+    import random
+
+    rng = random.Random(seed)
+    engine = _engine(kv_blocks=kv_blocks, host_blocks=host_blocks)
+    mover = engine.l1_kv_mover
+    if max_ticket:
+        mover.max_ticket_blocks = max_ticket
+    mover.staging_rows = 3
+    clock = mover.clock = _Clock()
+    errors = []
+    print_exc = de.traceback.print_exc
+
+    def record(*args, **kwargs):
+        errors.append(sys.exc_info()[1])
+        print_exc(*args, **kwargs)
+
+    monkeypatch.setattr(de.traceback, "print_exc", record)
+    cache = _cache(engine, l1_copy_timeout_seconds=timeout, l1_verify_fraction=verify,
+                   l1_promote_wait_seconds=0.0)
+    l1 = cache.l1
+    system = [(i * 31) % 4000 for i in range(4 * B)]
+    prompts = {s: system + [(s * 7919 + i) % 4000 for i in range(rng.randint(1, 6) * B + rng.randint(0, 127))]
+               for s in range(sessions)}
+    tag_of = {}
+    live = {}  # request id -> session
+    n = 0
+    for it in range(iters + 400):
+        draining = it >= iters
+        r = rng.random()
+        if not draining and r < 0.25:
+            idle = [s for s in range(sessions) if s not in live.values()]
+            if idle:
+                s = rng.choice(idle)
+                ids = prompts[s] = prompts[s] + [rng.randrange(4000) for _ in range(rng.randint(10, 3 * B))]
+                if len(ids) > 30 * B:
+                    ids = prompts[s] = system + [rng.randrange(4000) for _ in range(rng.randint(1, 4) * B)]
+                for h, tag in zip(pc.block_hashes(ids), sim_llm._block_tags(ids)):
+                    tag_of[h] = tag
+                n += 1
+                mover.fail_before_issue = fail and rng.random() < 0.05
+                mover.fail_after_chunks = 1 if fail and rng.random() < 0.05 else None
+                seq, _ = _add(engine, cache, f"r{n}", ids, max_tokens=rng.randint(1, 6))
+                if seq is not None:
+                    live[f"r{n}"] = s
+        elif not draining and r < 0.30 and live:
+            request_id = rng.choice(list(live))
+            cache.forget(request_id)
+            engine.abort_request(request_id)
+            del live[request_id]
+        if rng.random() < 0.5 or draining:
+            clock.t += rng.choice([0.0, 1e-5, 1e-4, 1e-3, 1.0])
+        mover.fail_before_issue = fail and rng.random() < 0.02
+        mover.fail_after_chunks = 1 if fail and rng.random() < 0.02 else None
+        cache.tick(list(live))
+        mover.fail_before_issue = False
+        mover.fail_after_chunks = None
+        assert l1.freeing_blocks == sum(1 for e in l1.entries.values() if e.freeing())
+        if engine.has_unfinished_requests():
+            for out in engine.step():
+                if out.finished and out.request_id in live:
+                    del live[out.request_id]
+                    cache.forget(out.request_id)
+    for _ in range(20):
+        clock.t += 100
+        cache.tick([])
+        while engine.has_unfinished_requests():
+            engine.step()
+    time.sleep(0.01)  # past l1_copy_timeout_seconds 0: a copy flagged stuck still completes
+    for _ in range(3):
+        clock.t += 100
+        cache.tick([])
+    assert not errors, errors
+    assert engine.kv_mismatch == 0
+    assert not cache.promoting and not l1.demoting and not l1.quarantine and not l1.deferred and not l1.restoring
+    assert l1.pending_d2h_blocks == 0 and l1.freeing_blocks == 0
+    bm = engine.block_manager
+    expected: dict = {}
+    for node in cache.index._nodes.values():
+        expected[node.block_id] = expected.get(node.block_id, 0) + 1
+    assert bm.refs == expected  # exactly one reference per L0 node, nothing leaked or freed twice
+    for h, node in cache.index._nodes.items():
+        assert bm.kv_tag.get(node.block_id) == tag_of[h], "an L0 block holds another hash's content"
+    slots = set()
+    for h, entry in l1.entries.items():
+        assert entry.state == lc.READY and entry.busy == 0 and entry.slot not in slots
+        assert mover.host_tag.get(entry.slot) == tag_of[h], "an L1 slot holds another hash's content"
+        slots.add(entry.slot)
+    assert l1.pool.free + len(l1.entries) == l1.pool.capacity
+    return cache.stats()
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_stress_keeps_every_reference_and_content_tag_balanced(seed, monkeypatch) -> None:
+    stats = _stress(seed, monkeypatch=monkeypatch)
+    assert stats["l1_promotions"] > 0
+
+
+@pytest.mark.parametrize("seed", range(2))
+def test_stress_with_a_tight_host_pool_and_split_copies(seed, monkeypatch) -> None:
+    _stress(seed, kv_blocks=70, host_blocks=40, sessions=14, max_ticket=5, monkeypatch=monkeypatch)
+
+
+@pytest.mark.parametrize("seed", range(2))
+def test_stress_with_verify_on_never_fails_verify(seed, monkeypatch) -> None:
+    stats = _stress(seed, fail=False, verify=1.0, monkeypatch=monkeypatch)
+    assert stats["l1_verify_failures"] == 0 and stats["l1_enabled"]
+
+
+@pytest.mark.parametrize("seed", range(2))
+def test_stress_with_every_copy_timing_out(seed, monkeypatch) -> None:
+    _stress(seed, timeout=0.0, monkeypatch=monkeypatch)
 
 
 # --- the rank loop ------------------------------------------------------------------------

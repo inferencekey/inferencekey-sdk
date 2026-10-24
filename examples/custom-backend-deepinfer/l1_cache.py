@@ -61,7 +61,7 @@ OWNER_L0 = _Owner("L0")
 
 
 class Entry:
-    __slots__ = ("slot", "state", "busy", "gpu_block", "owner", "checksum")
+    __slots__ = ("slot", "state", "busy", "gpu_block", "owner", "checksum", "stuck")
 
     def __init__(self, slot: int, gpu_block: int) -> None:
         self.slot = slot
@@ -69,7 +69,15 @@ class Entry:
         self.busy = 0  # promotion copies reading the slot; never evicted while > 0
         self.gpu_block = gpu_block  # only while WRITING
         self.owner: Any = OWNER_L1  # only while WRITING
-        self.checksum: Optional[int] = None  # source checksum taken by the demotion copy (verify)
+        #: Checksum of the bytes this slot holds (verify): the sampled source sum
+        #: of its own demotion copy, else the L0 sum of the very GPU block it was
+        #: copied from. Never a sum of another block cached under the same hash.
+        self.checksum: Optional[int] = None
+        self.stuck = False  # its demotion copy is flagged stuck: not counted as freeing
+
+    def freeing(self) -> bool:
+        """Its GPU block returns to the free list when its demotion copy completes."""
+        return self.state == WRITING and self.owner is OWNER_L1 and not self.stuck
 
 
 class HostPool:
@@ -187,12 +195,18 @@ class L1:
 
     #: Stuck copies after which L1 stops taking new work for the rest of the run.
     MAX_STUCK = 3
+    #: Entries an eviction scan skips (in flight or in use) before it gives up:
+    #: they gather at the recent end, so a long run of them means nothing is evictable.
+    SCAN_LIMIT = 4096
 
     def __init__(self, mover: Any, unpin: Callable[[List[int]], None], *, rank: int = 0,
                  verify_fraction: float = 0.0, copy_timeout: float = 10.0,
-                 rng: Optional[random.Random] = None) -> None:
+                 rng: Optional[random.Random] = None,
+                 l0_block: Optional[Callable[[bytes], Optional[int]]] = None) -> None:
         self.mover = mover
         self.unpin = unpin
+        #: The GPU block L0 caches a hash in (``PrefixIndex.block_of``), or None.
+        self.l0_block = l0_block
         self.rank = rank
         self.bytes_per_block = int(mover.bytes_per_block)
         self.pool = HostPool(int(mover.capacity_slots))
@@ -209,11 +223,17 @@ class L1:
         self.rng = rng or random.Random(0)
         self.enabled = True
         self.disabled_reason = ""
+        self.suspect = False  # disabled by a verify failure: host contents are not trusted
         self.stuck = 0
-        #: Checksums of blocks as the prefill wrote them (sampled), by hash.
-        self.l0_sums: "OrderedDict[bytes, int]" = OrderedDict()
-        self.l0_sum_tickets: List[Tuple[Any, List[bytes]]] = []
-        self.pending_d2h_blocks = 0
+        #: Checksums of blocks as the prefill wrote them (sampled), by hash: (GPU
+        #: block, sum), valid while L0 holds that block for the hash (dropped when
+        #: L0 evicts it), so a sum is never compared with another block's bytes.
+        self.l0_sums: "OrderedDict[bytes, Tuple[int, int]]" = OrderedDict()
+        self.l0_sum_tickets: List[Tuple[Any, List[bytes], List[int]]] = []
+        self.pending_d2h_blocks = 0  # blocks with a demotion copy in flight or deferred (stats)
+        #: Blocks the scheduler gets back when their demotion copies complete: entries
+        #: still WRITING, owned by L1 (not rescued or adopted again), not stuck.
+        self.freeing_blocks = 0
         self.h2d_ms: Deque[float] = deque(maxlen=2048)
         self.d2h_ms: Deque[float] = deque(maxlen=2048)
         self._window = {"h2d_bytes": 0, "h2d_s": 0.0, "d2h_bytes": 0, "d2h_s": 0.0}
@@ -230,11 +250,21 @@ class L1:
     def sample(self) -> bool:
         return self.verify_fraction > 0 and self.rng.random() < self.verify_fraction
 
-    def disable(self, reason: str) -> None:
+    def disable(self, reason: str, suspect: bool = False) -> None:
+        """Stop taking new work; ``suspect`` when the host contents may be wrong
+        (verify failure), so nothing more is restored from them."""
+        if suspect:
+            self.suspect = True
         if self.enabled:
             self.enabled = False
             self.disabled_reason = reason
             self.log(f"L1 disabled: {reason}")
+
+    def set_owner(self, entry: Entry, owner: Any) -> None:
+        """Change who holds a ``WRITING`` entry's GPU block, keeping ``freeing_blocks``."""
+        before = entry.freeing()
+        entry.owner = owner
+        self.freeing_blocks += entry.freeing() - before
 
     def _touch_chain(self, hashes: Sequence[bytes]) -> None:
         """Mark a chain used, deepest first, so the block next to the L0 boundary is
@@ -250,12 +280,17 @@ class L1:
         if short > 0:
             victims: List[bytes] = []
             freed: List[int] = []
+            skipped = 0
             for h, entry in self.entries.items():
                 if len(freed) >= short:
                     break
                 if entry.state == READY and entry.busy == 0 and h not in self.restoring:
                     victims.append(h)
                     freed.append(entry.slot)
+                else:
+                    skipped += 1
+                    if skipped > self.SCAN_LIMIT:
+                        break  # the rest is dropped (l1_dropped) instead of scanning every entry
             for h in victims:
                 del self.entries[h]
             if freed:
@@ -268,24 +303,38 @@ class L1:
     def demote(self, hashes: List[bytes], gpu_ids: List[int], depths: List[int]) -> None:
         """L0 evicted these leaves and passed their pins here: copy them to host
         slots and unpin each block once its copy completed (or right away when
-        no copy is needed)."""
+        no copy is needed). Also called when L1 is disabled: a block whose
+        demotion copy still reads it is then left to that copy, never unpinned
+        early."""
+        entries = self.entries
+        l0_sums = self.l0_sums
         if not self.enabled:
-            self.unpin(list(gpu_ids))
+            unpin_off: List[int] = []
+            for h, block in zip(hashes, gpu_ids):
+                l0_sums.pop(h, None)
+                entry = entries.get(h)
+                if entry is not None and entry.state == WRITING and entry.gpu_block == block:
+                    self.set_owner(entry, OWNER_L1)  # its copy unpins it when it completes
+                else:
+                    unpin_off.append(block)
+            if unpin_off:
+                self.unpin(unpin_off)
             return
         unpin_now: List[int] = []
-        need: List[Tuple[int, bytes, int]] = []
-        entries = self.entries
+        need: List[Tuple[int, bytes, int, Optional[int]]] = []
         for h, block, depth in zip(hashes, gpu_ids, depths):
+            # L0 no longer holds this block for the hash: its sum goes with it.
+            known = l0_sums.pop(h, None)
             entry = entries.get(h)
             if entry is None:
-                need.append((depth, h, block))
+                need.append((depth, h, block, known[1] if known is not None and known[0] == block else None))
             elif entry.state == READY:
                 unpin_now.append(block)  # inclusive L1: the host copy is still there
                 self.counters["l1_demote_skipped"] += 1
             elif entry.gpu_block == block:
                 # A promotion put this block back into L0 while its own demotion
                 # copy still reads it: that copy unpins it when it completes.
-                entry.owner = OWNER_L1
+                self.set_owner(entry, OWNER_L1)
                 self.counters["l1_demote_skipped"] += 1
             else:
                 unpin_now.append(block)  # another block with the same content is being copied
@@ -295,7 +344,7 @@ class L1:
             if len(slots) < len(need):
                 # Keep the shallowest blocks: a continuation must start at the L0 boundary.
                 need.sort(key=lambda item: item[0])
-                for _, _, block in need[len(slots):]:
+                for _, _, block, _ in need[len(slots):]:
                     unpin_now.append(block)
                 self.counters["l1_dropped"] += len(need) - len(slots)
                 need = need[: len(slots)]
@@ -304,14 +353,18 @@ class L1:
         if unpin_now:
             self.unpin(unpin_now)
 
-    def _copy_out(self, need: List[Tuple[int, bytes, int]], slots: List[int], unpin_now: List[int]) -> None:
+    def _copy_out(self, need: List[Tuple[int, bytes, int, Optional[int]]], slots: List[int],
+                  unpin_now: List[int]) -> None:
         # Deepest first into the LRU, so the shallowest is the most recent.
         order = sorted(range(len(need)), key=lambda i: -need[i][0])
         hashes = [need[i][1] for i in order]
         blocks = [need[i][2] for i in order]
-        for h, block, slot in zip(hashes, blocks, slots):
-            self.entries[h] = Entry(slot, block)
+        for i, h, block, slot in zip(order, hashes, blocks, slots):
+            entry = Entry(slot, block)
+            entry.checksum = need[i][3]  # the L0 sum of this very block, if one was sampled
+            self.entries[h] = entry
         self.pending_d2h_blocks += len(blocks)
+        self.freeing_blocks += len(blocks)
         step = self.max_ticket or len(blocks)
         for i in range(0, len(blocks), step):
             self._issue_d2h(hashes[i : i + step], blocks[i : i + step], slots[i : i + step], unpin_now)
@@ -333,6 +386,8 @@ class L1:
             mine = []
             for h, block in zip(hashes, blocks):
                 entry = self.entries.pop(h, None)
+                if entry is not None and entry.freeing():
+                    self.freeing_blocks -= 1
                 if entry is None or entry.owner is OWNER_L1:
                     mine.append(block)
             partial = getattr(exc, "ticket", None)
@@ -377,6 +432,7 @@ class L1:
                 else:
                     if not copy.warned and time.monotonic() - copy.t0 > self.copy_timeout:
                         copy.warned = True
+                        self._mark_stuck(copy)
                         self._stuck(len(copy.gpu_ids), "device to host")
                     still.append(copy)
             self.demoting = still
@@ -392,16 +448,19 @@ class L1:
             self.quarantine = still_q
         if self.l0_sum_tickets:
             still_s = []
-            for ticket, hashes in self.l0_sum_tickets:
+            l0_block = self.l0_block
+            for ticket, hashes, blocks in self.l0_sum_tickets:
                 if mover.done(ticket):
                     sums = mover.checksums(ticket) or []
-                    for h, s in zip(hashes, sums):
-                        self.l0_sums[h] = s
+                    for h, block, s in zip(hashes, blocks, sums):
+                        if l0_block is not None and l0_block(h) != block:
+                            continue  # L0 evicted it meanwhile: the sum would outlive the block
+                        self.l0_sums[h] = (block, s)
                         self.l0_sums.move_to_end(h)
                     while len(self.l0_sums) > max(4 * self.pool.capacity, 1 << 16):
                         self.l0_sums.popitem(last=False)
                 else:
-                    still_s.append((ticket, hashes))
+                    still_s.append((ticket, hashes, blocks))
             self.l0_sum_tickets = still_s
         if self.deferred:
             self._retry_deferred()
@@ -415,17 +474,20 @@ class L1:
             if entry is None or entry.slot != slot or entry.state != WRITING:
                 continue  # cannot happen: WRITING entries are never evicted or dropped
             owner = entry.owner
+            if entry.freeing():
+                self.freeing_blocks -= 1
             entry.state = READY
             entry.gpu_block = -1
             entry.owner = None
             if sums is not None:
+                # entry.checksum, when set, is the L0 sum of this same GPU block.
+                expected = entry.checksum
                 entry.checksum = sums[i]
-                expected = self.l0_sums.get(h)
                 if expected is not None and expected != sums[i]:
                     self.counters["l1_verify_failures"] += 1
-                    self.log(f"L1 verify FAILED at demotion: block {block} does not hold what L0 cached "
-                             "for its hash (L0 maps the hash to the wrong block)")
-                    self.disable("verify failure")
+                    self.log(f"L1 verify FAILED at demotion: block {block} does not hold what the prefill "
+                             "wrote into it for its hash")
+                    self.disable("verify failure", suspect=True)
             if owner is OWNER_L1:
                 unpin.append(block)
             # OWNER_L0 or a promotion: the block's reference stays where it is.
@@ -444,6 +506,15 @@ class L1:
             entry = self.entries.get(h)
             if entry is not None and entry.busy > 0:
                 entry.busy -= 1
+
+    def _mark_stuck(self, copy: _Copy) -> None:
+        """A stuck demotion may never complete: stop counting its blocks as freeing."""
+        for h, slot in zip(copy.hashes, copy.slots):
+            entry = self.entries.get(h)
+            if entry is not None and entry.slot == slot and entry.state == WRITING and not entry.stuck:
+                before = entry.freeing()
+                entry.stuck = True
+                self.freeing_blocks -= before
 
     def quarantine_copy(self, ticket: Any, unpin: List[int], slots: List[int], unbusy: List[bytes]) -> None:
         self.quarantine.append(_Quarantine(ticket, unpin, slots, unbusy))
@@ -471,7 +542,7 @@ class L1:
         except Exception as exc:  # noqa: BLE001 (verification is best effort)
             self.log(f"L1 checksum of {len(gpu_ids)} L0 blocks failed: {exc}")
             return
-        self.l0_sum_tickets.append((ticket, list(hashes)))
+        self.l0_sum_tickets.append((ticket, list(hashes), [int(b) for b in gpu_ids]))
 
     # --- promotion primitives (driven by _RankCache) -----------------------------------------
 
@@ -507,7 +578,7 @@ class L1:
                 self.unclaim(request_id, hashes[:i], first, h2d, rescued)
                 return None
             if entry.state == WRITING:
-                entry.owner = request_id
+                self.set_owner(entry, request_id)
                 rescued.append((first + i, entry.gpu_block))
             else:
                 entry.busy += 1
@@ -525,7 +596,7 @@ class L1:
             h = hashes[pos - first]
             entry = self.entries.get(h)
             if entry is not None and entry.state == WRITING and entry.owner == request_id:
-                entry.owner = OWNER_L1
+                self.set_owner(entry, OWNER_L1)
             else:
                 unpin.append(block)
         if not keep_busy:
@@ -549,11 +620,11 @@ class L1:
             writing = entry is not None and entry.state == WRITING and entry.owner == request_id
             if block in dropped:
                 if writing:
-                    entry.owner = OWNER_L1  # its demotion copy unpins it when done
+                    self.set_owner(entry, OWNER_L1)  # its demotion copy unpins it when done
                 else:
                     unpin.append(block)
             elif writing:
-                entry.owner = OWNER_L0  # L0 holds the reference; the copy just completes
+                self.set_owner(entry, OWNER_L0)  # L0 holds the reference; the copy just completes
         for pos, _ in h2d:
             entry = self.entries.get(hashes[pos - first])
             if entry is not None and entry.busy > 0:
@@ -565,12 +636,14 @@ class L1:
         return unpin
 
     def entry_sums(self, hashes: Sequence[bytes]) -> List[Optional[int]]:
-        """The source checksums stored at demotion, else the L0 checksums, per hash."""
+        """The checksum of what each hash's slot holds (``Entry.checksum``), or None.
+
+        Only the entry's own sums: ``l0_sums`` may describe another block computed
+        for the same hash (batch nondeterminism gives other bytes)."""
         out: List[Optional[int]] = []
         for h in hashes:
             entry = self.entries.get(h)
-            value = entry.checksum if entry is not None else None
-            out.append(value if value is not None else self.l0_sums.get(h))
+            out.append(entry.checksum if entry is not None else None)
         return out
 
     # --- stats ------------------------------------------------------------------------
@@ -591,6 +664,7 @@ class L1:
             "l1_pinned_bytes": self.pool.capacity * self.bytes_per_block,
             "l1_tokens_capacity": self.pool.capacity * BLOCK,
             "l1_pending_d2h_blocks": self.pending_d2h_blocks,
+            "l1_freeing_blocks": self.freeing_blocks,
             "l1_quarantined_blocks": q_blocks,
             "l1_quarantined_slots": q_slots,
             "l1_h2d_ms_p50": round(h2d[0], 3), "l1_h2d_ms_p99": round(h2d[1], 3), "l1_h2d_ms_max": round(h2d[2], 3),
