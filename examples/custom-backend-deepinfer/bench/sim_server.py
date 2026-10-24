@@ -54,6 +54,10 @@ def build_config(args: argparse.Namespace) -> dict:
         "decode_ctx_beta": args.decode_ctx_beta,
         "tokenizer": "fake" if args.fake_tokenizer else "hf",
         "stats_path": args.stats_path,
+        "l1_pcie_gbps": args.l1_pcie_gbps,
+        "l1_copy_latency_us": args.l1_copy_latency_us,
+        "l1_bytes_per_block": args.l1_bytes_per_block,
+        "l1_host_blocks": args.l1_host_blocks,
     }
     if not args.no_lockstep and args.dp > 1:
         sim["barrier"] = ctx.Barrier(args.dp)
@@ -85,6 +89,16 @@ def main() -> None:
                         help="prompt tokens per second per rank (0: prefill is free)")
     parser.add_argument("--kv-blocks", type=int, default=0,
                         help="KV cache blocks of 128 tokens per rank (0: unlimited)")
+    parser.add_argument("--l1-pcie-gbps", type=float, default=0.0,
+                        help="simulated host link bandwidth per direction for the L1 host cache, GB/s "
+                             "(0: the ranks have no KV mover, so L1 stays off)")
+    parser.add_argument("--l1-copy-latency-us", type=float, default=10.0,
+                        help="fixed latency of every simulated L1 copy, microseconds")
+    parser.add_argument("--l1-bytes-per-block", type=int, default=114048,
+                        help="bytes of one KV block (full DeepSeek-V4.1-Flash: 114048)")
+    parser.add_argument("--l1-host-blocks", type=int, default=0,
+                        help="L1 host slots per rank (0: from the backend's host budget, l1_host_gb capped "
+                             "by this machine's memory)")
     parser.add_argument("--decode-ctx-beta", type=float, default=0.0,
                         help="extra seconds per decode step per token of context in the batch")
     parser.add_argument("--tokenizer-dir", default=os.environ.get("BENCH_TOKENIZER_DIR", ""),

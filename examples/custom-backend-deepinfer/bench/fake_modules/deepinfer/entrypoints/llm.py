@@ -30,6 +30,20 @@ prompt and ``max_tokens`` fit in the free blocks and the pool is under the
 90 % prefill watermark; otherwise it waits. ``decode_ctx_beta`` adds that many seconds per
 step for every token of context in the running batch (attention cost).
 
+Host tier (``l1_pcie_gbps`` > 0): ``SimEngine.l1_kv_mover`` is a
+:class:`SimKVMover`, the stand-in for the backend's ``TorchKVMover``: a host
+pool of slots and one link per direction with a bandwidth and a per-copy
+latency, so a copy takes simulated time and the backend must wait for it. To
+catch ordering bugs without a GPU, the rank keeps a content tag per block (a
+chained crc32 of the prompt tokens up to the end of the block, written when
+the prefill finishes): a block is poisoned when it is allocated or freed, a
+device-to-host copy reads the tags of its source blocks only when it
+completes, a host-to-device copy poisons its destination blocks when issued
+and writes them only when it completes, and ``add_sequence_with_prefix``
+counts every reused block whose tag does not match the sequence's own tokens
+(``kv_mismatch``). An early unpin, an early admission or any hash, slot or
+block mix-up shows up there.
+
 Every ``stats_interval_s`` the rank appends one JSON line with its counters to
 ``<stats_path>.rank<N>`` so the load driver can compare what the ranks produce
 with what the clients receive.
@@ -41,8 +55,9 @@ import json
 import time
 import types
 import zlib
+from array import array
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Sequence
 
 from deepinfer._C.engine import RequestOutput
 
@@ -61,11 +76,24 @@ _PASSAGE = (
 
 BLOCK = 128
 PREFILL_WATERMARK = 0.9
+POISON = -1  # the content tag of a block nobody wrote (fresh, freed, or a copy still in flight)
+
+
+def _block_tags(token_ids: Any) -> List[int]:
+    """Content tag of each full prompt block: a crc32 chained over the tokens up to its end."""
+    data = token_ids.tobytes() if hasattr(token_ids, "tobytes") else array("i", token_ids).tobytes()
+    step = BLOCK * 4
+    tags: List[int] = []
+    crc = 0
+    for start in range(0, len(data) - step + 1, step):
+        crc = zlib.crc32(data[start : start + step], crc)
+        tags.append(crc)
+    return tags
 
 
 class _Seq:
     __slots__ = ("request_id", "prompt_len", "prefill_left", "max_tokens", "generated", "offset",
-                 "block_table", "num_cached_tokens", "engine")
+                 "block_table", "num_cached_tokens", "engine", "token_ids", "_tags")
 
     @property
     def status(self) -> str:
@@ -81,16 +109,31 @@ class _Seq:
         self.block_table: List[int] = []
         self.num_cached_tokens = 0
         self.engine: Any = None
+        self.token_ids: Any = None  # kept only when the engine tracks content tags
+        self._tags: Optional[List[int]] = None
+
+    def tags(self) -> List[int]:
+        if self._tags is None:
+            self._tags = _block_tags(self.token_ids) if self.token_ids is not None else []
+        return self._tags
 
 
 class _BlockManager:
-    """Refcounted block ids; ids are handed out lazily so a huge pool costs nothing."""
+    """Refcounted block ids; ids are handed out lazily so a huge pool costs nothing.
+
+    ``kv_tag`` holds the content tag of every written block (absent = poisoned).
+    ``lock`` / ``unlock`` / ``allocate_nolock`` mirror the real block manager:
+    ``allocate_nolock`` has no free check and raises halfway when the free list
+    runs dry, keeping the blocks it already took (the real one leaks them too).
+    """
 
     def __init__(self, num_blocks: int) -> None:
         self.num_blocks = num_blocks
         self.refs: Dict[int, int] = {}
         self.released: List[int] = []
-        self.next_fresh = 0
+        self.next_fresh = 1  # block 0 is never handed out, as in DeepInfer
+        self.kv_tag: Dict[int, int] = {}
+        self.locked = False
 
     def get_num_free_blocks(self) -> int:
         return self.num_blocks - len(self.refs)
@@ -98,13 +141,34 @@ class _BlockManager:
     def allocate(self, n: int) -> List[int]:
         out = []
         for _ in range(n):
-            if self.released:
-                block = self.released.pop()
-            else:
-                block = self.next_fresh
-                self.next_fresh += 1
-            self.refs[block] = 1
-            out.append(block)
+            out.append(self._take())
+        return out
+
+    def _take(self) -> int:
+        if self.released:
+            block = self.released.pop()
+        else:
+            block = self.next_fresh
+            self.next_fresh += 1
+        self.refs[block] = 1
+        self.kv_tag.pop(block, None)
+        return block
+
+    def lock(self) -> None:
+        assert not self.locked, "block manager lock re-entered"
+        self.locked = True
+
+    def unlock(self) -> None:
+        assert self.locked, "unlock without lock"
+        self.locked = False
+
+    def allocate_nolock(self, n: int) -> List[int]:
+        assert self.locked, "allocate_nolock without the lock"
+        out = []
+        for _ in range(n):
+            if self.get_num_free_blocks() <= 0:
+                raise RuntimeError("no free KV blocks")  # like TORCH_CHECK(_head != 0); taken blocks leak
+            out.append(self._take())
         return out
 
     def pin_blocks(self, block_ids: List[int]) -> None:
@@ -118,6 +182,7 @@ class _BlockManager:
                 self.refs[block] = n
             else:
                 del self.refs[block]
+                self.kv_tag.pop(block, None)  # a freed block's bytes are fair game
                 self.released.append(block)
 
 
@@ -129,6 +194,13 @@ class _Scheduler:
     def add_sequence_with_prefix(self, seq: _Seq, blocks: Any, num_cached: int, swa_valid_start: int) -> None:
         blocks = [int(b) for b in blocks]
         assert len(blocks) == num_cached // BLOCK, (len(blocks), num_cached)
+        engine = self.engine
+        if engine.kv_tags:
+            tags, kv_tag = seq.tags(), engine.block_manager.kv_tag
+            bad = sum(1 for i, b in enumerate(blocks) if i >= len(tags) or kv_tag.get(b, POISON) != tags[i])
+            if bad:
+                engine.kv_mismatch += bad
+                engine.kv_mismatch_requests += 1
         self.engine.block_manager.pin_blocks(blocks)
         seq.block_table = blocks
         seq.num_cached_tokens = num_cached
@@ -173,6 +245,14 @@ class SimEngine:
         kv_blocks = int(sim.get("kv_blocks", 0)) or 1 << 40
         self.block_manager = _BlockManager(kv_blocks)
         self.cache_config = types.SimpleNamespace(num_gpu_blocks=kv_blocks, block_size=BLOCK)
+        gbps = float(sim.get("l1_pcie_gbps", 0.0))
+        self.kv_tags = bool(gbps > 0 or sim.get("kv_tags"))
+        self.kv_mismatch = 0
+        self.kv_mismatch_requests = 0
+        self.l1_kv_mover = (SimKVMover(self, gbps, float(sim.get("l1_copy_latency_us", 10.0)),
+                                       int(sim.get("l1_bytes_per_block", 114048)),
+                                       host_blocks=int(sim.get("l1_host_blocks", 0)))
+                            if gbps > 0 else None)
         self.scheduler = _Scheduler(self)
         self.hit_tokens = 0
         self.prompt_tokens = 0
@@ -198,6 +278,8 @@ class SimEngine:
         offset = zlib.crc32(request_id.encode()) % len(self.token_ids)
         seq = _Seq(request_id, len(prompt_token_ids), sampling_params.max_tokens, offset)
         seq.engine = self
+        if self.kv_tags:
+            seq.token_ids = prompt_token_ids
         self.prompt_tokens += seq.prompt_len
         if enqueue:
             self.waiting.append(seq)
@@ -266,6 +348,8 @@ class SimEngine:
             seq.prefill_left -= take
             prefill_tokens += take
             if seq.prefill_left == 0:
+                if self.kv_tags:
+                    self._write_tags(seq)
                 # The step that finishes a prompt samples its first token.
                 if not self._emit(seq, outputs, first=True):
                     still_running.append(seq)
@@ -311,6 +395,12 @@ class SimEngine:
 
     # --- helpers --------------------------------------------------------------
 
+    def _write_tags(self, seq: _Seq) -> None:
+        """The prefill wrote the KV of the prompt blocks it computed."""
+        tags, table, kv_tag = seq.tags(), seq.block_table, self.block_manager.kv_tag
+        for i in range(seq.num_cached_tokens // BLOCK, min(len(tags), len(table))):
+            kv_tag[table[i]] = tags[i]
+
     def _emit(self, seq: _Seq, outputs: List[RequestOutput], first: bool = False) -> bool:
         """Append this step's tokens of ``seq``; True when it finished."""
         n = 1 if first else self.tokens_per_step
@@ -338,10 +428,150 @@ class SimEngine:
             "prefilled": self.prefilled, "running": len(self.running),
             "prefilling": len(self.prefilling), "waiting": len(self.waiting),
             "free_blocks": self.block_manager.get_num_free_blocks(), "hit_tokens": self.hit_tokens,
-            "prompt_tokens": self.prompt_tokens,
+            "prompt_tokens": self.prompt_tokens, "kv_mismatch": self.kv_mismatch,
         }
+        if self.l1_kv_mover is not None:
+            line.update(self.l1_kv_mover.counters())
         with open(f"{self.stats_path}.rank{self.rank}", "a", encoding="utf-8") as fh:
             fh.write(json.dumps(line) + "\n")
+
+
+class SimPartialIssue(Exception):
+    """Like ``kv_mover.PartialIssue``: part of the copy is queued; ``.ticket`` completes later."""
+
+    def __init__(self, ticket: "_SimTicket") -> None:
+        super().__init__("simulated copy failure after the first chunks")
+        self.ticket = ticket
+
+
+class _SimTicket:
+    __slots__ = ("kind", "src", "dst", "t_issue", "t_done", "applied", "sums", "want_sums")
+
+    def __init__(self, kind: str, src: List[int], dst: List[int], t_issue: float, t_done: float,
+                 want_sums: bool) -> None:
+        self.kind = kind
+        self.src = src
+        self.dst = dst
+        self.t_issue = t_issue
+        self.t_done = t_done
+        self.applied = False
+        self.sums: Optional[List[int]] = None
+        self.want_sums = want_sums
+
+
+class SimKVMover:
+    """Simulated ``KVMover``: a host pool of tagged slots and one link per direction.
+
+    A ticket of ``n`` blocks completes at ``max(now, link free) + latency + n *
+    bytes_per_block / bandwidth`` and keeps the link busy until then. ``done()``
+    compares with ``clock()`` and, the first time it returns True, applies the
+    copy: the content tags move only at completion (see the module docstring).
+    Test hooks: ``fail_before_issue`` (raise before anything is queued) and
+    ``fail_after_chunks`` (raise :class:`SimPartialIssue` after that many chunks
+    of ``staging_rows`` blocks, whose copy still completes later).
+    """
+
+    def __init__(self, engine: "SimEngine", gbps: float, latency_us: float, bytes_per_block: int,
+                 host_blocks: int = 0, staging_rows: int = 588) -> None:
+        self.engine = engine
+        self.gbps = gbps
+        self.latency = latency_us * 1e-6
+        self.bytes_per_block = bytes_per_block
+        self.host_blocks = host_blocks
+        self.staging_rows = staging_rows
+        self.capacity_slots = 0
+        self.host_tag: Dict[int, int] = {}
+        self.link_free = {"d2h": 0.0, "h2d": 0.0}
+        self.clock = time.perf_counter
+        self.fail_before_issue = False
+        self.fail_after_chunks: Optional[int] = None
+        self.copied = {"d2h": 0, "h2d": 0}
+
+    def pin_host(self, nbytes: int) -> int:
+        self.capacity_slots = self.host_blocks or max(0, int(nbytes) // self.bytes_per_block)
+        return self.capacity_slots
+
+    def _check(self, gpu_ids: Sequence[int], slots: Optional[Sequence[int]]) -> None:
+        if self.fail_before_issue:
+            raise RuntimeError("simulated copy failure before issue")
+        if slots is not None and len(slots) != len(gpu_ids):
+            raise ValueError("blocks and slots differ in length")
+        num = self.engine.block_manager.num_blocks
+        for b in gpu_ids:
+            if not 0 < b <= num:  # ids 1..num_blocks (block 0 is never handed out)
+                raise ValueError(f"GPU block {b} out of range")
+        for s in slots or ():
+            if not 0 <= s < self.capacity_slots:
+                raise ValueError(f"host slot {s} out of range")
+
+    def _issue(self, kind: str, src: List[int], dst: List[int], want_sums: bool) -> _SimTicket:
+        direction = "h2d" if kind == "h2d" else "d2h"
+        n = len(src)
+        partial = (self.fail_after_chunks is not None and n > self.fail_after_chunks * self.staging_rows)
+        if partial:
+            n = self.fail_after_chunks * self.staging_rows
+            src, dst = src[:n], dst[:n]
+        now = self.clock()
+        cost = self.latency + (n * self.bytes_per_block / (self.gbps * 1e9) if kind != "sum" else 0.0)
+        t_done = max(now, self.link_free[direction]) + cost
+        self.link_free[direction] = t_done
+        ticket = _SimTicket(kind, src, dst, now, t_done, want_sums)
+        if kind == "h2d":
+            kv_tag = self.engine.block_manager.kv_tag
+            for b in dst:
+                kv_tag.pop(b, None)  # the destination holds garbage until the copy lands
+        if partial:
+            raise SimPartialIssue(ticket)
+        return ticket
+
+    def d2h(self, gpu_ids: Sequence[int], slots: Sequence[int], checksum: bool = False) -> _SimTicket:
+        self._check(gpu_ids, slots)
+        return self._issue("d2h", [int(b) for b in gpu_ids], [int(s) for s in slots], checksum)
+
+    def h2d(self, slots: Sequence[int], gpu_ids: Sequence[int], checksum: bool = False) -> _SimTicket:
+        self._check(gpu_ids, slots)
+        return self._issue("h2d", [int(s) for s in slots], [int(b) for b in gpu_ids], checksum)
+
+    def checksum_blocks(self, gpu_ids: Sequence[int]) -> _SimTicket:
+        self._check(gpu_ids, None)
+        return self._issue("sum", [int(b) for b in gpu_ids], [], True)
+
+    def done(self, ticket: _SimTicket) -> bool:
+        if ticket.applied:
+            return True
+        if self.clock() < ticket.t_done:
+            return False
+        ticket.applied = True
+        kv_tag = self.engine.block_manager.kv_tag
+        if ticket.kind == "d2h":
+            sums = [kv_tag.get(b, POISON) for b in ticket.src]
+            for s, tag in zip(ticket.dst, sums):
+                self.host_tag[s] = tag
+        elif ticket.kind == "h2d":
+            sums = [self.host_tag.get(s, POISON) for s in ticket.src]
+            for b, tag in zip(ticket.dst, sums):
+                if tag == POISON:
+                    kv_tag.pop(b, None)
+                else:
+                    kv_tag[b] = tag
+        else:
+            sums = [kv_tag.get(b, POISON) for b in ticket.src]
+        if ticket.kind != "sum":
+            self.copied["h2d" if ticket.kind == "h2d" else "d2h"] += len(ticket.src)
+        ticket.sums = sums
+        return True
+
+    def checksums(self, ticket: _SimTicket) -> Optional[List[int]]:
+        return ticket.sums if ticket.want_sums else None
+
+    def elapsed(self, ticket: _SimTicket) -> float:
+        return ticket.t_done - ticket.t_issue
+
+    def counters(self) -> Dict[str, int]:
+        return {"l1_sim_d2h_blocks": self.copied["d2h"], "l1_sim_h2d_blocks": self.copied["h2d"]}
+
+    def close(self) -> None:
+        pass
 
 
 class LLM:
