@@ -16,6 +16,8 @@ calls and usage. The workload's `/v1/chat/completions` and Anthropic
 | `deepinfer_backend.py` | `DeepInferBackend`: implements `chat()` / `chat_stream()`. Maps OpenAI messages and tools to the DeepSeek-V4.1 prompt, streams reasoning and text, parses DSML tool calls back into OpenAI `tool_calls`, reports usage. |
 | `deepinfer_engines.py` | `DeepInferEngine` (one process per data-parallel rank, each with a DeepInfer `LLM`, plus a session-affinity router) and `FakeEngine` (deterministic, no GPU). |
 | `prefix_cache.py` | The GPU prefix cache of one rank: chain hashes of 128-token blocks, the index of cached blocks and its LRU eviction (pure Python, no torch). |
+| `l1_cache.py` | The host RAM tier of the prefix cache: chain hash to host slot, LRU, demotions in flight, quarantine (pure Python, no torch). |
+| `kv_mover.py` | Copies KV blocks between the GPU and pinned host memory: the mover interface and `TorchKVMover` (PyTorch, side streams, events). |
 | `dsv41_encoding.py` | The model's official prompt encoder and completion parser, vendored unmodified from the model repository (MIT, `LICENSE-dsv41-encoding.txt`). |
 
 Per request: the OpenAI request becomes a DeepSeek-V4.1 prompt (tools on the
@@ -130,6 +132,60 @@ ships DeepInfer built with it (`patches/deepinfer-prefix-cache.patch`, and
 `rebuild-deepinfer-C.sh` to apply it to another tree). Without it, set
 `prefix_cache: false`.
 
+## L1 host cache
+
+HBM does not hold the KV of hundreds of long agent sessions (400 sessions of
+340K tokens need about 120 GB of KV, a 4x B200 node has about 100M tokens of
+KV pool). When the GPU cache (L0) has to evict an idle session, the L1 host
+cache keeps a copy of its blocks in pinned host RAM, and the session's next
+turn copies them back (about 18 ms for a 1M-token session at 50 GB/s) instead
+of recomputing them (seconds of prefill that stall every rank). With
+`l1_cache` on (the default):
+
+- All paged KV of a rank is one GPU tensor (`cache_engine.gpu_blocks`, one row
+  per block, about 111 KiB per block for the full model), so a block moves as
+  one row. Nothing else is saved: bounded replay recomputes the last cached
+  block with a zeroed state slot, as for an L0 hit.
+- Demotion: the blocks L0 evicts are copied to host slots on a side stream,
+  and stay pinned on the GPU until the copy completed (events polled between
+  engine steps). A block that is already in L1 is just unpinned (L1 is
+  inclusive: a promoted block keeps its host copy).
+- Promotion: when a prompt's L0 hit continues in L1, the rank allocates fresh
+  GPU blocks, copies the host rows into them, puts the restored chain back
+  into L0, and only then gives the request to the engine, reusing the whole
+  hit. `usage.prompt_tokens_details.cached_tokens` counts L0 and L1 tokens.
+  Continuations shorter than `l1_min_promote_blocks` are recomputed; a
+  promotion that waits more than `l1_promote_wait_seconds` for free GPU
+  blocks falls back to recompute.
+- Failures never break the engine step: a copy that cannot be issued falls
+  back to plain L0 behaviour (drop the block, or recompute); a copy that failed
+  halfway or got stuck keeps its GPU blocks and host slots out of use until its
+  event completed. `l1_verify_fraction` adds checksums of the bytes as the
+  prefill wrote them, as they were demoted and as they were restored; a
+  mismatch turns L1 off.
+- The host budget is computed once, after every rank is ready: the container's
+  memory limit minus what cannot be reclaimed (`anon + shmem + unevictable`),
+  a reserve of `max(32 GiB, 5 %)` and the Engram host storage, split over the
+  ranks and capped at `l1_host_gb`. Each rank pins its share at startup and
+  never pins during serving; the backend logs the budget line and the pinned
+  size per rank.
+- L1 turns itself off (logged, the backend serves with L0 only) when the engine
+  lacks what it needs: `cp` above 1, a block manager without `allocate_nolock`,
+  no reachable KV tensor, no room in the budget, or a failed pin.
+
+The rank line logged every `log_rank_stats_seconds` gains an L1 part (blocks
+held, hits and hit tokens, promoted and demoted blocks, copy latency p50/p99
+and GB/s, drops, timeouts, fallbacks), and the rank stats carry every `l1_*`
+counter.
+
+Not run on a GPU yet: the PyTorch mover (`index_select` / `index_copy_` on the
+KV tensor, `cudaHostRegister` of `mmap` segments, side streams) is only tested
+with CPU tensors, and the ordering is reasoned from the DeepInfer source. Check
+first on one GPU with `l1_verify_fraction: 1.0`: `cache_config.bytes_per_block`
+(114,048 for the full model), a byte-exact demote, overwrite and promote of one
+prompt's blocks, the same output tokens as an L0 hit, then the same with other
+requests decoding and with zero-overhead scheduling on, and the copy bandwidth.
+
 ## Workload config
 
 | Key | Default | Meaning |
@@ -148,6 +204,17 @@ ships DeepInfer built with it (`patches/deepinfer-prefix-cache.patch`, and
 | `tokenizer_threads` | `2` | Prompt tokenization threads per rank. |
 | `prefix_cache` | `true` | GPU prefix cache and session routing (see "Prefix cache"). Needs the patched DeepInfer. |
 | `prefix_cache_free_fraction` | `0.05` | KV pool kept free by eviction on top of the 10 % prefill watermark. |
+| `l1_cache` | `true` | L1 host cache (see "L1 host cache"). Needs `prefix_cache` and `cp` 1; turns itself off when the engine lacks what it needs. |
+| `l1_host_gb` | `64` | Pinned host memory per rank, GiB, capped at startup by the node budget. |
+| `l1_prealloc_gb` | `l1_host_gb` | Pinned at startup (nothing is pinned while serving), so a smaller value only shrinks the pool. |
+| `l1_engram_host_gb` | from the model config | Engram host storage of the node to keep out of the budget (tables plus buffer storage). `0` when it is already counted in the process memory. |
+| `l1_segment_mb` | `1024` | Size of one registered host segment. |
+| `l1_staging_mb` | `64` | GPU staging buffer per copy direction. |
+| `l1_index_ring` | `65536` | Block indices in flight per copy direction (pinned ring). |
+| `l1_min_promote_blocks` | `2` | Shorter L1 continuations are recomputed instead. |
+| `l1_promote_wait_seconds` | `2.0` | Longest wait for free GPU blocks before a promotion falls back to recompute. |
+| `l1_copy_timeout_seconds` | `10.0` | A copy not done by then is logged as stuck and its memory kept out of use; three stuck copies turn L1 off. |
+| `l1_verify_fraction` | `0.0` | Fraction of L0 inserts, demotions and promotions that carry checksums (1.0 for the GPU check). |
 | `session_migrate_inflight` | `4 * max_num_seqs` | A session moves to another rank (one cold turn) only when its rank has this many requests in flight. |
 | `session_table_size` | `100000` | Sessions remembered by the router (LRU). |
 | `session_idle_seconds` | `1800` | A session idle this long no longer counts when new sessions are balanced across ranks. |
@@ -209,7 +276,15 @@ python -m inferencekey.backend.serve --port 8099 --backend deepinfer_backend:Dee
   --config-json '{"engine": "fake", "fake_tool_arguments": {"file_path": "/tmp/a.txt"}}'
 ```
 
-Tests: `bindings/python/tests/test_example_deepinfer.py`.
+Tests: `bindings/python/tests/test_example_deepinfer.py`, `test_example_deepinfer_cache.py` (prefix
+cache) and `test_example_deepinfer_l1.py` (L1 host cache).
+
+The simulated ranks of `bench/sim_server.py` model L1 too: `--l1-pcie-gbps 50`
+gives each rank a simulated mover (copies take `--l1-copy-latency-us` plus the
+bytes over that bandwidth, and admission waits for them), `--l1-host-blocks`
+sets its host slots, and `--kv-blocks` smaller than the sessions forces
+eviction. Content tags per block catch an early unpin or admission
+(`kv_mismatch` in the rank stats file).
 
 Throughput of the parent process (router, result queue, detokenization, SSE)
 with simulated ranks, no GPU: `bench/README.md`.
