@@ -5,9 +5,11 @@ engine as an InferenceKey custom backend, with OpenAI chat: streaming, tool
 calls and usage. The workload's `/v1/chat/completions` and Anthropic
 `/v1/messages` endpoints work, so Claude Code can program against it.
 
-> **Untested on real hardware.** Everything below the engine boundary was
-> written from the DeepInfer source and has only run with the fake engine. The
-> list of what is unverified is at the end. Read it before renting B200s.
+> **Run on 4x B200 (2026-10-24 and 25).** Load, serving, the prefix cache,
+> the L1 host cache, tool calls and a Claude Code session work on real
+> hardware with the configuration in "Tested on 4x B200" at the end, which
+> also lists the measured capacity and what is still unverified (8 GPUs,
+> B300). Read it before renting GPUs.
 
 ## How it works
 
@@ -78,25 +80,60 @@ What fails, and how:
 
 ## Requirements (engine `deepinfer`)
 
-- NVIDIA SM100 GPUs (B200 or GB200). DeepInfer's README names SM100; B300
-  (sm_103) is not confirmed.
-- At least 4 B200 to load the weights (about 510 GB) with room for context; the
-  DeepInfer examples run one 8-GPU node (`ep 8`).
-- Linux, CUDA 13, Python 3.12, GCC 13 or newer.
-- DeepInfer built from source with its `build.sh` (it is not on PyPI).
-- A local copy of `deepseek-ai/DeepSeek-V4.1-Flash-1017` (about 510 GB). The
-  backend never downloads it on its own.
+- NVIDIA SM100 GPUs (B200 or GB200). Tested on 4x B200 with driver 595.91
+  (CUDA 13.2); B300 (sm_103) is not confirmed.
+- At least 4 B200 to load the weights with room for context; the DeepInfer
+  examples run one 8-GPU node (`ep 8`), which we have not run.
+- Linux, CUDA 13, Python 3.12. The prebuilt package below needs the system
+  packages `zstd` and `libdw-dev`; building from source also needs GCC 13 or
+  newer.
+- DeepInfer with the prefix-cache patch (it is not on PyPI): the prebuilt
+  package or a source build, see below.
+- A copy of `deepseek-ai/DeepSeek-V4.1-Flash-1017` (about 510 GB, 476 GiB on
+  disk) on **local disk**. The backend never downloads it on its own. DeepInfer
+  reads the weights with `mmap`: from a network filesystem (a RunPod pod
+  volume or network volume mounted on `/workspace` is MooseFS) a load takes
+  about 13 min or stalls; from local NVMe the whole load takes about 4 min. On RunPod,
+  create the pod without a volume (`volumeInGb: 0`) and a container disk of
+  about 900 GB, so `/workspace` is local.
+- Host RAM for the L1 host cache when it is on (`l1_host_gb` per rank, 128 GiB
+  in our runs; the backend lowers it to what the container can spare).
 
 ### Getting DeepInfer into the backend's environment
 
-DeepInfer's `build.sh` compiles in place (no installable wheel) and installs
-torch, its vendored CUDA kernels and transformers into the active Python. The
-worker gives every custom backend a fresh venv, so DeepInfer is built once into
-its own venv on the node (for example `/workspace/di-venv` on a network volume,
-with a `.pth` file pointing at the DeepInfer checkout) and the backend uses it
-through `deepinfer_venv`: its site-packages are appended to `sys.path` and the
-rank processes start with its interpreter. Both venvs must use the same Python
-minor version (3.12). `requirements.txt` stays empty.
+The worker gives every custom backend a fresh venv, so DeepInfer lives in its
+own venv on the node (for example `/workspace/di-venv`, on local disk) and the
+backend uses it through `deepinfer_venv`: its site-packages are appended to
+`sys.path` and the rank processes start with its interpreter. Both venvs must
+use the same Python minor version (3.12). `requirements.txt` stays empty.
+
+Two ways to get that venv:
+
+- **Prebuilt (what we use):** download
+  [inferencekey/deepinfer-sm100-cu132](https://huggingface.co/inferencekey/deepinfer-sm100-cu132)
+  and run its installer, then unpack the JIT kernel cache for your GPU count
+  (optional: without it the kernels compile on first use). About 2 to 3 min
+  on a B200 pod:
+
+  ```bash
+  apt-get install -y zstd libdw-dev
+  python3 -m venv /workspace/hf-venv && /workspace/hf-venv/bin/pip install "huggingface_hub[hf_transfer]"
+  HF_HUB_ENABLE_HF_TRANSFER=1 /workspace/hf-venv/bin/python -c \
+    'from huggingface_hub import snapshot_download as d; d("inferencekey/deepinfer-sm100-cu132", local_dir="/workspace/deepinfer-prebuilt")'
+  bash /workspace/deepinfer-prebuilt/install.sh /workspace/di-venv /workspace
+  zstd -dc /workspace/deepinfer-prebuilt/jit-cache/jit-cache-4xb200-ep4.tar.zst | tar -x -C /workspace
+  ```
+
+  Point DeepInfer's JIT caches at the unpacked directories in the workload's
+  `env` (`DG_JIT_CACHE_DIR=/workspace/jit-cache/deep_gemm`,
+  `EP_JIT_CACHE_DIR=/workspace/jit-cache/deep_ep`,
+  `TILELANG_CACHE_DIR=/workspace/jit-cache/tilelang`,
+  `TRITON_CACHE_DIR=/workspace/jit-cache/triton`).
+- **From source:** DeepInfer's `build.sh` compiles in place (no installable
+  wheel) and installs torch, its vendored CUDA kernels and transformers into
+  the active Python; build it into its own venv with a `.pth` file pointing at
+  the checkout, after applying the patches of the prebuilt package
+  (`patches/`, see "Prefix cache").
 
 ## Prefix cache
 
@@ -138,8 +175,8 @@ HBM does not hold the KV of hundreds of long agent sessions (400 sessions of
 340K tokens need about 120 GB of KV, a 4x B200 node has about 100M tokens of
 KV pool). When the GPU cache (L0) has to evict an idle session, the L1 host
 cache keeps a copy of its blocks in pinned host RAM, and the session's next
-turn copies them back (about 18 ms for a 1M-token session at 50 GB/s) instead
-of recomputing them (seconds of prefill that stall every rank). It is off by
+turn copies them back (measured on B200: about 17 GB/s host to GPU and 47 GB/s
+GPU to host, so about 60 ms for a 1M-token session) instead of recomputing them (seconds of prefill that stall every rank). It is off by
 default; with `l1_cache: true`:
 
 - All paged KV of a rank is one GPU tensor (`cache_engine.gpu_blocks`, one row
@@ -180,13 +217,22 @@ held, hits and hit tokens, promoted and demoted blocks, copy latency p50/p99
 and GB/s, drops, timeouts, fallbacks), and the rank stats carry every `l1_*`
 counter.
 
-Not run on a GPU yet: the PyTorch mover (`index_select` / `index_copy_` on the
-KV tensor, `cudaHostRegister` of `mmap` segments, side streams) is only tested
-with CPU tensors, and the ordering is reasoned from the DeepInfer source. Check
-first on one GPU with `l1_verify_fraction: 1.0`: `cache_config.bytes_per_block`
-(114,048 for the full model), a byte-exact demote, overwrite and promote of one
-prompt's blocks, the same output tokens as an L0 hit, then the same with other
-requests decoding and with zero-overhead scheduling on, and the copy bandwidth.
+Checked on GPU: on one B200 with the trimmed model and `l1_verify_fraction:
+1.0`, a byte-exact demote, overwrite and promote of a 32K-token prompt's
+blocks (7 block-indexed tensors, 0 mismatches) and the same greedy output as
+an L0 hit; on 4x B200 with the full model, hundreds of 450K-token sessions
+moving between GPU and host with no failed copy and no verify failure. The
+mover warms its kernels after pinning (CUDA loads them lazily, which cost the
+first promotion about 50 ms).
+
+What L1 does and does not buy: it keeps idle sessions warm in host RAM, so they
+come back without a prefill. It does not raise how many sessions can be active
+at once: the blocks of every sequence the engine is running must be on the
+GPU. With agents that pause only seconds between turns nearly every session is
+active, and above the GPU pool (about 120 sessions of 450K tokens on 4x B200)
+promotions wait for free blocks, time out and fall back to recompute. L1 pays
+off with human-paced sessions (minutes between turns) and many more sessions
+than the GPU holds.
 
 ## Workload config
 
@@ -292,20 +338,70 @@ eviction. Content tags per block catch an early unpin or admission
 Throughput of the parent process (router, result queue, detokenization, SSE)
 with simulated ranks, no GPU: `bench/README.md`.
 
-## What is unverified (check on the first B200 run)
+## Tested on 4x B200 (2026-10-24 and 25)
 
-1. DeepInfer builds and imports in the backend's venv (wheel from `build.sh`, `deep_cluster` included).
-2. `LLM(...)` accepts the arguments used here (taken from `examples/_config.py` and `offline_inference.py`) and loads the checkpoint with `ep 4` on 4 B200 and `ep 8` on 8.
-3. A long-lived lockstep loop works: idle ranks keep calling `has_unfinished_requests()` (an all-reduce) and `step()` with no local work, for hours.
-4. Requests can be added between steps while others are in flight (the offline example adds all requests before the first step).
-5. `flush_inflight_reqs()` after the last step returns the remaining outputs and stays in lockstep.
-6. One `RequestOutput` per generated token (with DSpark on, accepted draft tokens arrive as separate outputs), and `prompt_len` is the prompt length. Several outputs of one request in one step are handled.
-7. Decoding with the checkpoint's tokenizer, `skip_special_tokens=False`, yields the DSML and `</think>` markup the parser expects. (The rank's byte table reproduces that `decode` exactly for the DeepSeek-V4.1 `tokenizer.json` with transformers 4.50; checked offline, and again by every rank at startup.)
-8. The model actually emits DSML tool calls in the format of `dsv41_encoding.py` for Claude Code's tools, and Claude Code accepts the `reasoning_content` it does not use.
-9. The context length (`max_model_len`), batch limits and memory settings that fit 4 and 8 B200, and the time to load (to size `ready_timeout_secs`).
-10. Whether DeepInfer reuses prompt prefixes across requests (a cache). Without one, every agent turn reads its whole context again.
-11. `llm_engine.abort_request()` between steps, while other requests run and with DSpark in-flight steps, leaves the engine and the lockstep healthy. Set `abort_on_disconnect` to `false` if it does not.
-12. The tokenizer from `llm.get_tokenizer()` can encode on the rank's tokenizer threads while the loop steps (encode only; nothing changes its settings). With the Hugging Face fast tokenizer it releases the GIL, as measured offline.
-13. Requests the scheduler ignores or stops (`FINISHED_IGNORED`, `FINISHED_PREEMPTED`, `FINISHED_SO_FAILED`, `FINISHED_VE_FAILED`) arrive as one finished `RequestOutput` with `finish_reason` set (`prompt_length_exceeded`, `insufficient_system_resource`, `xgrammar ...`, `ve_error`), as read in `outputs.hpp`. Not seen on hardware yet; send a prompt over `max_model_len` and check for the 400.
-14. The backend process at 200 to 400 streams on the B200 host: per-user tok/s and its CPU. In the benchmark it sits at about 100 to 130 % CPU at 400 streams (per chunk, not per token), with no `/v1/messages` adapter or proxy in front. If it is near 100 % there, raise `stream_interval_ms`, lower `stream_chunks_per_second`, or split the HTTP layer across processes; treat about 400 streams as the limit of one backend process until then.
-15. The rank's added CPU stays small next to a GPU step. On the dev VM, grouping and detokenizing one step of 128 requests takes about 0.24 ms (2 us per request), and building and checking the byte table takes about 0.5 s at startup. Not measured: `RequestOutput.clone` and the queue message on the real engine.
+RunPod, 4x B200 (183 GB each), driver 595.91, 2 to 3 TB host RAM, 900 GB
+container disk, no pod volume. DeepInfer from the prebuilt package above,
+weights on local disk. Setup (weights and DeepInfer in parallel) 4 to 11 min,
+load about 4 min.
+
+Workload config of the runs:
+
+```json
+{
+  "engine": "deepinfer",
+  "env": {"CUDA_VISIBLE_DEVICES": "0,1,2,3", "DEEPINFER_HF_MODEL_DIR": "/workspace/v41flash",
+          "IK_BACKEND_HTTP": "native"},
+  "ep": 4,
+  "deepinfer_venv": "/workspace/di-venv",
+  "eplb": false, "extra_experts": 0,
+  "max_model_len": 1064960, "max_num_seqs": 128, "max_num_batched_tokens": 16384,
+  "gpu_memory_utilization": 0.90, "load_timeout_seconds": 3600,
+  "l1_cache": true, "l1_host_gb": 128,
+  "deepinfer_env": {"DEEPINFER_ENGRAM_LOCAL": "1", "EP_DISABLE_GIN": "1", "NCCL_IB_DISABLE": "1",
+                    "MASTER_PORT": "29511", "DEEPINFER_NCCL_NVLS_ENABLE": "0", "NCCL_NVLS_ENABLE": "0"},
+  "ready_timeout_secs": 5400,
+  "request_timeout_secs": 1800
+}
+```
+
+With it each rank has 111,456 KV blocks (14.3M tokens, 57M on the node) and
+128 GiB of L1 (154M tokens per rank, 617M on the node).
+
+Quality with the cache: the same long prompt (16K to 200K tokens, one fact
+hidden at 10 to 90 % depth) sent cold and then again: both answers find the
+fact and are identical; the repeat is served from the cache (98 to 99 % of the
+prompt) in 0.8 to 1.5 s instead of 1.3 to 20.6 s.
+
+Capacity, simulated coding agents with 3 s between turns (turn sizes from 30
+days of real Claude Code calls), one measured turn per user. Pass = time to
+first token p95 at most 15 s, per-user tok/s p50 at least 20 and p10 at least
+10, cache hit at least 90 %, errors under 1 %:
+
+| Context | Users | TTFT p50 / p95 | tok/s p50 / p10 | Cache | Errors | Verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| 128K | 300 | 5.6 / 14.8 s | 35 / 16 | 98 % | 0/521 | pass |
+| 128K | 350 | 7.4 / 21.0 s | 22 / 8.4 | 98 % | 0/676 | fail |
+| 128K | 400 | 7.3 / 16.9 s | 29 / 9.5 | 98 % | 0/652 | fail (just) |
+| 500K | 50 | 2.5 / 4.4 s | 163 / 100 | 100 % | 0/75 | pass |
+| 500K | 100 | 2.6 / 37 s | 135 / 39 | 99 % | 0/237 | fail (p95 only) |
+| 500K | 200 | 151 / 161 s | 26 / 9 | 41 % | 0/17 | fail (active sessions exceed the GPU pool) |
+| 1M | 48 | 3.6 / 28.9 s | 69 / 22 | 100 % | 0/100 | fail (p95 only) |
+
+Through InferenceKey (manager, NATS and a tunnel to the pod) 128K at 300 users
+gave the same median TTFT, speed, cache and errors, with a p95 of 22 s. A
+Claude Code session against the endpoint finished a small coding task (14 tool
+calls, tests passing) in 39 s.
+
+Confirmed on hardware: the prebuilt venv imports and loads with `ep 4`; the
+long-lived lockstep loop (more than an hour, idle ranks included); adding requests between
+steps; `flush_inflight_reqs()`; per-token outputs with DSpark; the tokenizer
+markup, DSML tool calls and Claude Code; aborts while other requests run; the
+prefix cache (with DeepInfer's zero-overhead scheduling a finished sequence is
+finalized one step after its last token, and the rank loop keeps its entry
+until then); 400 streams on one backend process.
+
+Still unverified: 8 GPUs (`ep 8`); B300; the `finish_reason` of requests the
+scheduler ignores or stops (`prompt_length_exceeded` and the others: send a
+prompt over `max_model_len` and check for the 400); the CPU of the backend process at 400 streams and the cost of
+`RequestOutput.clone` on the real engine.
