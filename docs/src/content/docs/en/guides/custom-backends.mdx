@@ -126,7 +126,7 @@ serve_backend(SentimentBackend, port=8099, config={"device": "cpu"})
 ```
 
 <Aside type="note">
-The runtime serves a small, SDK-owned HTTP schema: `GET /healthz` (ready only after `setup()`), `POST /process`, and `GET /meta`. It binds `127.0.0.1` only.
+The runtime serves a small, SDK-owned HTTP schema: `GET /healthz` (ready only after `setup()`), `POST /process`, and `GET /meta`. It binds `127.0.0.1` only. The HTTP server itself can be the standard library one or a native Rust one; see [The HTTP transport](#7-the-http-transport).
 </Aside>
 
 ## 3. Package it
@@ -248,6 +248,31 @@ class MyLLMBackend(CustomBackend):
 - **Streaming.** A request with `"stream": true` calls `chat_stream()`. The default replays `chat()` as `chat.completion.chunk` events, so streaming clients work from day one. Override `chat_stream()` and yield chunks as your engine produces tokens.
 - **Package it with `api="openai-chat"`** (`--api openai-chat` in the CLI). It is inferred from `chat()` for `GET /meta`, and the manifest field lets the worker know before the first request.
 - Raise `InvalidInput` for a bad request (400). Any other exception is a 500 for that request; the server stays alive.
+- **Stop work when the client leaves.** When the caller disconnects, the runtime closes your generator at its next `yield` (Python raises `GeneratorExit` there). Put the engine's abort in a `try`/`finally` so it runs on a disconnect too:
+
+  ```python
+  def chat_stream(self, request):
+      req_id = self.engine.submit(request)
+      try:
+          for piece in self.engine.stream(req_id):
+              yield {"choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]}
+      finally:
+          self.engine.abort(req_id)      # runs on a client disconnect as well
+  ```
+
+  A backend that catches `BaseException` around a `yield` must re-raise `GeneratorExit`.
+- **Nothing to send yet.** `chat_stream()` may yield `None` while the engine is busy (a long prefill, a queue). The runtime writes an SSE keepalive comment, which also notices a client that left, so the generator is closed during idle periods too.
+- **Pre-serialized chunks (optional fast path).** A hot loop may yield a `str` or `bytes` holding an already-serialized chunk object; the runtime writes it as is, without `json.dumps`. It must be a single line of JSON: a chunk with a raw line break (for example `json.dumps(obj, indent=2)`) ends the stream with an error event. Dict chunks remain the default.
+
+  ```python
+  import json
+  PREFIX = '{"choices":[{"index":0,"delta":{"content":'
+  SUFFIX = '},"finish_reason":null}]}'
+
+  def chat_stream(self, request):
+      for piece in self.engine.generate(request["messages"]):
+          yield PREFIX + json.dumps(piece) + SUFFIX
+  ```
 
 A complete, dependency-free example is in [`examples/custom-backend-openai-chat`](https://github.com/inferencekey/inferencekey-sdk/tree/main/examples/custom-backend-openai-chat): it either forwards to an upstream OpenAI-compatible server, the place to plug your engine, or runs a scripted mode that lets Claude Code read and edit a file through the whole chain without a model.
 
@@ -263,6 +288,56 @@ The workload's `config` reaches your process:
 | `request_timeout_secs` | Longest time one request may take, a whole streamed answer included (default 300 s for `/process` and streaming). Raise it for long agent turns. |
 
 Two workloads of the same custom backend share one process only when their configs are equal.
+
+## 7. The HTTP transport
+
+The runtime can serve your backend with two HTTP servers. Both run the same request handling in Python (your methods, the status codes, the error bodies and the SSE `data:` lines are identical), so the platform cannot tell them apart.
+
+| Transport | What it is | When it is used |
+| --- | --- | --- |
+| `stdlib` | The Python standard library `http.server`, one thread per connection. | The default in this release, and the fallback whenever the native one is unavailable. |
+| `native` | A Rust server in the SDK's native module. It accepts connections, parses HTTP, answers `/healthz`, `/meta` and `/v1/models`, frames SSE and writes every byte without holding the GIL; Python only runs your backend's methods. | When you opt in with `IK_BACKEND_HTTP`. |
+
+Pick one with the `IK_BACKEND_HTTP` environment variable of the backend process. On the platform, set it in the workload config's `env`, for example `{"env": {"IK_BACKEND_HTTP": "auto"}}`:
+
+- `stdlib` (the default for now): the standard library server.
+- `auto`: native when the native module is importable and provides the server, the standard library otherwise.
+- `native`: native, or exit with code 2 when it is unavailable. Use it in CI and benchmarks so a silent fallback cannot pass unnoticed.
+
+At startup the runtime writes exactly one line to stderr naming the transport in use:
+
+```text
+http transport: native (abi 1, io_threads=4, backlog=4096, max_inflight=1024, flush_tick_us=1000)
+http transport: stdlib (reason: IK_BACKEND_HTTP=stdlib (default))
+```
+
+Setting `IK_BACKEND_HTTP=stdlib` is the instant rollback for one workload; no release is needed.
+
+<Aside type="note" title="Why native is opt-in for now">
+The native transport keeps `/healthz` answering in a few milliseconds while hundreds of streams are open (and while `setup()` holds the GIL), and it removes the per-token socket writes from Python. In our CPU load tests it does not yet meet every target for a simultaneous burst of hundreds of new streams, so `auto` will become the default in a later release, once those targets are met.
+</Aside>
+
+The native transport reads these optional settings from the environment (they are ignored by `stdlib`):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `IK_BACKEND_MAX_INFLIGHT` | 1024 | Concurrent backend calls; further requests wait in the server, they are not refused. Lower it for heavy `/process` payloads, since a waiting request holds its body (up to 16 MiB) in memory. |
+| `IK_BACKEND_IO_THREADS` | min(4, CPUs) | Server IO threads. |
+| `IK_BACKEND_BACKLOG` | 4096 | Listen backlog (the kernel's `net.core.somaxconn` caps it). |
+| `IK_BACKEND_STREAM_MAX_BYTES` | 8388608 | Bytes one stream may have queued for a client that stopped reading before it is closed as a slow client. |
+| `IK_SSE_CONNECTION_CLOSE` | 0 | `1` streams every response close-delimited, the way the standard library server does. |
+| `IK_BACKEND_FLUSH_TICK_US` | 1000 | While busy, stream bodies are woken in batches this many microseconds apart (0, or 1000 to 100000). `0` wakes on every push. |
+
+When the native transport is selected, a setting with an invalid value makes the process exit with code 2, as does an unknown `IK_BACKEND_HTTP` value on either transport.
+
+### What you may notice on `native`
+
+- **Requirements.** The native server ships in the SDK's binary wheels (CPython 3.9+, Linux x86_64 and aarch64, glibc 2.34 or newer). On other platforms, or with a native module built before the server existed, `auto` falls back to `stdlib` and the startup line says why. A source checkout gets it with `maturin develop --release` in `bindings/python`.
+- **Framing.** Streaming responses to HTTP/1.1 clients use chunked transfer encoding (HTTP/1.0 clients still get a close-delimited stream, and `IK_SSE_CONNECTION_CLOSE=1` restores that for everyone). JSON responses use HTTP/1.1 keep-alive. Every SSE `data:` line is byte-identical to `stdlib`.
+- **Malformed requests.** A non-numeric `Content-Length` gets the HTTP library's own `400` with an empty body instead of the JSON `400`. The status is the same.
+- **Shutdown.** On SIGTERM a request still running is given up to 2 seconds to finish before the process exits.
+- **`serve()` and `serve_backend()`** return an object with `server_address`, `server_port`, `serve_forever()`, `shutdown()` and `server_close()`, but it is not a `ThreadingHTTPServer`. Code that checks `isinstance(httpd, ThreadingHTTPServer)` or touches `RequestHandlerClass` or `socket` needs `IK_BACKEND_HTTP=stdlib`.
+- Your methods are still called concurrently from many threads, exactly as with `stdlib`, so a backend must stay thread-safe.
 
 ## What happens after that
 

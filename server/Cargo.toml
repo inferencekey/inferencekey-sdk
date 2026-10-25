@@ -1,0 +1,31 @@
+[package]
+name = "inferencekey-backend-server"
+description = "Native HTTP/SSE transport for InferenceKey custom backends: accept, parse, health and every socket write in Rust; request semantics stay with the caller."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "inferencekey_backend_server"
+
+[dependencies]
+inferencekey-core = { path = "../core" }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+# The workspace line has rt, rt-multi-thread and macros; the server adds what it
+# needs here so core, capi and node built alone keep their feature set.
+tokio = { workspace = true, features = ["net", "io-util", "sync", "time"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# prctl(PR_SET_NAME), to name the threads that run application calls.
+libc = "0.2"
+
+[dev-dependencies]
+serde_json = { workspace = true }

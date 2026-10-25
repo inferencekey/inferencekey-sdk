@@ -12,6 +12,9 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "backend-server")]
+mod backend_server;
+
 use futures_util::stream::{BoxStream, StreamExt};
 use pyo3::exceptions::{PyPermissionError, PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
@@ -359,5 +362,9 @@ fn _inferencekey(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Client>()?;
     m.add_class::<ChatStream>()?;
     m.add_class::<ReadinessStream>()?;
+    // The native HTTP/SSE transport of `inferencekey.backend.serve`
+    // (`BackendServer`, `StreamSink`, `BACKEND_SERVER_ABI`).
+    #[cfg(feature = "backend-server")]
+    backend_server::register(m)?;
     Ok(())
 }

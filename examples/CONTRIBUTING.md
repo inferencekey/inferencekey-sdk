@@ -129,6 +129,19 @@ resolves to the local build. Pin it in `requirements.txt` as a comment for now:
 
 > **When the package ships,** drop the maturin step and `pip install inferencekey`.
 
+**Custom backend examples** run through `python -m inferencekey.backend.serve`.
+The native HTTP transport of that runtime lives in the same native module, so
+rebuild with `maturin develop --release` after pulling SDK changes: a module
+built before the server existed falls back to the standard library server
+under `IK_BACKEND_HTTP=auto`. The startup line on stderr tells you which one is
+in use (`http transport: native (...)` or `http transport: stdlib
+(reason: ...)`). An example's README may show `IK_BACKEND_HTTP=native` to
+exercise the native transport and `IK_BACKEND_HTTP=stdlib` as the rollback;
+nothing in the backend code depends on the choice. If your example streams
+chat, put the engine's abort in a `try`/`finally` around the `yield` of
+`chat_stream()`: the runtime closes the generator when the client leaves (see
+the custom backends guide).
+
 ## 5. README template
 
 Each example's `README.md` follows this skeleton — same order every time, so

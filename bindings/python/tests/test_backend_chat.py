@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import socket
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -72,6 +74,28 @@ class TokenStreamBackend(ToolChatBackend):
         if request.get("fail_midway"):
             raise RuntimeError("lost the GPU")
         yield {"object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+
+
+class EndlessStreamBackend(ToolChatBackend):
+    """Streams until the client goes away; records that its generator was closed."""
+
+    closed = threading.Event()
+    # Strong references to every generator handed out, so ``closed`` is set
+    # only by an explicit close from the runtime, not by garbage collection.
+    generators: list = []
+
+    def chat_stream(self, request):
+        gen = self._stream()
+        EndlessStreamBackend.generators.append(gen)
+        return gen
+
+    def _stream(self):
+        try:
+            while True:
+                yield {"object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "x"}, "finish_reason": None}]}
+                time.sleep(0.01)
+        finally:
+            EndlessStreamBackend.closed.set()
 
 
 class ProcessOnlyBackend(CustomBackend):
@@ -220,6 +244,47 @@ def test_invalid_input_is_400_and_model_failure_is_500(server, stream) -> None:
 def test_missing_messages_is_400(server) -> None:
     port = server(ToolChatBackend)
     assert _post_raw(port, {"prompt": "x"})[0] == 400
+
+
+#: A 200 status line on either transport (stdlib speaks HTTP/1.0, native HTTP/1.1).
+OK_STATUS_LINES = (b"HTTP/1.0 200", b"HTTP/1.1 200")
+
+
+def test_server_listens_with_a_large_backlog_and_daemon_threads(server) -> None:
+    port = server(ToolChatBackend)
+    assert serve_mod.LISTEN_BACKLOG >= 1024
+    assert serve_mod._HTTPServer.request_queue_size == serve_mod.LISTEN_BACKLOG
+    assert serve_mod._HTTPServer.daemon_threads
+    # A burst of simultaneous connections is accepted, none reset.
+    socks = [socket.create_connection(("127.0.0.1", port), timeout=5) for _ in range(64)]
+    try:
+        body = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
+        for s in socks:
+            s.sendall(
+                b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+            )
+        for s in socks:
+            # stdlib answers with an HTTP/1.0 status line, native with HTTP/1.1.
+            assert s.recv(64).startswith(OK_STATUS_LINES)
+    finally:
+        for s in socks:
+            s.close()
+
+
+def test_client_disconnect_closes_the_backend_stream(server) -> None:
+    EndlessStreamBackend.closed.clear()
+    EndlessStreamBackend.generators.clear()
+    port = server(EndlessStreamBackend)
+    body = json.dumps({"stream": True, "messages": [{"role": "user", "content": "x"}]}).encode()
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    s.sendall(
+        b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+        + f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+    )
+    assert s.recv(64).startswith(OK_STATUS_LINES)
+    s.close()
+    assert EndlessStreamBackend.closed.wait(5)
 
 
 def test_models_lists_the_backend(server) -> None:

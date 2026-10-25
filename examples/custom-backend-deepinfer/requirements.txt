@@ -1,0 +1,12 @@
+# DeepInfer is NOT on PyPI. It is built from source with its build.sh
+# (github.com/deepseek-ai/DeepInfer: Linux, GCC >= 13, Python 3.12, CUDA 13,
+# NVIDIA SM100), which installs deepinfer and deep_cluster into the active
+# environment together with torch, transformers, numpy and huggingface_hub.
+#
+# The worker creates a fresh venv for every custom backend and installs this file
+# into it, so a pip line here cannot bring DeepInfer. Two ways to provide it:
+#   1. Build DeepInfer into the Python the worker uses for this backend (see the
+#      README, "Getting DeepInfer into the backend's environment").
+#   2. Leave this file without requirements and run engine "fake" (tests, demos).
+#
+# Nothing to install for the fake engine: it only needs the standard library.
