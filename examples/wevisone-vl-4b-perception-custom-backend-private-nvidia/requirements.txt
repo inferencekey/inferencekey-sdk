@@ -1,0 +1,27 @@
+# Requirements of the CUSTOM BACKEND (installed by the worker into the
+# backend's own venv, Python 3.12). The client side (main.py) only needs the
+# SDK and `requests`, see README.
+
+# InferenceKey SDK runtime: provides `python -m inferencekey.backend.serve`.
+inferencekey
+
+# The set the WeVisOne-VL authors pin (requirements.txt at commit 40f735b8,
+# 2026-10-23), minus the demo and evaluation extras (gradio, matplotlib,
+# pycocotools, scipy). torch 2.11 wheels are CUDA 13 builds: the GPU driver
+# must support CUDA 13.
+torch==2.11.0
+torchvision==0.26.0
+transformers==5.12.1
+vllm==0.23.0
+triton==3.6.0
+accelerate==1.14.0
+huggingface-hub==1.21.0
+qwen_vl_utils==0.0.14
+safetensors==0.8.0
+numpy==2.2.6
+Pillow==12.2.0
+supervision==0.31.0
+# vLLM's FlashInfer JIT shells out to `ninja`; the custom backend venv does
+# not get it from the worker, so install the wheel (backend.py puts the venv
+# bin on PATH).
+ninja
