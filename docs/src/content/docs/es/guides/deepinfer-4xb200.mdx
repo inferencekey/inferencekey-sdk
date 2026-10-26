@@ -1,0 +1,304 @@
+---
+title: Ejecuta DeepInfer con InferenceKey
+description: "Sirve DeepSeek-V4.1-Flash con DeepInfer desde una sola máquina 4x B200 como custom backend de InferenceKey, con la caché de prefijos y la caché en RAM del host activadas, y conecta Claude Code."
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from "@astrojs/starlight/components";
+import YouTube from "../../../../components/YouTube.astro";
+
+Esta guía sirve **DeepSeek-V4.1-Flash** con [DeepInfer](https://github.com/deepseek-ai/DeepInfer), el motor de código abierto de DeepSeek, en **una máquina con 4 GPU NVIDIA B200**, como **custom backend** de InferenceKey. Publicáis el backend con el SDK, fijáis un workload a la máquina con `ensure()`, dais acceso a una API key y Claude Code habla con el endpoint Anthropic `/v1/messages` del workload. El código del backend es el ejemplo [`custom-backend-deepinfer`](https://github.com/inferencekey/inferencekey-sdk/tree/main/examples/custom-backend-deepinfer) de este repositorio.
+
+<YouTube id="2wEUzMmkscE" title="Claude Code en una máquina 4x B200 en vez de 200 suscripciones" />
+
+El informe completo de las pruebas, con gráficas y el método detrás de cada cifra, está en el artículo de research [Claude Code en una máquina 4x B200](https://inferencekey.com/es/research/deepinfer-4xb200-one-machine-claude-code).
+
+## Qué es DeepInfer y por qué importa la caché
+
+DeepInfer es el motor de inferencia de DeepSeek para sus modelos V4.1 en GPU Blackwell: paralelismo de expertos entre las GPU de un nodo, decodificación especulativa DSpark y SWA bounded replay. Su versión abierta no reparte la carga entre ranks y libera todos los bloques KV cuando termina una petición.
+
+Eso último es lo que encarece a un agente de programación. Claude Code reenvía la conversación entera en cada turno, y casi toda es el turno anterior. Sin caché, cada turno vuelve a hacer el prefill de todo su contexto: una sesión de 500K tokens pagaría medio millón de tokens de prefill por cada llamada a una herramienta. El backend de InferenceKey añade dos niveles de caché encima de DeepInfer:
+
+| Nivel | Dónde | Qué hace |
+| --- | --- | --- |
+| **L0, caché de prefijos** | GPU (HBM) | Guarda los bloques KV de los prompts terminados, identificados por un hash encadenado de sus tokens. Un turno nuevo arranca desde su prefijo cacheado más largo y solo hace el prefill de los tokens nuevos. Todos los turnos de una sesión van al rank que guarda su prefijo. |
+| **L1, caché del host** | RAM fijada del host | Cuando L0 tiene que expulsar una sesión inactiva, sus bloques se copian a la RAM del host. El turno siguiente los devuelve a la GPU (unos 60 ms para una sesión de 1M tokens) en vez de recalcularlos. |
+
+En el paso medido de más carga, el 96 % de los tokens de entrada salió de la caché. El backend además convierte las llamadas a herramientas DSML del modelo en `tool_calls` de OpenAI, emite el razonamiento y el texto en streaming e informa del uso, que es lo que necesita Claude Code.
+
+## Antes de empezar
+
+El **worker** (la máquina con GPU registrada en vuestro proyecto, un servidor propio o una máquina 4x B200 en la nube de InferenceKey) necesita:
+
+| | |
+| --- | --- |
+| **GPU** | 4x NVIDIA B200 (SM100). Probado con el driver 595.91 (CUDA 13.2). B300 y nodos de 8 GPU no están verificados. |
+| **Disco** | Unos 900 GB de disco **local** (NVMe): 476 GB de pesos, el entorno de DeepInfer y margen. |
+| **RAM** | La suficiente para la caché L1: 128 GiB fijados por rank en la configuración probada (512 GiB en total) además del motor. Las máquinas de las pruebas tenían de 2 a 3 TB. |
+| **Software** | Linux, Python 3.12 y los paquetes de sistema `zstd` y `libdw-dev`. |
+
+<Aside type="caution" title="Pesos en disco local, nunca en un volumen de red">
+DeepInfer lee los pesos con `mmap`. Desde un sistema de ficheros en red, una carga tarda unos 13 minutos o se queda colgada; desde NVMe local, la carga entera tarda unos 4 minutos. Si el worker corre en un contenedor, dadle un **disco de contenedor** grande (unos 900 GB) y **ningún volumen de red**, para que el directorio de descarga sea local. Comprobadlo antes de descargar nada (paso 1).
+</Aside>
+
+Vuestro **portátil** necesita Python 3.10+ y `pip install inferencekey`, además de [Claude Code](https://code.claude.com/docs). Sin GPU.
+
+Del panel necesitáis:
+
+- Un **token del SDK** (`ik_sdk_`) con `workload:read` y `workload:write`. Ved [Tokens](/es/quickstart/tokens/).
+- Vuestro **tenant id**, el **slug del proyecto** y el **worker id** de la máquina 4x B200 (página Workers).
+- Una **API key** (`ik_live_`) para el endpoint, que se crea en el paso 5.
+
+<Steps>
+
+1. ### Preparad la máquina: pesos y DeepInfer, en paralelo
+
+   En el worker, en una shell. Primero comprobad que `/workspace` (o el directorio que elijáis) es disco local. El tipo de sistema de ficheros tiene que ser local, como `ext4`, `xfs` u `overlay`, no `nfs` ni `fuse`:
+
+   ```bash title="En el worker"
+   df -h /workspace && stat -f -c %T /workspace
+   ```
+
+   Después descargad a la vez los pesos de `deepseek-ai/DeepSeek-V4.1-Flash-1017` y DeepInfer precompilado. El paquete [inferencekey/deepinfer-sm100-cu132](https://huggingface.co/inferencekey/deepinfer-sm100-cu132) es DeepInfer compilado para SM100 y CUDA 13.2 con el parche de caché de prefijos que necesita el backend, más la caché de kernels JIT para 4 GPU:
+
+   ```bash title="En el worker"
+   apt-get install -y zstd libdw-dev
+   python3 -m venv /workspace/hf-venv
+   /workspace/hf-venv/bin/pip install "huggingface_hub[hf_transfer]"
+   export HF_HUB_ENABLE_HF_TRANSFER=1
+
+   # Weights (about 476 GB) to local disk
+   /workspace/hf-venv/bin/python -c 'from huggingface_hub import snapshot_download as d; d("deepseek-ai/DeepSeek-V4.1-Flash-1017", local_dir="/workspace/v41flash", max_workers=16)' &
+
+   # DeepInfer with the prefix-cache patch, into its own venv, plus the 4-GPU kernel cache
+   ( /workspace/hf-venv/bin/python -c 'from huggingface_hub import snapshot_download as d; d("inferencekey/deepinfer-sm100-cu132", local_dir="/workspace/deepinfer-prebuilt")' \
+     && bash /workspace/deepinfer-prebuilt/install.sh /workspace/di-venv /workspace \
+     && zstd -dc /workspace/deepinfer-prebuilt/jit-cache/jit-cache-4xb200-ep4.tar.zst | tar -x -C /workspace ) &
+
+   wait
+   ```
+
+   En las pruebas esto tardó de 4 a 5 minutos en total (pesos de 217 a 302 s, DeepInfer de 83 a 133 s). Al terminar tenéis los pesos en `/workspace/v41flash` y DeepInfer en `/workspace/di-venv`.
+
+   <Aside type="note" title="Por qué un venv aparte">
+   El worker da a cada custom backend un entorno virtual nuevo. DeepInfer no está en PyPI, así que vive en su propio venv en la máquina y el ajuste `deepinfer_venv` del backend apunta a él: sus site-packages se añaden al path y los procesos de los ranks arrancan con su intérprete. Los dos tienen que usar Python 3.12. El `requirements.txt` del backend se queda vacío.
+   </Aside>
+
+2. ### Descargad el backend y preparad el entorno
+
+   En vuestro portátil:
+
+   ```bash
+   git clone https://github.com/inferencekey/inferencekey-sdk.git
+   cd inferencekey-sdk
+   pip install inferencekey
+   ```
+
+   ```bash title="Entorno"
+   export INFERENCEKEY_SDK_TOKEN=ik_sdk_...       # control plane: workload:read + workload:write
+   export INFERENCEKEY_PROJECT=your-project-slug
+   export IK_TENANT_ID=...                        # your tenant id
+   export IK_WORKER_ID=...                        # the worker with the 4x B200
+   ```
+
+3. ### Empaquetad y publicad el custom backend
+
+   ```python title="publish.py"
+   import os
+   from inferencekey import publish_custom_backend
+   from inferencekey.backend import package_backend
+
+   src = "examples/custom-backend-deepinfer"
+   pkg = package_backend(
+       src=src,
+       entrypoint="deepinfer_backend:DeepInferBackend",
+       requirements=os.path.join(src, "requirements.txt"),
+       name="deepinfer-v41-flash",
+       version="0.1.0",
+       task_type="text2text",
+       requires_python="3.12",
+       api="openai-chat",
+       out_dir="dist",
+   )
+   print(pkg.path, pkg.sha256[:12], f"{pkg.size_bytes / 1024:.0f} KiB")
+
+   record = publish_custom_backend(
+       os.environ["IK_TENANT_ID"], pkg.path, token=os.environ["INFERENCEKEY_SDK_TOKEN"]
+   )
+   print("published", record["slug"], record["version"])
+   ```
+
+   El paquete es solo código (unos 420 KB, sin pesos). Cada versión se publica una vez; publicar otra vez el mismo slug y versión devuelve 409, así que subid `version` cada vez que cambie el código del backend. También podéis arrastrar el `.tar.gz` de `dist/` a la página **Custom backends** del panel. Ved [Custom backends](/es/guides/custom-backends/) para el contrato.
+
+4. ### Fijad el workload a la máquina, con la caché activada
+
+   Esta es la configuración del workload en las pruebas medidas:
+
+   ```python title="deploy.py"
+   import os
+   from inferencekey import ExecutionPolicy, ManagementClient, WorkloadSpec
+
+   mgmt = ManagementClient.from_env()
+   spec = WorkloadSpec(
+       name="DeepSeek-V4.1-Flash on DeepInfer",
+       slug="deepinfer-v41-flash",
+       model="deepseek-v4.1-flash",
+       backend="deepinfer-v41-flash",          # the custom backend slug
+       task_type="text2text",
+       worker_id=os.environ["IK_WORKER_ID"],   # the 4x B200 worker
+       execution_policy=ExecutionPolicy.FIXED, # one always-on replica
+       config={
+           "engine": "deepinfer",
+           "env": {
+               "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+               "DEEPINFER_HF_MODEL_DIR": "/workspace/v41flash",
+               "IK_BACKEND_HTTP": "native",
+           },
+           "ep": 4,
+           "deepinfer_venv": "/workspace/di-venv",
+           "eplb": False,
+           "extra_experts": 0,
+           "max_model_len": 1064960,
+           "max_num_seqs": 128,
+           "max_num_batched_tokens": 16384,
+           "gpu_memory_utilization": 0.90,
+           "load_timeout_seconds": 3600,
+           "l1_cache": True,
+           "l1_host_gb": 128,
+           "deepinfer_env": {
+               "DEEPINFER_ENGRAM_LOCAL": "1",
+               "EP_DISABLE_GIN": "1",
+               "NCCL_IB_DISABLE": "1",
+               "MASTER_PORT": "29511",
+               "DEEPINFER_NCCL_NVLS_ENABLE": "0",
+               "NCCL_NVLS_ENABLE": "0",
+           },
+           "ready_timeout_secs": 5400,
+           "request_timeout_secs": 1800,
+       },
+   )
+   ref = mgmt.ensure(spec)
+   mgmt.wait_until_ready(ref.workload_slug, timeout=5400)
+   print("ready:", ref.workload_slug)
+   ```
+
+   ```bash
+   python deploy.py
+   ```
+
+   Qué hace cada ajuste:
+
+   | Ajuste | Por qué |
+   | --- | --- |
+   | `ep: 4` | Paralelismo de expertos en las 4 GPU: 4 ranks, uno por GPU. |
+   | `deepinfer_venv` | El venv de DeepInfer del paso 1. |
+   | `prefix_cache` | Activado por defecto: la caché L0 en GPU y el enrutado por sesión. |
+   | `l1_cache`, `l1_host_gb: 128` | La caché L1 del host, 128 GiB de RAM fijada por rank. El backend lo baja a lo que la máquina puede ceder y deja el presupuesto en el log. |
+   | `extra_experts: 0`, `eplb: false` | Sin expertos redundantes: ahorra unos 5,6 GiB por GPU para la caché KV. |
+   | `max_model_len: 1064960` | 1M tokens de contexto más margen para la respuesta. Un límite mayor reduce el pool de KV. |
+   | `max_num_seqs: 128` | Hasta 128 secuencias por rank, 512 en la máquina. |
+   | `deepinfer_env` | Sin RDMA en un solo nodo: el tráfico MoE va por NVLink y Engram corre en local. |
+   | `IK_BACKEND_HTTP: native` | El transporte HTTP y SSE nativo del SDK para el proceso del backend, pensado para cientos de streams. |
+   | `ready_timeout_secs: 5400` | El worker espera 300 s por defecto a un custom backend; cargar los pesos tarda más. |
+   | `request_timeout_secs: 1800` | Turnos largos de agente, con el stream entero incluido. |
+
+   Con esta configuración cada rank tuvo 14,3M tokens de pool KV en GPU (57M en la máquina) y 154M tokens de L1 (617M en la máquina). Con los pesos ya en disco, el despliegue (empaquetar, publicar, ensure y esperar) quedó listo en 105 s.
+
+   Después subid los **Concurrent requests** del worker para este workload: un workload fijado empieza en 1. En la página **Workloads**, pulsad el indicador de concurrencia del worker y ponedlo a `512` (los 4 ranks por `max_num_seqs`).
+
+   <Aside type="note" title="Cachés de kernels">
+   El paso 1 desempaquetó la caché de kernels JIT en `/workspace/jit-cache`. Si aun así los kernels se compilan en el primer uso, indicádselo a DeepInfer en `env`: `DG_JIT_CACHE_DIR=/workspace/jit-cache/deep_gemm`, `EP_JIT_CACHE_DIR=/workspace/jit-cache/deep_ep`, `TILELANG_CACHE_DIR=/workspace/jit-cache/tilelang`, `TRITON_CACHE_DIR=/workspace/jit-cache/triton`.
+   </Aside>
+
+5. ### Cread una API key para el endpoint
+
+   Abrid Platform Management, **API Keys**, **+ New API Key**. Elegid **Specific endpoints** y marcad solo `<project>/deepinfer-v41-flash`. Pulsad **Create key** y copiad la clave `ik_live_`: el secreto solo se muestra una vez. Ved [Autenticación](/es/guides/authentication/).
+
+   Comprobad el endpoint con una petición Anthropic Messages con una herramienta:
+
+   ```bash
+   export EP="https://api.inferencekey.com/endpoint/<project>/deepinfer-v41-flash"
+   curl -s "$EP/v1/messages" \
+     -H "x-api-key: $INFERENCEKEY_API_KEY" \
+     -H "anthropic-version: 2023-06-01" \
+     -H "Content-Type: application/json" \
+     -d '{"model": "deepseek-v4.1-flash", "max_tokens": 300,
+          "messages": [{"role": "user", "content": "What is in README.md?"}],
+          "tools": [{"name": "Read", "description": "Read a file",
+                     "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}}]}'
+   ```
+
+   Un endpoint que funciona responde con un mensaje cuyo contenido trae un bloque `tool_use` para `Read`. El mismo workload responde a `/v1/chat/completions` de OpenAI, con streaming y llamadas a herramientas.
+
+6. ### Conectad Claude Code
+
+   ```bash title="Shell, antes de lanzar claude"
+   export ANTHROPIC_BASE_URL="https://api.inferencekey.com/endpoint/<project>/deepinfer-v41-flash"
+   export ANTHROPIC_API_KEY="ik_live_..."
+   export ANTHROPIC_MODEL="deepseek-v4.1-flash"
+   export ANTHROPIC_DEFAULT_HAIKU_MODEL="deepseek-v4.1-flash"
+   export CLAUDE_CODE_MAX_CONTEXT_TOKENS=500000
+   export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+   claude
+   ```
+
+   | Variable | Por qué |
+   | --- | --- |
+   | `ANTHROPIC_BASE_URL` | La URL base del workload. Claude Code añade `/v1/messages`, así que termina en el slug del workload. |
+   | `ANTHROPIC_API_KEY` | Vuestra clave `ik_live_`, enviada como `x-api-key`. No pongáis además `ANTHROPIC_AUTH_TOKEN` con otro valor: dos claves distintas dan 401. |
+   | `ANTHROPIC_MODEL` | El nombre de modelo del workload. El endpoint acepta el slug del workload, su nombre de modelo o `default`, nunca un id de modelo de Claude. |
+   | `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Las tareas en segundo plano usan el alias Haiku; mandadlas al mismo modelo. |
+   | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | La ventana de contexto con la que cuenta Claude Code, y por tanto dónde compacta. Mantenedla por debajo del `max_model_len` del workload (1.064.960 aquí). 500.000 es el contexto de las pruebas de 500K. |
+   | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | Evita que Claude Code llame a Anthropic para cualquier otra cosa. |
+
+   En la prueba, Claude Code contra este endpoint terminó una tarea de programación pequeña (implementar una función para que pase una batería de 15 tests) en 39 s con 14 llamadas a herramientas, y pasaron los 15 tests.
+
+</Steps>
+
+## Resultados en 4x B200
+
+Medidos el 24 y el 25 de octubre de 2026 con la configuración de arriba. Agentes de programación simulados, con tamaños de turno sacados de 30 días de llamadas reales de Claude Code y 3 s entre turnos, así que casi todos los agentes están activos a la vez. Un paso se aprueba cuando el tiempo hasta el primer token (TTFT) p95 es de 15 s como mucho, la velocidad por usuario p50 es de al menos 20 tok/s y la p10 de al menos 10, el acierto de caché es de al menos el 90 % y los errores se quedan por debajo del 1 %.
+
+| Contexto | Agentes a la vez | TTFT p50 / p95 | tok/s por agente p50 / p10 | Caché | Veredicto |
+| --- | --- | --- | --- | --- | --- |
+| 128K | 300 | 5,6 / 14,8 s | 35 / 16 | 98 % | aprobado |
+| 500K | 50 | 2,5 / 4,4 s | 163 / 100 | 100 % | aprobado |
+| 500K | 100 | 2,6 / 37 s | 135 / 39 | 99 % | solo falla el p95 (unos 1,8M tokens de entrada por segundo) |
+| 1M | 48 | 3,6 / 28,9 s | 69 / 22 | 100 % | solo falla el p95 |
+
+- **Errores:** 0 en todos los pasos.
+- **Arranque en frío:** 397 conversaciones de unos 440K tokens cada una, sin nada en caché, pasaron en 14,6 minutos (unos 176M tokens), con 0 errores.
+- **Respuestas desde la caché:** el mismo prompt largo (de 16K a 200K tokens, con un dato escondido) enviado en frío y otra vez: las dos respuestas encontraron el dato y coincidieron, 5 de 5; la repetición desde la caché tardó de 0,8 a 1,5 s en vez de 1,3 a 20,6 s.
+- **Coste:** la máquina 4x B200 en la nube de InferenceKey cuesta 27.900 USD al mes. A los 1,8M tokens de entrada por segundo medidos, sale a unos 0,006 USD por millón de tokens de entrada, unas 80 veces menos que la API de Claude para un mes intenso real de Claude Code (0,47 USD por millón). Frente a 200 suscripciones de Claude Max (40.000 USD al mes) es un 30 % menos, aproximadamente.
+
+<Aside type="note" title="De dónde salen las 200 suscripciones">
+Las 200 son una cifra modelada, no medida: un simulador calibrado con estas pruebas aguanta 400 agentes con contextos de 500K que crecen con un TTFT p95 por debajo de 30 s, y las 200 suscripciones suponen que cada usuario intensivo tiene 2 agentes funcionando a la vez todo el día. Si cada suscriptor es tan intensivo como el usuario de referencia, la cifra más estricta del simulador es de unas 80 suscripciones. El [artículo de research](https://inferencekey.com/es/research/deepinfer-4xb200-one-machine-claude-code) explica las dos.
+</Aside>
+
+## Límites
+
+- **Hardware:** probado solo en 4x B200. 8 GPU (`ep: 8`) y B300 no están verificados.
+- **Las sesiones activas las limita el pool de la GPU.** L1 mantiene calientes en la RAM del host las sesiones inactivas, pero toda secuencia en ejecución tiene que estar en la GPU. A 500K, 200 agentes que solo paran unos segundos superan el pool (unas 120 sesiones de 450K tokens): el acierto de caché cayó al 41 % y el TTFT p50 subió a 151 s. L1 compensa con sesiones a ritmo humano y muchas más sesiones de las que caben en la GPU.
+- **Ritmo de peor caso.** Todos los pasos medidos usaron 3 s entre turnos. Los desarrolladores reales paran más, lo que ayuda; no se midió.
+- **Si cae un rank, cae el backend.** Los ranks van sincronizados: si uno muere, fallan todos los streams abiertos y las peticiones nuevas reciben 500 hasta que el backend se reinicia.
+- **Nombres de modelo.** El endpoint solo acepta el slug del workload, su nombre de modelo (`deepseek-v4.1-flash`) o `default`.
+- **Calidad.** Se comprobó que la caché da las mismas respuestas que una ejecución en frío. La calidad del modelo programando no la hemos medido nosotros; Claude Code está pensado para modelos de Claude, así que evaluadlo con vuestras propias tareas.
+
+## Solución de problemas
+
+| Síntoma | Causa probable | Solución |
+| --- | --- | --- |
+| La carga tarda más de 10 minutos o no termina | Los pesos están en un volumen de red. | Recread el worker con disco de contenedor local y sin volumen de red, y volved a descargar los pesos. |
+| El workload se queda en "Preparing backend" y el worker registra un timeout de readiness | Falta `ready_timeout_secs`: por defecto son 300 s. | Poned `ready_timeout_secs: 5400` en la configuración. |
+| `cached_tokens` es 0 en cada repetición | DeepInfer sin el parche de caché de prefijos. | Usad el paquete precompilado del paso 1, o poned `prefix_cache: false`. |
+| El backend registra que L1 está desactivada | No hay RAM libre suficiente para el presupuesto fijado, o al motor le falta algo que L1 necesita. | Bajad `l1_host_gb`, o funcionad solo con L0. |
+| Claude Code recibe 400 "Model ... is not available on this endpoint" | Ha llegado al endpoint un id de modelo de Claude. | Poned `ANTHROPIC_MODEL` y `ANTHROPIC_DEFAULT_HAIKU_MODEL` a `deepseek-v4.1-flash`. |
+| Muchos agentes esperan en cola con las GPU ociosas | La concurrencia del worker sigue en 1. | Subid **Concurrent requests** a 512 (paso 4). |
+
+## Siguientes pasos
+
+<CardGrid>
+  <LinkCard title="El artículo de research" description="Todas las pruebas, las gráficas y la comparación de costes." href="https://inferencekey.com/es/research/deepinfer-4xb200-one-machine-claude-code" />
+  <LinkCard title="custom-backend-deepinfer" description="El código del backend, todas las claves de configuración y los tests sin GPU." href="https://github.com/inferencekey/inferencekey-sdk/tree/main/examples/custom-backend-deepinfer" />
+  <LinkCard title="Custom backends" description="El contrato setup() / chat(), el empaquetado y la publicación." href="/es/guides/custom-backends/" />
+  <LinkCard title="Despliega tu propio asistente de código" description="Claude Code contra un workload de vLLM en una sola GPU." href="/es/guides/deploy-your-own-code-assistant/" />
+</CardGrid>
