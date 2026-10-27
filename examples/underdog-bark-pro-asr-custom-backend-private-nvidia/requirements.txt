@@ -1,0 +1,17 @@
+# Requirements of the CUSTOM BACKEND (installed by the worker into the
+# backend's own venv, Python 3.12). The client side (main.py) only needs the
+# SDK, `requests` and the scoring helpers, see README.
+
+# InferenceKey SDK runtime: provides `python -m inferencekey.backend.serve`.
+inferencekey
+
+# The set the Bark 3.0 Pro authors pin (runtime/requirements.txt at revision
+# 4b5c51e0, 2026-10-15) plus their PyTorch version. torch 2.8.0 wheels on PyPI
+# are CUDA 12.8 builds: the GPU driver must support CUDA 12.8.
+torch==2.8.0
+transformers==5.19.0
+numpy==2.4.6
+librosa==0.11.0
+soundfile==0.14.0
+soxr==1.1.0
+huggingface-hub>=1.31.0,<3.0
