@@ -1,0 +1,32 @@
+# Requirements of the CUSTOM BACKEND (installed by the worker with uv into the
+# backend's own venv). The client side (main.py) only needs the local SDK build
+# and `requests`, see README.
+
+# InferenceKey SDK runtime: provides `python -m inferencekey.backend.serve`.
+inferencekey
+
+# Ming-3.0-tts-0.5B runtime, as pinned in the authors' requirements.txt at the
+# pinned commit. The Ming source itself is fetched by backend.py (not on PyPI).
+# torch 2.6.0 from PyPI is the CUDA 12.4 build: needs an NVIDIA driver for CUDA 12.4+.
+torch==2.6.0
+torchaudio==2.6.0
+transformers==4.46.3
+tokenizers
+accelerate==1.3.0
+numpy
+soundfile==0.12.1
+tqdm
+loguru
+x_transformers==2.9.2
+diffusers==0.33.0
+onnxruntime
+inflect
+einops
+packaging
+
+# Text normalization (numbers, dates, units). The authors suggest conda; the
+# PyPI wheel works on Linux x86_64 with CPython 3.10 to 3.13.
+pynini==2.1.6.post1
+
+# Weights download (3.0 GB).
+huggingface_hub[hf_xet]
