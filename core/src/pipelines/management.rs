@@ -323,7 +323,8 @@ fn normalize_slug(spec: &WorkloadSpec) -> WorkloadSpec {
 
 /// Delete the workload named by `slug` from `project_id`, returning whether it
 /// existed. Idempotent: a slug that isn't there resolves to `Ok(false)` rather
-/// than an error, so cleanup-on-exit is safe to call unconditionally.
+/// than an error, so cleanup-on-exit is safe to call unconditionally. The slug
+/// is canonicalised first, like `ensure()`, so it finds what `ensure()` created.
 ///
 /// On the platform side this also tears down any cloud GPUs the autoscaler had
 /// provisioned for the workload (private workers are only unassigned), so a
@@ -337,7 +338,7 @@ pub async fn delete(
     slug: &str,
 ) -> CoreResult<bool> {
     let ctx = Ctx { http, base_url, sdk_token, project_id };
-    match find_by_slug(&ctx, slug).await? {
+    match find_by_slug(&ctx, &canonical_slug(slug)).await? {
         None => Ok(false),
         Some(live) => {
             delete_workload(&ctx, &live.id).await?;
@@ -911,6 +912,27 @@ mod tests {
         assert!(
             calls[1].1.ends_with("/api/workloads/wl-doomed"),
             "deletes the resolved id, got {}",
+            calls[1].1
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_canonicalizes_slug_before_lookup() {
+        // `ensure()` stores the canonical slug, so `delete()` with the same
+        // non-canonical declared slug must still find and delete it.
+        let http = DeleteHttp::new(json!({ "workloads": [
+            workload_json("some-dotted-slug", TaskType::Text2Text, Backend::Vllm),
+        ]}));
+        let existed = delete(http.as_ref(), "https://api.test", "ik_sdk_x", "proj", "Some.Dotted Slug")
+            .await
+            .expect("delete ok");
+        assert!(existed, "canonical slug present → returns true");
+        let calls = http.calls();
+        assert_eq!(calls.len(), 2, "list GET then DELETE");
+        assert_eq!(calls[1].0, "DELETE");
+        assert!(
+            calls[1].1.ends_with("/api/workloads/wl-some-dotted-slug"),
+            "deletes the canonical workload, got {}",
             calls[1].1
         );
     }

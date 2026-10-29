@@ -28,7 +28,7 @@ Examples assume `INFERENCEKEY_SDK_TOKEN` (control plane) and `INFERENCEKEY_PROJE
 
 `execution_policy` is `fixed | scheduled | autoscaling`. It defaults on the server when omitted; set it explicitly for anything other than a single always-on replica. Policy details ride in `execution_policy_config`.
 
-- **`fixed`** — one always-on replica. The default mental model for an interactive endpoint.
+- **`fixed`**: one always-on replica. The default mental model for an interactive endpoint.
 - **`scheduled`** — runs on a window/cron. Good for nightly batch embedding or a daytime-only assistant.
 - **`autoscaling`** — replica count tracks load between a floor and a ceiling. Good for spiky chat or image traffic.
 
