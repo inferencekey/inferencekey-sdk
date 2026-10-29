@@ -14,7 +14,8 @@ Contract shape — this backend implements the SDK's typed **forecast** contract
 
 * input  — ``{"id": "f1", "target": [...], "horizon": 24, "freq": "D",
   "quantile_levels": [0.1, 0.5, 0.9], "past_covariates": {...},
-  "future_covariates": {...}}`` (only ``id``/``target``/``horizon`` required).
+  "future_covariates": {...}}`` (only ``target``/``horizon`` required; ``id``
+  is optional and ``series_id`` is its alias).
 * output — ``{"forecast": {"median": [...], "timestamps": [...],
   "quantiles": {"0.1": [...], "0.9": [...]}}}``.
 

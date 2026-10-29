@@ -17,8 +17,9 @@ Contract shape — this backend implements the SDK's typed **forecast** contract
 ``process`` shape. See ``inferencekey.backend`` for the dataclasses.
 
 * input  — ``{"id": "f1", "target": [...], "horizon": 24, "freq": "D",
-  "quantile_levels": [0.1, 0.5, 0.9]}`` (only ``id``/``target``/``horizon``
-  required; covariates accepted but ignored).
+  "quantile_levels": [0.1, 0.5, 0.9]}`` (only ``target``/``horizon``
+  required; ``id`` is optional and ``series_id`` is its alias; covariates
+  accepted but ignored).
 * output — ``{"forecast": {"median": [...], "timestamps": [...],
   "quantiles": {"0.1": [...], "0.9": [...]}}}``.
 

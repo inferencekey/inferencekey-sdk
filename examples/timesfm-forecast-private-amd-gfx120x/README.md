@@ -17,7 +17,8 @@ example, which models covariates natively.
 
 ## Request id
 The `/forecast` body's `id` is optional: it is only a correlation id that the
-response echoes. When it is missing, empty or not a string, the SDK uses
+backend receives as `request.id` (useful in backend logs); the response body
+does not include it. When it is missing, empty or not a string, the SDK uses
 `series_id` instead, and when that is not usable either it generates a UUID.
 Behind a gateway such as LiteLLM, whose pass-through strips a top-level `id`
 from the body, send `series_id`:

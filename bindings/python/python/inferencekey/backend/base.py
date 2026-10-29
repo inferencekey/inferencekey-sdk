@@ -323,8 +323,9 @@ class ForecastRequest:
     """One time-series forecast request handed to :meth:`CustomBackend.forecast`.
 
     A single series per request (batching multiple series is out of scope for
-    v1). ``id`` correlates the request across logs and responses, mirroring
-    :class:`Job`, and the response echoes it.
+    v1). ``id`` is a correlation id the backend receives as ``request.id``
+    (useful in backend logs), mirroring :class:`Job`; the response body does
+    not include it.
 
     ``id`` is optional on the wire. When it is missing, empty or not a string,
     a non-empty string ``series_id`` is used instead, and when neither is
