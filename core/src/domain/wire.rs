@@ -99,6 +99,11 @@ pub struct WorkloadResponse {
     pub execution_policy: Option<ExecutionPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_policy_config: Option<Value>,
+    /// The policy config exactly as last sent, before the Manager normalized it
+    /// into `execution_policy_config`. Absent on older Managers, on a workload
+    /// created without a config and after a policy change without a config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_policy_config_requested: Option<Value>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -189,6 +194,7 @@ pub fn diff_workload(spec: &WorkloadSpec, current: &WorkloadResponse) -> Vec<Fie
         policy_kind_changed.clone(),
         diff_execution_policy_config(
             &current.execution_policy_config,
+            &current.execution_policy_config_requested,
             &spec.execution_policy_config,
             policy_kind_changed.is_some(),
         ),
@@ -273,13 +279,23 @@ fn diff_execution_policy(
 /// `fixed → autoscaling` MUST carry the new config in the same PATCH — otherwise
 /// the server validates the new kind against the stale (often empty) config and
 /// rejects it (e.g. "max_hourly_cost_usd must be greater than zero").
+///
+/// The Manager stores a normalized config (defaults filled in, GPU names
+/// expanded), which never equals what the caller asked for. When it also
+/// returns the config as last sent (`requested`), the desired config is
+/// compared with that one, so a second `ensure()` with the same config sends
+/// no PATCH. Without it (older Managers) the normalized config is compared.
 fn diff_execution_policy_config(
     current: &Option<Value>,
+    requested: &Option<Value>,
     desired: &Option<Value>,
     policy_kind_changed: bool,
 ) -> Option<FieldDiff> {
     let want = desired.as_ref()?;
-    let have = current.clone().unwrap_or(Value::Null);
+    let have = requested
+        .clone()
+        .or_else(|| current.clone())
+        .unwrap_or(Value::Null);
     match have == *want && !policy_kind_changed {
         true => None,
         false => Some(named_diff("execution_policy_config", have, want.clone())),
@@ -376,6 +392,7 @@ mod tests {
             gpu_resource_id: None,
             execution_policy: None,
             execution_policy_config: None,
+            execution_policy_config_requested: None,
             created_at: "2026-06-15T00:00:00Z".to_string(),
             updated_at: "2026-06-15T00:00:00Z".to_string(),
         }
@@ -741,6 +758,81 @@ mod tests {
                     ..r
                 },
                 expected_fields: &[],
+            },
+            Case {
+                // The Manager normalizes the stored config; the config as last
+                // sent equals the spec, so a second ensure() sends no PATCH.
+                name: "requested config in sync despite a normalized stored one",
+                mutate_spec: |s| WorkloadSpec {
+                    execution_policy: Some(ExecutionPolicy::Autoscaling),
+                    execution_policy_config: Some(json!({ "max_hourly_cost_usd": 5.0 })),
+                    ..s
+                },
+                mutate_resp: |r| WorkloadResponse {
+                    execution_policy: Some(ExecutionPolicy::Autoscaling),
+                    execution_policy_config: Some(json!({
+                        "schema_version": 1,
+                        "max_hourly_cost_usd": 5.0,
+                        "max_in_flight": 20,
+                    })),
+                    execution_policy_config_requested: Some(json!({ "max_hourly_cost_usd": 5.0 })),
+                    ..r
+                },
+                expected_fields: &[],
+            },
+            Case {
+                // The config as last sent differs from the spec: a real change,
+                // even when the normalized stored one happens to match.
+                name: "requested config drifts",
+                mutate_spec: |s| WorkloadSpec {
+                    execution_policy: Some(ExecutionPolicy::Autoscaling),
+                    execution_policy_config: Some(json!({ "max_hourly_cost_usd": 9.0 })),
+                    ..s
+                },
+                mutate_resp: |r| WorkloadResponse {
+                    execution_policy: Some(ExecutionPolicy::Autoscaling),
+                    execution_policy_config: Some(json!({ "max_hourly_cost_usd": 9.0 })),
+                    execution_policy_config_requested: Some(json!({ "max_hourly_cost_usd": 5.0 })),
+                    ..r
+                },
+                expected_fields: &["execution_policy_config"],
+            },
+            Case {
+                // An older Manager returns no requested config: the normalized
+                // stored one is compared, as before.
+                name: "requested config absent compares the stored one",
+                mutate_spec: |s| WorkloadSpec {
+                    execution_policy: Some(ExecutionPolicy::Autoscaling),
+                    execution_policy_config: Some(json!({ "max_hourly_cost_usd": 5.0 })),
+                    ..s
+                },
+                mutate_resp: |r| WorkloadResponse {
+                    execution_policy: Some(ExecutionPolicy::Autoscaling),
+                    execution_policy_config: Some(json!({
+                        "schema_version": 1,
+                        "max_hourly_cost_usd": 5.0,
+                    })),
+                    execution_policy_config_requested: None,
+                    ..r
+                },
+                expected_fields: &["execution_policy_config"],
+            },
+            Case {
+                // A policy kind change still carries the config, even when the
+                // config as last sent equals the spec.
+                name: "policy kind change carries its config despite a matching requested one",
+                mutate_spec: |s| WorkloadSpec {
+                    execution_policy: Some(ExecutionPolicy::Autoscaling),
+                    execution_policy_config: Some(json!({ "max_hourly_cost_usd": 5.0 })),
+                    ..s
+                },
+                mutate_resp: |r| WorkloadResponse {
+                    execution_policy: Some(ExecutionPolicy::Scheduled),
+                    execution_policy_config: Some(json!({ "schema_version": 1 })),
+                    execution_policy_config_requested: Some(json!({ "max_hourly_cost_usd": 5.0 })),
+                    ..r
+                },
+                expected_fields: &["execution_policy", "execution_policy_config"],
             },
             Case {
                 name: "multiple fields, stable order",

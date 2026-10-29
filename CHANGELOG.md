@@ -5,6 +5,27 @@ on PyPI; entries are listed newest first.
 
 ## Unreleased
 
+### Workloads (`ensure()` and `delete()`)
+
+- **`ensure()` converges for `scheduled` and `autoscaling` configs.** The
+  Manager stores a normalized `execution_policy_config` (defaults filled in,
+  GPU names expanded), so a second `ensure()` with the same config used to see
+  drift and send a PATCH on every run. `WorkloadResponse` now reads the new
+  optional `execution_policy_config_requested` (the config exactly as last
+  sent) and the diff compares the spec with it when present. Older Managers
+  that do not return it keep the previous behavior (a PATCH on every run). A
+  change of policy kind still sends the config with it.
+- **Fixed examples and docs no longer pass `replicas`.** A `fixed` workload
+  takes no `execution_policy_config`; the examples and doc snippets that sent
+  `{"replicas": N}` now omit it.
+- **`delete()` canonicalizes the slug** the same way `ensure()` does, so a
+  workload created from a non-canonical slug can be deleted with that slug.
+- **Corrected docs shapes.** The `scheduled` snippets used `window` / `cron`
+  keys the Manager rejects (`400 scheduled.rules must not be empty`); they now
+  use `timezone` + `rules` in `keep_queued` mode with a `workers` block. The
+  private-worker `autoscaling` shape now carries the required
+  `max_hourly_cost_usd`.
+
 ### Custom backend runtime (`inferencekey.backend.serve`)
 
 - **Forecast `id` is optional.** `ForecastRequest.from_wire` no longer answers

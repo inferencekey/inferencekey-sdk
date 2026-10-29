@@ -166,6 +166,12 @@ ref = mgmt.ensure(WorkloadSpec(
     backend=Backend.VLLM,
     command="vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
     execution_policy="autoscaling",
+    execution_policy_config={
+        "min_workers": 0, "max_workers": 2, "max_hourly_cost_usd": 5.0,
+        "workers": {"source": "cloud", "cloud_pool": {
+            "gpu_pool": ["NVIDIA A100-SXM4-80GB"], "max_hourly_cost_usd": 5.0, "max_instances": 2,
+        }},
+    },
 ))
 ```
   </TabItem>
@@ -178,6 +184,12 @@ const ref = await mgmt.ensure({
   backend: Backend.Vllm,
   command: "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
   executionPolicy: "autoscaling",
+  executionPolicyConfig: {
+    min_workers: 0, max_workers: 2, max_hourly_cost_usd: 5.0,
+    workers: { source: "cloud", cloud_pool: {
+      gpu_pool: ["NVIDIA A100-SXM4-80GB"], max_hourly_cost_usd: 5.0, max_instances: 2,
+    }},
+  },
 });
 ```
   </TabItem>
@@ -187,18 +199,38 @@ const ref = await mgmt.ensure({
 
 The policy *name* is the stable contract; `execution_policy_config` carries the per-policy parameters and is validated by the Manager. The keys below are the ones the Manager actually validates.
 
+The Manager stores a normalized copy of the config (it fills in defaults such as `schema_version` and `max_in_flight` and expands GPU names), and also returns the config exactly as you sent it in `execution_policy_config_requested`. `ensure()` compares your spec with that field, so running it again with the same config sends no PATCH, whatever the policy. An older Manager that does not return the field makes `ensure()` compare with the normalized copy instead, which never matches a `scheduled` or `autoscaling` config: every run then sends a PATCH with the same values.
+
 **`fixed`**: a constant allocation with no configurable fields. Omit `execution_policy_config`; the Manager stores it as:
 
 ```json
 { "schema_version": 1 }
 ```
 
-Passing any key there makes every `ensure()` see drift against that stored value and send a PATCH.
-
-**`scheduled`** — a window or cron expression:
+**`scheduled`**: weekly time windows in a timezone, served by the `workers` you name. In the default `keep_queued` mode each rule lists `days` (`mon` to `sun`), `from` and `to` (`HH:MM`, a `to` earlier than `from` wraps past midnight) and the `min_workers` / `max_workers` while it is open; inside a window workers start when jobs queue up, and outside every window the workload drains to zero. `rules` must not be empty and `workers` is required (same `source` blocks as autoscaling below):
 
 ```json
-{ "cron": "0 2 * * *" }              // or: { "window": "Mon-Fri 08:00-20:00 Europe/Madrid" }
+{
+  "mode": "keep_queued",
+  "timezone": "Europe/Madrid",
+  "rules": [
+    {
+      "days": ["mon", "tue", "wed", "thu", "fri"],
+      "from": "08:00",
+      "to": "20:00",
+      "min_workers": 0,
+      "max_workers": 2
+    }
+  ],
+  "workers": {
+    "source": "cloud",
+    "cloud_pool": {
+      "gpu_pool": ["NVIDIA A100-SXM4-80GB"],
+      "max_hourly_cost_usd": 5.0,
+      "max_instances": 2
+    }
+  }
+}
 ```
 
 **`autoscaling` (cloud)** — scales cloud workers between a floor and a ceiling. Worker bounds are `min_workers` / `max_workers` (**not** `min_replicas`/`max_replicas`). A cost ceiling `max_hourly_cost_usd` (> 0) is **required**, and `workers.cloud_pool` needs a non-empty `gpu_pool` of catalog display names:
@@ -222,12 +254,13 @@ Passing any key there makes every `ensure()` see drift against that stored value
 
 `gpu_pool` entries are GPU display names from the cloud catalog (dashboard → **GPU Resources**). `allowed_cuda_versions` is an optional CUDA pin. A flat `gpu_pool` at the root is a legacy form that **cannot** carry `allowed_cuda_versions` — prefer the `workers.cloud_pool` shape above.
 
-**`autoscaling` (private worker)** — scales across your own registered workers instead of cloud GPUs:
+**`autoscaling` (private worker)**: scales across your own registered workers instead of cloud GPUs. `max_hourly_cost_usd` (> 0) is required here too, even when every worker is private:
 
 ```json
 {
   "min_workers": 1,
   "max_workers": 4,
+  "max_hourly_cost_usd": 5.0,
   "workers": {
     "source": "private",
     "private_worker_ids": ["wrk_7Yc2..."]

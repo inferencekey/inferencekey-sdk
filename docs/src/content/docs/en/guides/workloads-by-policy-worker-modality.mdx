@@ -28,8 +28,8 @@ Examples assume `INFERENCEKEY_SDK_TOKEN` (control plane) and `INFERENCEKEY_PROJE
 
 `execution_policy` is `fixed | scheduled | autoscaling`. It defaults on the server when omitted; set it explicitly for anything other than a single always-on replica. Policy details ride in `execution_policy_config`.
 
-- **`fixed`**: one always-on replica. The default mental model for an interactive endpoint.
-- **`scheduled`** — runs on a window/cron. Good for nightly batch embedding or a daytime-only assistant.
+- **`fixed`**: always on, no scaling. The default mental model for an interactive endpoint.
+- **`scheduled`**: runs inside weekly time windows (`rules` of days plus `from`/`to` hours in a `timezone`) on the `workers` you name. Good for nightly batch embedding or a daytime-only assistant.
 - **`autoscaling`** — replica count tracks load between a floor and a ceiling. Good for spiky chat or image traffic.
 
 <Aside type="note">
@@ -212,10 +212,20 @@ mgmt.ensure(WorkloadSpec(**base,
         },
     }))
 
-# Scheduled: daytime-only assistant.
+# Scheduled: daytime-only assistant, Mon-Fri 08:00-20:00 Madrid time.
+# Inside the window workers start when requests queue up (keep_queued).
 mgmt.ensure(WorkloadSpec(**base,
     execution_policy=ExecutionPolicy.SCHEDULED,
-    execution_policy_config={"window": "Mon-Fri 08:00-20:00 Europe/Madrid"}))
+    execution_policy_config={
+        "mode": "keep_queued",
+        "timezone": "Europe/Madrid",
+        "rules": [{"days": ["mon", "tue", "wed", "thu", "fri"],
+                   "from": "08:00", "to": "20:00",
+                   "min_workers": 0, "max_workers": 2}],
+        "workers": {"source": "cloud", "cloud_pool": {
+            "gpu_pool": ["NVIDIA A100-SXM4-80GB"], "max_hourly_cost_usd": 5.0, "max_instances": 2,
+        }},
+    }))
 
 # Private worker + fixed: pin to your own GPU box.
 mgmt.ensure(WorkloadSpec(**base,
@@ -258,10 +268,20 @@ await mgmt.ensure({ ...base,
     },
   } });
 
-// Scheduled: daytime-only assistant.
+// Scheduled: daytime-only assistant, Mon-Fri 08:00-20:00 Madrid time.
+// Inside the window workers start when requests queue up (keep_queued).
 await mgmt.ensure({ ...base,
   executionPolicy: "scheduled",
-  executionPolicyConfig: { window: "Mon-Fri 08:00-20:00 Europe/Madrid" } });
+  executionPolicyConfig: {
+    mode: "keep_queued",
+    timezone: "Europe/Madrid",
+    rules: [{ days: ["mon", "tue", "wed", "thu", "fri"],
+              from: "08:00", to: "20:00",
+              min_workers: 0, max_workers: 2 }],
+    workers: { source: "cloud", cloud_pool: {
+      gpu_pool: ["NVIDIA A100-SXM4-80GB"], max_hourly_cost_usd: 5.0, max_instances: 2,
+    }},
+  } });
 
 // Private worker + fixed: pin to your own GPU box.
 await mgmt.ensure({ ...base,
@@ -298,7 +318,16 @@ ref = mgmt.ensure(WorkloadSpec(
     task_type="embedding",
     command="vllm serve BAAI/bge-large-en-v1.5 --task embed",
     execution_policy=ExecutionPolicy.SCHEDULED,
-    execution_policy_config={"cron": "0 2 * * *"},  # nightly at 02:00
+    execution_policy_config={  # nightly window, 02:00-05:00 UTC
+        "mode": "keep_queued",
+        "timezone": "UTC",
+        "rules": [{"days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+                   "from": "02:00", "to": "05:00",
+                   "min_workers": 0, "max_workers": 1}],
+        "workers": {"source": "cloud", "cloud_pool": {
+            "gpu_pool": ["NVIDIA A100-SXM4-80GB"], "max_hourly_cost_usd": 5.0, "max_instances": 1,
+        }},
+    },
 ))
 ```
 
@@ -318,7 +347,16 @@ const ref = await mgmt.ensure({
   taskType: "embedding",
   command: "vllm serve BAAI/bge-large-en-v1.5 --task embed",
   executionPolicy: "scheduled",
-  executionPolicyConfig: { cron: "0 2 * * *" }, // nightly at 02:00
+  executionPolicyConfig: { // nightly window, 02:00-05:00 UTC
+    mode: "keep_queued",
+    timezone: "UTC",
+    rules: [{ days: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+              from: "02:00", to: "05:00",
+              min_workers: 0, max_workers: 1 }],
+    workers: { source: "cloud", cloud_pool: {
+      gpu_pool: ["NVIDIA A100-SXM4-80GB"], max_hourly_cost_usd: 5.0, max_instances: 1,
+    }},
+  },
 });
 ```
 
@@ -378,6 +416,8 @@ mgmt.ensure(WorkloadSpec(**base, worker_id="wrk_7Yc2...",
     execution_policy=ExecutionPolicy.AUTOSCALING,
     execution_policy_config={
         "min_workers": 1, "max_workers": 4,
+        # required (> 0) even when every worker is private
+        "max_hourly_cost_usd": 5.0,
         "workers": {"source": "private", "private_worker_ids": ["wrk_7Yc2..."]},
     }))
 ```
@@ -404,6 +444,8 @@ await mgmt.ensure({ ...base, workerId: "wrk_7Yc2...",
   executionPolicy: "autoscaling",
   executionPolicyConfig: {
     min_workers: 1, max_workers: 4,
+    // required (> 0) even when every worker is private
+    max_hourly_cost_usd: 5.0,
     workers: { source: "private", private_worker_ids: ["wrk_7Yc2..."] },
   } });
 ```
@@ -543,7 +585,14 @@ mgmt.ensure(WorkloadSpec(**base,
 # Scheduled (private worker): batch render overnight on your hardware.
 mgmt.ensure(WorkloadSpec(**base, worker_id="wrk_7Yc2...",
     execution_policy=ExecutionPolicy.SCHEDULED,
-    execution_policy_config={"cron": "0 1 * * *"}))
+    execution_policy_config={  # overnight window, 01:00-05:00 UTC
+        "mode": "keep_queued",
+        "timezone": "UTC",
+        "rules": [{"days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+                   "from": "01:00", "to": "05:00",
+                   "min_workers": 0, "max_workers": 1}],
+        "workers": {"source": "private", "private_worker_ids": ["wrk_7Yc2..."]},
+    }))
 ```
 
   </TabItem>
@@ -566,7 +615,14 @@ await mgmt.ensure({ ...base,
 // Scheduled (private worker): batch render overnight on your hardware.
 await mgmt.ensure({ ...base, workerId: "wrk_7Yc2...",
   executionPolicy: "scheduled",
-  executionPolicyConfig: { cron: "0 1 * * *" } });
+  executionPolicyConfig: { // overnight window, 01:00-05:00 UTC
+    mode: "keep_queued",
+    timezone: "UTC",
+    rules: [{ days: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+              from: "01:00", to: "05:00",
+              min_workers: 0, max_workers: 1 }],
+    workers: { source: "private", private_worker_ids: ["wrk_7Yc2..."] },
+  } });
 ```
 
   </TabItem>
@@ -695,7 +751,16 @@ mgmt.ensure(WorkloadSpec(**base,
 # Scheduled (cloud): generate daily briefings each morning.
 mgmt.ensure(WorkloadSpec(**base,
     execution_policy=ExecutionPolicy.SCHEDULED,
-    execution_policy_config={"cron": "0 6 * * *"}))
+    execution_policy_config={  # morning window, 06:00-09:00 UTC
+        "mode": "keep_queued",
+        "timezone": "UTC",
+        "rules": [{"days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+                   "from": "06:00", "to": "09:00",
+                   "min_workers": 0, "max_workers": 1}],
+        "workers": {"source": "cloud", "cloud_pool": {
+            "gpu_pool": ["NVIDIA A100-SXM4-80GB"], "max_hourly_cost_usd": 5.0, "max_instances": 1,
+        }},
+    }))
 ```
 
   </TabItem>
@@ -724,7 +789,16 @@ await mgmt.ensure({ ...base,
 // Scheduled (cloud): generate daily briefings each morning.
 await mgmt.ensure({ ...base,
   executionPolicy: "scheduled",
-  executionPolicyConfig: { cron: "0 6 * * *" } });
+  executionPolicyConfig: { // morning window, 06:00-09:00 UTC
+    mode: "keep_queued",
+    timezone: "UTC",
+    rules: [{ days: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+              from: "06:00", to: "09:00",
+              min_workers: 0, max_workers: 1 }],
+    workers: { source: "cloud", cloud_pool: {
+      gpu_pool: ["NVIDIA A100-SXM4-80GB"], max_hourly_cost_usd: 5.0, max_instances: 1,
+    }},
+  } });
 ```
 
   </TabItem>
@@ -855,7 +929,16 @@ mgmt.ensure(WorkloadSpec(**base, worker_id="wrk_7Yc2...",
 # Scheduled (cloud): transcribe the day's recordings overnight.
 mgmt.ensure(WorkloadSpec(**base,
     execution_policy=ExecutionPolicy.SCHEDULED,
-    execution_policy_config={"cron": "0 0 * * *"}))
+    execution_policy_config={  # overnight window, 00:00-04:00 UTC
+        "mode": "keep_queued",
+        "timezone": "UTC",
+        "rules": [{"days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+                   "from": "00:00", "to": "04:00",
+                   "min_workers": 0, "max_workers": 1}],
+        "workers": {"source": "cloud", "cloud_pool": {
+            "gpu_pool": ["NVIDIA A100-SXM4-80GB"], "max_hourly_cost_usd": 5.0, "max_instances": 1,
+        }},
+    }))
 ```
 
   </TabItem>
@@ -877,7 +960,16 @@ await mgmt.ensure({ ...base, workerId: "wrk_7Yc2...",
 // Scheduled (cloud): transcribe the day's recordings overnight.
 await mgmt.ensure({ ...base,
   executionPolicy: "scheduled",
-  executionPolicyConfig: { cron: "0 0 * * *" } });
+  executionPolicyConfig: { // overnight window, 00:00-04:00 UTC
+    mode: "keep_queued",
+    timezone: "UTC",
+    rules: [{ days: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+              from: "00:00", to: "04:00",
+              min_workers: 0, max_workers: 1 }],
+    workers: { source: "cloud", cloud_pool: {
+      gpu_pool: ["NVIDIA A100-SXM4-80GB"], max_hourly_cost_usd: 5.0, max_instances: 1,
+    }},
+  } });
 ```
 
   </TabItem>
