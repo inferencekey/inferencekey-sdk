@@ -79,7 +79,6 @@ def main() -> int:
         # Private + fixed: one always-on replica. The GPU stays reserved (and
         # billing) until delete() runs — see the README's Cost & cleanup.
         execution_policy=ExecutionPolicy.FIXED,
-        execution_policy_config={"replicas": 1},
     )
 
     try:

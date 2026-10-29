@@ -187,11 +187,13 @@ const ref = await mgmt.ensure({
 
 The policy *name* is the stable contract; `execution_policy_config` carries the per-policy parameters and is validated by the Manager. The keys below are the ones the Manager actually validates.
 
-**`fixed`** — a constant allocation:
+**`fixed`** — a constant allocation with no configurable fields. Omit `execution_policy_config`; the Manager stores it as:
 
 ```json
-{ "replicas": 1 }
+{ "schema_version": 1 }
 ```
+
+Passing any key there makes every `ensure()` see drift against that stored value and send a PATCH.
 
 **`scheduled`** — a window or cron expression:
 

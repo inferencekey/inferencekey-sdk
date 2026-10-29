@@ -87,7 +87,6 @@ def main() -> int:
         worker_id=os.environ["IK_WORKER_ID"],
         # Private + fixed: one always-on replica on your GPU until delete() runs.
         execution_policy=ExecutionPolicy.FIXED,
-        execution_policy_config={"replicas": 1},
     )
     base = os.environ.get("INFERENCEKEY_BASE_URL", "https://cloud.inferencekey.com").rstrip("/")
     project = os.environ["INFERENCEKEY_PROJECT"]

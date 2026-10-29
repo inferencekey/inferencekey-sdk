@@ -28,7 +28,7 @@ Examples assume `INFERENCEKEY_SDK_TOKEN` (control plane) and `INFERENCEKEY_PROJE
 
 `execution_policy` is `fixed | scheduled | autoscaling`. It defaults on the server when omitted; set it explicitly for anything other than a single always-on replica. Policy details ride in `execution_policy_config`.
 
-- **`fixed`** — a constant set of replicas, always on. The default mental model for an interactive endpoint.
+- **`fixed`** — one always-on replica. The default mental model for an interactive endpoint.
 - **`scheduled`** — runs on a window/cron. Good for nightly batch embedding or a daytime-only assistant.
 - **`autoscaling`** — replica count tracks load between a floor and a ceiling. Good for spiky chat or image traffic.
 
@@ -113,7 +113,6 @@ ref = mgmt.ensure(WorkloadSpec(
     task_type="text2text",  # server default; explicit for clarity
     command="vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
     execution_policy=ExecutionPolicy.FIXED,
-    execution_policy_config={"replicas": 1},
 ))
 print(ref.project_slug, ref.workload_slug)  # acme support-bot
 ```
@@ -134,7 +133,6 @@ const ref = await mgmt.ensure({
   taskType: "text2text", // server default; explicit for clarity
   command: "vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192",
   executionPolicy: "fixed",
-  executionPolicyConfig: { replicas: 1 },
 });
 console.log(ref.projectSlug, ref.workloadSlug); // acme support-bot
 ```
@@ -222,8 +220,7 @@ mgmt.ensure(WorkloadSpec(**base,
 # Private worker + fixed: pin to your own GPU box.
 mgmt.ensure(WorkloadSpec(**base,
     worker_id="wrk_7Yc2...",
-    execution_policy=ExecutionPolicy.FIXED,
-    execution_policy_config={"replicas": 2}))
+    execution_policy=ExecutionPolicy.FIXED))
 ```
 
   </TabItem>
@@ -269,8 +266,7 @@ await mgmt.ensure({ ...base,
 // Private worker + fixed: pin to your own GPU box.
 await mgmt.ensure({ ...base,
   workerId: "wrk_7Yc2...",
-  executionPolicy: "fixed",
-  executionPolicyConfig: { replicas: 2 } });
+  executionPolicy: "fixed" });
 ```
 
   </TabItem>
@@ -374,7 +370,7 @@ base = dict(
 
 # Fixed (cloud): always-on for live RAG queries.
 mgmt.ensure(WorkloadSpec(**base,
-    execution_policy=ExecutionPolicy.FIXED, execution_policy_config={"replicas": 1}))
+    execution_policy=ExecutionPolicy.FIXED))
 
 # Autoscaling (private worker): scale on your own hardware. See the full
 # config shapes in Backends & policies (/reference/backends-and-policies/).
@@ -400,7 +396,7 @@ const base = {
 
 // Fixed (cloud): always-on for live RAG queries.
 await mgmt.ensure({ ...base,
-  executionPolicy: "fixed", executionPolicyConfig: { replicas: 1 } });
+  executionPolicy: "fixed" });
 
 // Autoscaling (private worker): scale on your own hardware. See the full
 // config shapes in Backends & policies (/reference/backends-and-policies/).
@@ -542,7 +538,7 @@ base = dict(
 
 # Fixed (cloud): one warm replica for predictable latency.
 mgmt.ensure(WorkloadSpec(**base,
-    execution_policy=ExecutionPolicy.FIXED, execution_policy_config={"replicas": 1}))
+    execution_policy=ExecutionPolicy.FIXED))
 
 # Scheduled (private worker): batch render overnight on your hardware.
 mgmt.ensure(WorkloadSpec(**base, worker_id="wrk_7Yc2...",
@@ -565,7 +561,7 @@ const base = {
 
 // Fixed (cloud): one warm replica for predictable latency.
 await mgmt.ensure({ ...base,
-  executionPolicy: "fixed", executionPolicyConfig: { replicas: 1 } });
+  executionPolicy: "fixed" });
 
 // Scheduled (private worker): batch render overnight on your hardware.
 await mgmt.ensure({ ...base, workerId: "wrk_7Yc2...",
@@ -603,7 +599,6 @@ ref = mgmt.ensure(WorkloadSpec(
     command="vllm-omni serve hexgrad/Kokoro-82M",
     worker_id="wrk_7Yc2...",                 # private worker
     execution_policy=ExecutionPolicy.FIXED,
-    execution_policy_config={"replicas": 1},
 ))
 ```
 
@@ -624,7 +619,6 @@ const ref = await mgmt.ensure({
   command: "vllm-omni serve hexgrad/Kokoro-82M",
   workerId: "wrk_7Yc2...",            // private worker
   executionPolicy: "fixed",
-  executionPolicyConfig: { replicas: 1 },
 });
 ```
 
@@ -856,7 +850,7 @@ base = dict(
 
 # Fixed (private worker): always-on, audio stays on your hardware.
 mgmt.ensure(WorkloadSpec(**base, worker_id="wrk_7Yc2...",
-    execution_policy=ExecutionPolicy.FIXED, execution_policy_config={"replicas": 1}))
+    execution_policy=ExecutionPolicy.FIXED))
 
 # Scheduled (cloud): transcribe the day's recordings overnight.
 mgmt.ensure(WorkloadSpec(**base,
@@ -878,7 +872,7 @@ const base = {
 
 // Fixed (private worker): always-on, audio stays on your hardware.
 await mgmt.ensure({ ...base, workerId: "wrk_7Yc2...",
-  executionPolicy: "fixed", executionPolicyConfig: { replicas: 1 } });
+  executionPolicy: "fixed" });
 
 // Scheduled (cloud): transcribe the day's recordings overnight.
 await mgmt.ensure({ ...base,

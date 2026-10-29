@@ -53,7 +53,6 @@ def main() -> int:
         worker_id=os.environ["IK_WORKER_ID"],
         config={"sglang_version": "0.5.14"},
         execution_policy=ExecutionPolicy.FIXED,
-        execution_policy_config={"replicas": 1},
     )
     try:
         t0 = time.time()

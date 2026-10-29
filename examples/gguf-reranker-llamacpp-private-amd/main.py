@@ -75,7 +75,6 @@ def main() -> int:
         worker_id=worker_id,
         # Private + fixed: one always-on replica, reserved until delete().
         execution_policy=ExecutionPolicy.FIXED,
-        execution_policy_config={"replicas": 1},
     )
 
     try:

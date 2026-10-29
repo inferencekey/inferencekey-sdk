@@ -725,6 +725,24 @@ mod tests {
                 expected_fields: &[],
             },
             Case {
+                // `fixed` has no configurable fields: the Manager stores its
+                // config as `{"schema_version": 1}`. A fixed spec that omits
+                // the config must not drift against that stored value, so a
+                // second ensure() sends no PATCH.
+                name: "fixed without config ignores the stored schema_version",
+                mutate_spec: |s| WorkloadSpec {
+                    execution_policy: Some(ExecutionPolicy::Fixed),
+                    execution_policy_config: None,
+                    ..s
+                },
+                mutate_resp: |r| WorkloadResponse {
+                    execution_policy: Some(ExecutionPolicy::Fixed),
+                    execution_policy_config: Some(json!({ "schema_version": 1 })),
+                    ..r
+                },
+                expected_fields: &[],
+            },
+            Case {
                 name: "multiple fields, stable order",
                 mutate_spec: |s| WorkloadSpec {
                     name: "renamed".to_string(),

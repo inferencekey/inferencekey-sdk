@@ -97,7 +97,6 @@ def main() -> int:
         worker_id=os.environ["IK_WORKER_ID"],
         # Private + fixed: one always-on replica on your GPU until delete() runs.
         execution_policy=ExecutionPolicy.FIXED,
-        execution_policy_config={"replicas": 1},
     )
     results: dict = {"slug": SLUG}
     try:

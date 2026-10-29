@@ -108,7 +108,6 @@ def main() -> int:
         config={"ready_timeout_secs": 3000, "request_timeout_secs": 600, "env": backend_env},
         # Private + fixed: one always-on replica on your GPU until delete() runs.
         execution_policy=ExecutionPolicy.FIXED,
-        execution_policy_config={"replicas": 1},
     )
     results: dict = {"slug": SLUG, "steps": []}
     try:

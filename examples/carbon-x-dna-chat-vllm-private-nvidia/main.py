@@ -89,7 +89,6 @@ def main() -> int:
         # Pin to your NVIDIA worker (48 GB, CUDA 13 driver). Never hard-code the id.
         worker_id=os.environ["IK_WORKER_ID"],
         execution_policy=ExecutionPolicy.FIXED,
-        execution_policy_config={"replicas": 1},
     )
 
     try:

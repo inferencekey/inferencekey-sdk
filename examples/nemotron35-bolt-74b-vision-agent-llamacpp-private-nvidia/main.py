@@ -189,7 +189,6 @@ def main() -> int:
         # Pin to your NVIDIA worker (32 GB or more). Never hard-code the id.
         worker_id=os.environ["IK_WORKER_ID"],
         execution_policy=ExecutionPolicy.FIXED,
-        execution_policy_config={"replicas": 1},
     )
     outputs = HERE / "outputs"
     outputs.mkdir(exist_ok=True)

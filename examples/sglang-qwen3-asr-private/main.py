@@ -87,7 +87,6 @@ def main() -> int:
         # Private + fixed: one always-on replica. Stays reserved (and billing)
         # until delete() runs.
         execution_policy=ExecutionPolicy.FIXED,
-        execution_policy_config={"replicas": 1},
     )
 
     try:

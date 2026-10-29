@@ -170,7 +170,6 @@ def main() -> int:
         },
         # Private + fixed: one always-on replica on your GPU until delete() runs.
         execution_policy=ExecutionPolicy.FIXED,
-        execution_policy_config={"replicas": 1},
     )
     results: dict = {"slug": SLUG}
     try:
