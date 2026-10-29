@@ -319,6 +319,26 @@ These are the OpenAI Chat Completions and Embeddings shapes. Other modalities
 The SDK's `out.text` is `choices[0].message.content`; `out.model` is the response
 `model` field.
 
+#### Defaults
+
+For a workload served by a GPU worker (llama.cpp, vLLM, SGLang, Ollama and the
+other native backends), the platform fills in these fields when the request
+leaves them out:
+
+| Field         | Sent by the client              | Not sent |
+| ------------- | ------------------------------- | -------- |
+| `max_tokens`  | Passed to the engine unchanged. | No limit from the platform: OpenAI-compatible engines (vLLM, SGLang, llama.cpp, custom `openai-chat` backends) get no `max_tokens` key and generate until the model stops or the context is full; Ollama gets `num_predict: -1` (no limit). |
+| `temperature` | Passed to the engine unchanged. | `0.7`. OpenAI uses `1.0`; send `temperature` to get another value. |
+
+Earlier versions of the platform cut a request without `max_tokens` at 256
+tokens (`finish_reason: "length"`). LiteLLM and many OpenAI SDKs do not send
+`max_tokens` by default, so their answers came back truncated. Send
+`max_tokens` when you want a limit.
+
+The asynchronous `/jobs` route of a chat workload builds the engine request the
+same way, so the same defaults apply there. Workloads of type `api-gateway`
+forward the request to the external provider, which applies its own defaults.
+
 #### Streaming
 
 Set `"stream": true` to receive Server-Sent Events. Each event is a
@@ -340,6 +360,50 @@ If the server restarts before the stream completes, the stream ends with one err
 `503` if the response had not started). The
 request is retryable: see
 [`server_shutting_down`: retry the request](/en/reference/common-errors/#server_shutting_down-retry-the-request).
+
+#### Usage in a streamed answer
+
+When the request also sends `"stream_options": {"include_usage": true}`, the
+stream carries, as OpenAI does, one more chunk right before `data: [DONE]`: same
+`id`, `object` and `model` as the other chunks, an empty `choices` array and
+the `usage` object (`prompt_tokens`, `completion_tokens`, `total_tokens`) with
+the token counts the engine reported. This example targets a workload whose
+slug is `gemma4-26b`.
+
+```bash title="Streamed chat completion with usage"
+curl -N \
+  "$INFERENCEKEY_BASE_URL/endpoint/acme/gemma4-26b/v1/chat/completions" \
+  -H "Authorization: Bearer $GEMMA_IK_LIVE" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma4-26b",
+    "messages": [{"role": "user", "content": "Say hello"}],
+    "stream": true,
+    "stream_options": {"include_usage": true}
+  }'
+```
+
+```http title="Last three frames of the stream"
+data: {"id":"chatcmpl_3f...","object":"chat.completion.chunk","created":1793280000,"model":"gemma4-26b","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl_3f...","object":"chat.completion.chunk","created":1793280000,"model":"gemma4-26b","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":9,"total_tokens":21}}
+
+data: [DONE]
+```
+
+Without `include_usage` (or with it `false`) the stream is the same minus that
+chunk: no frame carries `usage`. If the engine reported no usage for the
+request, no usage chunk is sent even when it was asked for.
+
+LiteLLM (1.106.6) asks for `include_usage` upstream by default and reads this
+chunk to cost streamed requests.
+
+<Aside type="note">
+The Anthropic Messages route, `POST .../v1/messages` on the same workload,
+reports its streamed usage in the `message_delta` event (`input_tokens`,
+`output_tokens`); `stream_options` does not apply to it. `message_start` always
+reports zero usage, because it is sent before the engine counts are known.
+</Aside>
 
 ### Embeddings
 
