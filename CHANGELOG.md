@@ -7,6 +7,10 @@ on PyPI; entries are listed newest first.
 
 ### Custom backend runtime (`inferencekey.backend.serve`)
 
+- **Forecast `id` is optional.** `ForecastRequest.from_wire` no longer answers
+  `400` when `id` is missing, empty or not a string: it uses `series_id` when
+  that is a non-empty string, else a generated UUID4. Send `series_id` behind a
+  gateway such as LiteLLM, whose pass-through strips a top-level `id`.
 - **Native HTTP/SSE transport (opt-in).** The Python wheel now contains a Rust
   HTTP server for custom backends (new crate `server/`,
   `inferencekey-backend-server`). It accepts connections, parses HTTP, answers

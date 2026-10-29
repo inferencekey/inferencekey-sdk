@@ -25,6 +25,17 @@ examples is the data shape: **multivariate OHLCV** (not a single bare series).
   20, configurable) and takes per-step percentiles across the sample paths. More
   paths → smoother quantiles but a slower call.
 
+## Request id
+The `/forecast` body's `id` is optional: it is only a correlation id that the
+response echoes. When it is missing, empty or not a string, the SDK uses
+`series_id` instead, and when that is not usable either it generates a UUID.
+Behind a gateway such as LiteLLM, whose pass-through strips a top-level `id`
+from the body, send `series_id`:
+
+```json
+{"series_id": "sales", "target": [1, 2, 3, 4, 5], "horizon": 3}
+```
+
 ## Compatibility
 - SDK: local build in this repo (or >= 0.1.0 once published)
 - Language: Python >= 3.9 (the `main.py` client). The **backend** needs Python

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 
 from inferencekey.backend import (
@@ -9,6 +11,7 @@ from inferencekey.backend import (
     BackendContext,
     BackendManifest,
     CustomBackend,
+    ForecastRequest,
     InvalidInput,
     Job,
     Result,
@@ -68,6 +71,51 @@ def test_job_input_defaults_to_empty_dict() -> None:
 def test_job_from_wire_rejects_bad_payloads(bad: object) -> None:
     with pytest.raises(ValueError):
         Job.from_wire(bad)  # type: ignore[arg-type]
+
+
+# --- IK-540: forecast `id` is optional, `series_id` is its alias ---
+
+
+def test_forecast_from_wire_keeps_a_valid_id() -> None:
+    req = ForecastRequest.from_wire(
+        {"id": "abc", "series_id": "sales", "target": [1, 2, 3], "horizon": 2}
+    )
+    assert req.id == "abc"
+    assert req.to_wire()["id"] == "abc"
+
+
+def test_forecast_from_wire_uses_series_id_when_id_is_missing() -> None:
+    req = ForecastRequest.from_wire({"series_id": "sales", "target": [1, 2, 3], "horizon": 2})
+    assert req.id == "sales"
+    assert req.to_wire()["id"] == "sales"
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {},  # no id, no series_id
+        {"id": ""},  # empty id counts as missing
+        {"id": 5},  # non-string id counts as missing
+        {"id": "", "series_id": ""},  # empty series_id is skipped too
+        {"series_id": 7},  # non-string series_id is skipped too
+    ],
+)
+def test_forecast_from_wire_generates_an_id_when_none_is_usable(data: dict) -> None:
+    req = ForecastRequest.from_wire({**data, "target": [1, 2, 3], "horizon": 2})
+    assert isinstance(req.id, str) and req.id
+    assert str(uuid.UUID(req.id)) == req.id
+
+
+def test_forecast_from_wire_series_id_fills_an_empty_id() -> None:
+    req = ForecastRequest.from_wire(
+        {"id": "", "series_id": "sales", "target": [1, 2, 3], "horizon": 2}
+    )
+    assert req.id == "sales"
+
+
+def test_forecast_from_wire_generated_ids_differ() -> None:
+    body = {"target": [1, 2, 3], "horizon": 2}
+    assert ForecastRequest.from_wire(body).id != ForecastRequest.from_wire(body).id
 
 
 # --- B1: InvalidInput — client input errors are 4xx, retrocompatible with ValueError ---

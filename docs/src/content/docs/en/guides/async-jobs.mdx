@@ -157,7 +157,7 @@ curl -X POST "https://cloud.inferencekey.com/endpoint/gpu-workloads/my-workload/
 | `images` (or `images_generations`) | `POST /v1/images/generations` | Text → image. |
 | `images_edits` | `POST /v1/images/edits` | Takes a file. |
 | `images_variations` | `POST /v1/images/variations` | Takes a file. |
-| `forecast` | `POST …/forecast` | Time-series forecasting on a custom backend. |
+| `forecast` | `POST …/forecast` | Time-series forecasting on a custom backend. The body's `id` is optional: a missing one falls back to `series_id`, else to a generated id. Prefer `series_id` behind a gateway such as LiteLLM, which strips a top-level `id`. |
 
 <Aside type="note" title="audio_voices is synchronous only">
 Listing available TTS voices is read-only metadata that returns instantly, so it has no async form. Use `GET /v1/audio/voices` and you'll get an explicit error if you try to submit it as a job.

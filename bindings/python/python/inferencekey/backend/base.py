@@ -32,6 +32,7 @@ Example::
 
 from __future__ import annotations
 
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional
@@ -323,7 +324,13 @@ class ForecastRequest:
 
     A single series per request (batching multiple series is out of scope for
     v1). ``id`` correlates the request across logs and responses, mirroring
-    :class:`Job`.
+    :class:`Job`, and the response echoes it.
+
+    ``id`` is optional on the wire. When it is missing, empty or not a string,
+    a non-empty string ``series_id`` is used instead, and when neither is
+    usable a random UUID4 is generated. Prefer ``series_id`` when the request
+    goes through a gateway such as LiteLLM, whose pass-through strips a
+    top-level ``id`` from the body.
 
     Fields:
 
@@ -347,7 +354,11 @@ class ForecastRequest:
 
     Minimal valid request::
 
-        {"id": "f1", "target": [1, 2, 3, 4, 5], "horizon": 3}
+        {"target": [1, 2, 3, 4, 5], "horizon": 3}
+
+    With an explicit correlation id that survives a gateway::
+
+        {"series_id": "sales", "target": [1, 2, 3, 4, 5], "horizon": 3}
     """
 
     id: str
@@ -373,13 +384,21 @@ class ForecastRequest:
 
         Raises :class:`ValueError` (mapped to a ``400`` by the runtime) with a
         message that says *what* is missing or malformed — never a traceback.
+
+        The effective ``id`` is ``id`` when it is a non-empty string, else
+        ``series_id`` when that is a non-empty string, else a generated
+        UUID4. ``id`` and ``series_id`` never cause a ``400``.
         """
         if not isinstance(data, dict):
             raise ValueError("forecast request must be a JSON object")
 
         req_id = data.get("id")
         if not isinstance(req_id, str) or not req_id:
-            raise ValueError("forecast 'id' must be a non-empty string")
+            # Gateways such as LiteLLM strip a top-level `id`; fall back to
+            # `series_id`, then to a generated one (it is only a correlation id).
+            req_id = data.get("series_id")
+            if not isinstance(req_id, str) or not req_id:
+                req_id = str(uuid.uuid4())
 
         if "target" not in data:
             raise ValueError("forecast 'target' is required (the series history)")
