@@ -495,6 +495,28 @@ mod tests {
     }
 
     #[test]
+    fn strata_spec_builds_command_and_version_pin_config() {
+        // Strata's config takes only `command` and the optional `strata_version`
+        // tag pin, which rides in the free-form config next to the command.
+        let command = "strata --family coder --model IQ1_M --context 262144 --kv int8";
+        let spec = WorkloadSpec {
+            backend: Backend::Strata,
+            model: "qwen3.8-flash-next-coder-iq1_m".to_string(),
+            command: Some(command.to_string()),
+            config: Some(json!({ "strata_version": "v0.1.40" })),
+            task_type: Some(TaskType::Text2Text),
+            ..base_spec()
+        };
+        let expected = json!({ "command": command, "strata_version": "v0.1.40" });
+        assert_eq!(build_config(&spec), Some(expected.clone()));
+        let value = serde_json::to_value(to_create_request(&spec)).expect("serialize");
+        let obj = value.as_object().expect("object");
+        assert_eq!(obj.get("backend"), Some(&json!("strata")));
+        assert_eq!(obj.get("task_type"), Some(&json!("text2text")));
+        assert_eq!(obj.get("config"), Some(&expected));
+    }
+
+    #[test]
     fn to_create_request_maps_spec_fields() {
         struct Case {
             mutate: fn(WorkloadSpec) -> WorkloadSpec,

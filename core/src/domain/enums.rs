@@ -10,8 +10,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// Inference backend. The serialized form is the `backend` wire string.
 ///
 /// The native variants carry no data and serialize to their fixed wire strings
-/// (`ollama`, `vllm`, `vllm-omni`, `vllm-exl3`, `sglang`, `llamacpp`). Any other
-/// wire string deserializes to [`Backend::Custom`] carrying the slug verbatim, so
+/// (`ollama`, `vllm`, `vllm-omni`, `vllm-exl3`, `sglang`, `llamacpp`,
+/// `stablediffusioncpp`, `strata`). Any other wire string deserializes to [`Backend::Custom`] carrying the slug verbatim, so
 /// a `WorkloadResponse` naming a custom (SDK-published) backend never fails to
 /// parse. `Custom` re-serializes to that same slug.
 ///
@@ -35,6 +35,13 @@ pub enum Backend {
     /// for the local GPU at bootstrap (no prebuilt Linux+CUDA release). Serves
     /// `text2image` only.
     StableDiffusionCpp,
+    /// Strata: serves a large Mixture-of-Experts GGUF on a single NVIDIA GPU,
+    /// with the hot experts resident in VRAM and the rest read from host RAM.
+    /// The config holds a `strata --family <f> --model <quant> ...` command
+    /// (the worker owns the port and host) and an optional `strata_version`
+    /// tag pin. `text2text` only. Older SDKs sent `"strata"` as
+    /// `Custom("strata")`, so the wire payload is the same either way.
+    Strata,
     /// A custom backend published through the SDK, identified by its slug.
     Custom(String),
 }
@@ -53,6 +60,7 @@ impl Backend {
             Backend::Sglang => Cow::Borrowed("sglang"),
             Backend::Llamacpp => Cow::Borrowed("llamacpp"),
             Backend::StableDiffusionCpp => Cow::Borrowed("stablediffusioncpp"),
+            Backend::Strata => Cow::Borrowed("strata"),
             Backend::Custom(slug) => Cow::Borrowed(slug.as_str()),
         }
     }
@@ -69,6 +77,7 @@ impl Backend {
             "sglang" => Some(Backend::Sglang),
             "llamacpp" => Some(Backend::Llamacpp),
             "stablediffusioncpp" => Some(Backend::StableDiffusionCpp),
+            "strata" => Some(Backend::Strata),
             _ => None,
         }
     }
@@ -202,6 +211,7 @@ mod tests {
             Backend::Sglang,
             Backend::Llamacpp,
             Backend::StableDiffusionCpp,
+            Backend::Strata,
         ] {
             assert_eq!(Backend::from_str_opt(b.as_str().as_ref()), Some(b.clone()));
         }
@@ -211,6 +221,7 @@ mod tests {
             Some(Backend::StableDiffusionCpp)
         );
         assert_eq!(Backend::from_str_opt("vllm-exl3"), Some(Backend::VllmExl3));
+        assert_eq!(Backend::from_str_opt("strata"), Some(Backend::Strata));
         assert_eq!(Backend::from_str_opt("nope"), None);
     }
 
@@ -237,6 +248,7 @@ mod tests {
             (Backend::Sglang, "\"sglang\""),
             (Backend::Llamacpp, "\"llamacpp\""),
             (Backend::StableDiffusionCpp, "\"stablediffusioncpp\""),
+            (Backend::Strata, "\"strata\""),
         ];
         for (variant, wire) in cases {
             let json = serde_json::to_string(&variant).expect("serialize");
@@ -265,6 +277,10 @@ mod tests {
         // Native strings still map to native variants, never to Custom.
         assert_eq!(Backend::from_wire("vllm"), Backend::Vllm);
         assert_eq!(Backend::from_wire("vllm-exl3"), Backend::VllmExl3);
+        // "strata" is native now: it must not fall back to Custom("strata").
+        let parsed: Backend = serde_json::from_str("\"strata\"").expect("deserialize");
+        assert_eq!(parsed, Backend::Strata);
+        assert_ne!(parsed, Backend::Custom("strata".to_owned()));
     }
 
     #[test]

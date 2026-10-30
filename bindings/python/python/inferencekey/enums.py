@@ -20,6 +20,7 @@ class Backend(_Str):
     SGLANG = "sglang"
     LLAMACPP = "llamacpp"
     STABLE_DIFFUSION_CPP = "stablediffusioncpp"
+    STRATA = "strata"
 
 
 class TaskType(_Str):

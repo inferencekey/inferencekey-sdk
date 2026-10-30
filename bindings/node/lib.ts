@@ -34,6 +34,7 @@ export const Backend = {
   Sglang: "sglang",
   Llamacpp: "llamacpp",
   StableDiffusionCpp: "stablediffusioncpp",
+  Strata: "strata",
 } as const;
 export type Backend = (typeof Backend)[keyof typeof Backend];
 
