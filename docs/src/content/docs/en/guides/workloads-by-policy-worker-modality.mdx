@@ -26,7 +26,7 @@ Examples assume `INFERENCEKEY_SDK_TOKEN` (control plane) and `INFERENCEKEY_PROJE
 
 ### Execution policy — *when it runs*
 
-`execution_policy` is `fixed | scheduled | autoscaling`. It defaults on the server when omitted; set it explicitly for anything other than a single always-on replica. Policy details ride in `execution_policy_config`.
+`execution_policy` is `fixed | scheduled | autoscaling`. It defaults on the server when omitted; set it explicitly for anything other than always on with no scaling. Policy details ride in `execution_policy_config`.
 
 - **`fixed`**: always on, no scaling. The default mental model for an interactive endpoint.
 - **`scheduled`**: runs inside weekly time windows (`rules` of days plus `from`/`to` hours in a `timezone`) on the `workers` you name. Good for nightly batch embedding or a daytime-only assistant.

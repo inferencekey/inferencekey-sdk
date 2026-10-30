@@ -17,7 +17,10 @@ on PyPI; entries are listed newest first.
   change of policy kind still sends the config with it.
 - **Fixed examples and docs no longer pass `replicas`.** A `fixed` workload
   takes no `execution_policy_config`; the examples and doc snippets that sent
-  `{"replicas": N}` now omit it.
+  `{"replicas": N}` now omit it. Existing code that still sends
+  `{"replicas": N}` for `fixed` converges too against a Manager that returns
+  `execution_policy_config_requested`, since the diff compares with what was
+  sent.
 - **`delete()` canonicalizes the slug** the same way `ensure()` does, so a
   workload created from a non-canonical slug can be deleted with that slug.
 - **Corrected docs shapes.** The `scheduled` snippets used `window` / `cron`
