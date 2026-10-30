@@ -194,6 +194,45 @@ You need:
 
 </Steps>
 
+## Option: a 125B coding model on one NVIDIA GPU with Strata
+
+The `strata` backend serves Qwen3.8-Flash-Next Coder 125B (a 1-bit IQ1_M build) on **one** 24-32 GB NVIDIA GPU: the hot experts stay in VRAM and the rest run from host RAM. Claude Code connects to it exactly as above, through `/v1/messages`.
+
+What changes compared with the vLLM workload:
+
+- **Worker:** a worker with one NVIDIA GPU of 24-32 GB on Linux x86_64, at least 64 GB of RAM (about 126 GB or more for the full 125B model) and about 70 GB of fast NVMe. AMD and multi-GPU are refused.
+- **Backend:** `Strata (big MoE on one GPU)`, task type Text to Text. The command field is labelled **Strata command** and the **Example model** list has the two recipes below. The optional **Strata version** pins a release tag such as `v0.1.40`.
+- **Command:** a `strata` command, not `vllm serve`. Never add `--port`: the worker owns the port, the host and the GPU.
+
+  | Users | Strata command |
+  | --- | --- |
+  | One user (speculative decoding, fastest single stream) | `strata --family coder --model IQ1_M --context 262144 --kv int8` |
+  | Up to eight users together | `strata --family coder --model IQ1_M --context 262144 --kv int8 --parallel 8 --vram-reserve-mib 1536` |
+
+  `--parallel 8` serves 8 users together but turns speculative decoding off. Keep `--vram-reserve-mib 1536` with 8 slots, or the engine pages VRAM. Measured on an RTX 5090: about 144 tok/s for one user, about 130 tok/s in aggregate for 8 users (about 19-21 tok/s each). Strata does not scale up like vLLM batching: keep the assignment's **Concurrent requests** in line with the `--parallel` value (1 without `--parallel`); further requests are queued.
+- **First start:** the worker downloads and builds about 60-70 GB (engine, model, expert packs, MTP draft). Expect 20-40 minutes before **Model ready**.
+
+The same workload from code:
+
+```python title="strata_workload.py"
+from inferencekey import ManagementClient, WorkloadSpec, Backend, ExecutionPolicy
+
+mgmt = ManagementClient.from_env(project="code-assistant")
+ref = mgmt.ensure(WorkloadSpec(
+    name="Qwen3.8 Coder 125B (Strata)",
+    slug="strata-coder",
+    model="qwen3.8-flash-next-coder-iq1_m",
+    backend=Backend.STRATA,
+    task_type="text2text",
+    command="strata --family coder --model IQ1_M --context 262144 --kv int8",
+    execution_policy=ExecutionPolicy.FIXED,
+    worker_id="<your-worker-id>",
+))
+mgmt.wait_until_ready(ref.workload_slug, timeout=3600)
+```
+
+Then set `ANTHROPIC_BASE_URL` to `https://api.inferencekey.com/endpoint/code-assistant/strata-coder` and every model variable to `strata-coder`, as in [Connect Claude Code](#connect-claude-code). The gateway translates `/v1/messages` to an OpenAI chat request for the Strata server, tools included; run the tool `curl` above once to check that tool calls come back as `tool_use` blocks. The runnable version, with every flag explained, is the [`strata-qwen-coder-private-nvidia`](https://github.com/inferencekey/inferencekey-sdk/tree/main/examples/strata-qwen-coder-private-nvidia) example; the backend reference is [Strata](/en/reference/backends-and-policies/#strata).
+
 ## Scale to more workers or GPUs
 
 Video: [2:48](https://www.youtube.com/watch?v=do5-e8-Y7lk&t=168s)
@@ -256,7 +295,7 @@ For other errors, see [Common errors](/en/reference/common-errors/).
 
 <CardGrid>
   <LinkCard title="Authentication" href="/en/guides/authentication/" description="How ik_live_ data keys are scoped per endpoint or per project." />
-  <LinkCard title="Backends & policies" href="/en/reference/backends-and-policies/" description="vLLM, SGLang, Ollama, llama.cpp and the fixed, scheduled and autoscaling policies." />
+  <LinkCard title="Backends & policies" href="/en/reference/backends-and-policies/" description="vLLM, SGLang, Ollama, llama.cpp, Strata and the fixed, scheduled and autoscaling policies." />
   <LinkCard title="Tutorial" href="/en/quickstart/tutorial/" description="Provision a workload from code with ensure() instead of the dashboard." />
   <LinkCard title="Common errors" href="/en/reference/common-errors/" description="Every error code the endpoints and the SDK return, with fixes." />
 </CardGrid>

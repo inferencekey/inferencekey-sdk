@@ -5,6 +5,21 @@ on PyPI; entries are listed newest first.
 
 ## Unreleased
 
+### Backends
+
+- **New native backend `strata`** (`Backend.STRATA` in Python,
+  `Backend.Strata` in TypeScript, `Backend::Strata` in the Rust core). It
+  serves a big Mixture-of-Experts model (Qwen3.8-Flash-Next Coder 125B) on one
+  NVIDIA GPU, `text2text` only. The config is a `strata --family ... --model
+  ...` command plus an optional `strata_version` tag pin. The wire string was
+  already `"strata"` when older SDKs sent it as a custom slug, so nothing
+  changes on the wire; reading a workload back now yields the native variant
+  instead of `Custom("strata")`. Needs a Manager and worker that know the
+  backend. New example: `examples/strata-qwen-coder-private-nvidia`.
+- **Docs list every native backend.** The README and the reference pages now
+  include `vllm-exl3`, `stablediffusioncpp` and `strata` where they listed only
+  the older backends.
+
 ### Workloads (`ensure()` and `delete()`)
 
 - **`ensure()` converges for `scheduled` and `autoscaling` configs.** The

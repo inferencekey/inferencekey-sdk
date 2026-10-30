@@ -200,6 +200,8 @@ a `WorkloadSpec` has no `provider` and no `min_vram_gb`.
 | `VLLM_EXL3` / `VllmExl3` | `vllm-exl3` | vLLM + ExLlamaV3 (EXL3 quantized weights) with host-memory MoE expert offload, for DeepSeek-V4.1-Flash on 2x RTX PRO 6000. `text2text` only; the config is only the `vllm serve` command. |
 | `SGLANG` / `Sglang` | `sglang` | Structured / programmatic generation on the SGLang runtime. |
 | `LLAMACPP` / `Llamacpp` | `llamacpp` | Prebuilt `llama-server` for **GGUF** models. Strong on AMD/ROCm and Apple Silicon. |
+| `STABLE_DIFFUSION_CPP` / `StableDiffusionCpp` | `stablediffusioncpp` | stable-diffusion.cpp `sd-server` (OpenAI images surface), compiled for the worker's GPU at bootstrap. `text2image` only; the config is the `sd-server` command. |
+| `STRATA` / `Strata` | `strata` | A big Mixture-of-Experts model (Qwen3.8-Flash-Next Coder 125B) on **one** NVIDIA GPU: hot experts in VRAM, the rest from host RAM. `text2text` only; the config is a `strata --family ... --model ...` command and an optional `strata_version`. |
 
 `task_type` defaults to `text2text` and spans **12 modalities** (text, embeddings,
 images, audio, reranking, classification, reward, …); `execution_policy` is
@@ -213,6 +215,7 @@ a folder you copy, set a few env vars, and run. Every example follows the same
 shape: **`ensure()` → wait until ready → call the endpoint.**
 
 - [`gguf-llamacpp-private-amd`](./examples/gguf-llamacpp-private-amd/) — serve a GGUF model with `llamacpp` on a private AMD/ROCm worker.
+- [`strata-qwen-coder-private-nvidia`](./examples/strata-qwen-coder-private-nvidia/): serve Qwen3.8-Flash-Next Coder 125B with `strata` on one private NVIDIA GPU, ready for Claude Code.
 - [`custom-backend-echo`](./examples/custom-backend-echo/) — a minimal PyTorch `CustomBackend` (identity `nn.Linear`).
 - [`custom-backend-text-sentiment`](./examples/custom-backend-text-sentiment/) — a `classification` `CustomBackend`.
 

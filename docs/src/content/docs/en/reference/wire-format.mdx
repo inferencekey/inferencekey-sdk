@@ -83,7 +83,7 @@ Body for `POST /api/projects/:project_id/workloads`.
 | `name`            | string   | yes      | Human-readable name.                                                  |
 | `description`     | string   | no       | Free text.                                                            |
 | `task_type`       | string   | yes      | Modality. Defaults to `text2text` if omitted. See [Task types](#task_type-values). |
-| `backend`         | string   | yes      | One of `ollama`, `vllm`, `vllm-omni`, `sglang`, `llamacpp`.           |
+| `backend`         | string   | yes      | One of `ollama`, `vllm`, `vllm-omni`, `vllm-exl3`, `sglang`, `llamacpp`, `stablediffusioncpp`, `strata`, or a custom backend slug. |
 | `model_name`      | string   | yes      | Model identifier the backend serves.                                  |
 | `config`          | object   | no       | Backend-specific. For `vllm`/`vllm-omni`: `{ command, vllm_version? }`. |
 | `worker_id`       | string   | no       | Pin to a specific worker.                                             |
@@ -142,11 +142,16 @@ endpoints below cover `text2text` (chat/completions) and `embedding`.
 | `vllm-omni`   | `{ command, vllm_version? }`    |
 | `sglang`      | backend-specific                |
 | `llamacpp`    | `{ command }` (verbatim `llama-server`, GGUF model) |
+| `vllm-exl3`   | `{ command }` (the `vllm serve` command only) |
+| `stablediffusioncpp` | `{ command }` (verbatim `sd-server`, `text2image` only) |
+| `strata`      | `{ command, strata_version? }` (`strata --family ... --model ...` pseudo-CLI, `text2text` only) |
 
 In the SDK the `Backend` enum maps to these wire strings:
 `Backend.Ollama` → `"ollama"`, `Backend.Vllm` → `"vllm"`,
 `Backend.VllmOmni` → `"vllm-omni"`, `Backend.Sglang` → `"sglang"`,
-`Backend.Llamacpp` → `"llamacpp"`.
+`Backend.Llamacpp` → `"llamacpp"`, `Backend.VllmExl3` → `"vllm-exl3"`,
+`Backend.StableDiffusionCpp` → `"stablediffusioncpp"`, `Backend.Strata` → `"strata"`.
+Any other string is a custom backend slug and is sent verbatim.
 
 ### UpdateWorkloadRequest
 

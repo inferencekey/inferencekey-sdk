@@ -1,6 +1,6 @@
 ---
 title: Backends & policies
-description: Reference for InferenceKey backends (ollama, vllm, vllm-omni, sglang, llamacpp), the 12 task-type modalities, and the fixed/scheduled/autoscaling execution policies.
+description: Reference for InferenceKey backends (ollama, vllm, vllm-omni, vllm-exl3, sglang, llamacpp, stablediffusioncpp, strata), the 12 task-type modalities, and the fixed/scheduled/autoscaling execution policies.
 ---
 
 import { Tabs, TabItem, Aside, LinkCard, CardGrid } from "@astrojs/starlight/components";
@@ -22,8 +22,11 @@ The `backend` field selects the serving engine. In code you pass the `Backend` e
 | `Backend.OLLAMA` / `Backend.Ollama` | `ollama` | Quick local-style serving and broad GGUF model coverage. Simplest to stand up. |
 | `Backend.VLLM` / `Backend.Vllm` | `vllm` | High-throughput production text generation. You control the launch command. |
 | `Backend.VLLM_OMNI` / `Backend.VllmOmni` | `vllm-omni` | vLLM for multimodal / omni models. Same command-driven config as `vllm`. |
+| `Backend.VLLM_EXL3` / `Backend.VllmExl3` | `vllm-exl3` | vLLM + ExLlamaV3 (EXL3 quantized weights) with host-memory MoE expert offload. `text2text` only; the config is only the `vllm serve` command. |
 | `Backend.SGLANG` / `Backend.Sglang` | `sglang` | Structured / programmatic generation workloads on the SGLang runtime. |
 | `Backend.LLAMACPP` / `Backend.Llamacpp` | `llamacpp` | Prebuilt `llama-server` for **GGUF** models (OpenAI-compatible). Strong on AMD/ROCm and Apple Silicon; `text2text` only. |
+| `Backend.STABLE_DIFFUSION_CPP` / `Backend.StableDiffusionCpp` | `stablediffusioncpp` | stable-diffusion.cpp `sd-server` (OpenAI images surface `/v1/images/generations`), compiled for the worker's GPU at bootstrap. `text2image` only. |
+| `Backend.STRATA` / `Backend.Strata` | `strata` | A big Mixture-of-Experts model (Qwen3.8-Flash-Next Coder 125B) on **one NVIDIA GPU**: hot experts stay in VRAM, the rest run from host RAM. OpenAI-compatible, so Claude Code works through `/v1/messages`. `text2text` only; the config is a `strata ...` command and an optional `strata_version`. See [Strata](#strata). |
 | *(custom backend slug)* | `<your-slug>` | **Your own PyTorch model**, defined in Python and published to your tenant. Use when the model or its I/O doesn't fit a built-in. See [Custom backends](/en/guides/custom-backends/). |
 
 <Aside type="note">
@@ -76,6 +79,68 @@ const ref = await mgmt.ensure({
 <Aside type="tip">
 `vllm_version` only applies to `vllm` / `vllm-omni`. The `command` is run verbatim by `vllm`, `vllm-omni`, and `llamacpp` — for `llamacpp` it must launch `llama-server` against a **GGUF** model (e.g. `llama-server -hf <repo> --hf-file <file.gguf> -ngl 99 -c 4096`). For `ollama` and `sglang`, leave `command` unset and let the backend launch the `model` you declared.
 </Aside>
+
+### Strata
+
+A `strata` workload serves `text2text` on one NVIDIA GPU (Linux x86_64). Its config takes only two keys: `command` and the optional `strata_version`. The `command` is not a binary to run: it is a Strata pseudo-CLI that the worker turns into Strata's installer flags and engine config.
+
+```
+[ENV=VAL ...] strata --family <qwen|swift|coder|unsloth> --model <QUANT>
+    [--context N] [--kv int8|q4_0|k8v4] [--parallel N] [--vram-reserve-mib N]
+    [--pool-workers N] [other setup flags] [-- extra engine args]
+```
+
+- The head must be `strata` (after an optional `ENV=VAL` prefix). `vllm serve ...`, `llama-server ...` or `python -m serve.server ...` are refused.
+- `--family` and `--model` pick the model. `--context`, `--kv` and the other setup flags go to Strata's installer.
+- `--parallel N` serves N users together but turns speculative decoding off: one user is fastest without it. The worker never sets it for you.
+- `--vram-reserve-mib N` and `--pool-workers N` go to the engine. With parallel slots and no reserve the worker adds `--vram-reserve-mib 1536` (the engine default pages VRAM with 8 slots). Without `--pool-workers` the worker sizes the CPU pool from the container CPU quota.
+- Never pass `--port`, `--host`, `--api-key` or `--data-dir`: the worker owns them and strips them.
+- Refused, never ignored: `--engine` (any value, also `mock`), `--gpus`, `--layer-split`, `--backend` other than `cuda`, `--experimental-speed-projection` other than `off`, and operations such as `--update`, `--rollback-engine`, `--check` or `--calibrate`.
+- `strata_version` pins a release tag such as `v0.1.40` (never a branch). It is part of the runtime identity, so a new tag starts a new process.
+
+| Recipe | `command` |
+| --- | --- |
+| Coder 125B IQ1_M, one user (speculative decoding) | `strata --family coder --model IQ1_M --context 262144 --kv int8` |
+| Coder 125B IQ1_M, eight users | `strata --family coder --model IQ1_M --context 262144 --kv int8 --parallel 8 --vram-reserve-mib 1536` |
+
+<Tabs syncKey="lang">
+  <TabItem label="Python">
+```python
+from inferencekey import WorkloadSpec, Backend, ExecutionPolicy
+
+spec = WorkloadSpec(
+    name="Qwen3.8 Coder 125B on Strata",
+    slug="strata-coder",
+    model="qwen3.8-flash-next-coder-iq1_m",
+    backend=Backend.STRATA,
+    task_type="text2text",
+    command="strata --family coder --model IQ1_M --context 262144 --kv int8",
+    config={"strata_version": "v0.1.40"},  # optional release pin
+    execution_policy=ExecutionPolicy.FIXED,
+    worker_id="<your-worker-id>",
+)
+```
+  </TabItem>
+  <TabItem label="TypeScript">
+```ts
+import { Backend, ExecutionPolicy } from "@inferencekey/sdk";
+
+const spec = {
+  name: "Qwen3.8 Coder 125B on Strata",
+  slug: "strata-coder",
+  model: "qwen3.8-flash-next-coder-iq1_m",
+  backend: Backend.Strata,
+  taskType: "text2text",
+  command: "strata --family coder --model IQ1_M --context 262144 --kv int8",
+  config: { strata_version: "v0.1.40" }, // optional release pin
+  executionPolicy: ExecutionPolicy.Fixed,
+  workerId: "<your-worker-id>",
+};
+```
+  </TabItem>
+</Tabs>
+
+The node needs a 24-32 GB NVIDIA GPU, at least 64 GB of RAM (about 126 GB or more for the full 125B model) and about 70 GB of fast NVMe. The first start downloads and builds about 60-70 GB, so wait with a long timeout (`wait_until_ready(timeout=3600)`). Throughput stays about 125-145 tok/s in aggregate from 1 to 8 users (measured on an RTX 5090): Strata does not scale up like vLLM batching. A runnable example is [`strata-qwen-coder-private-nvidia`](https://github.com/inferencekey/inferencekey-sdk/tree/main/examples/strata-qwen-coder-private-nvidia).
 
 ## Task types (modalities)
 

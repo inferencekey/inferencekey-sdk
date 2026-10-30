@@ -5,7 +5,7 @@ description: Bring your own PyTorch model as a custom inference backend — defi
 
 import { Tabs, TabItem, Card, CardGrid, Aside, Steps, LinkCard } from "@astrojs/starlight/components";
 
-The built-in backends (`vllm`, `sglang`, `ollama`, `llamacpp`) cover most LLM serving. When you need to run **your own model** — a classifier, an embedding model, a scoring head, an image or audio model, anything you can express in PyTorch — you define a **custom backend**: a small Python class the SDK turns into a long-lived inference server, packages, and ships to your workers.
+The built-in backends (`vllm`, `vllm-omni`, `vllm-exl3`, `sglang`, `ollama`, `llamacpp`, `stablediffusioncpp`, `strata`) cover most LLM serving. When you need to run **your own model** (a classifier, an embedding model, a scoring head, an image or audio model, anything you can express in PyTorch), you define a **custom backend**: a small Python class the SDK turns into a long-lived inference server, packages, and ships to your workers.
 
 You write two methods. The platform does the rest: distribution to workers, process supervision, and routing jobs to it.
 
@@ -25,7 +25,7 @@ You write two methods. The platform does the rest: distribution to workers, proc
 </CardGrid>
 
 <Aside type="note" title="When to use a custom backend">
-Reach for a built-in backend (`vllm`/`sglang`/`ollama`/`llamacpp`) when your model is a standard LLM served over the OpenAI-compatible API. Reach for a **custom backend** when the model or its I/O doesn't fit that mold — a non-chat modality, a bespoke pre/post-processing step, or a model you load and call yourself in PyTorch.
+Reach for a built-in backend (`vllm`/`vllm-exl3`/`sglang`/`ollama`/`llamacpp`/`strata`) when your model is a standard LLM served over the OpenAI-compatible API. Reach for a **custom backend** when the model or its I/O doesn't fit that mold: a non-chat modality, a bespoke pre/post-processing step, or a model you load and call yourself in PyTorch.
 </Aside>
 
 ## 1. Define the backend

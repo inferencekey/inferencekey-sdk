@@ -106,10 +106,13 @@ OpenAI route).
 <dt id="backend">Backend</dt>
 <dd>
 The serving engine that runs the model: <code>Backend.Ollama</code>, <code>Vllm</code>,
-<code>VllmOmni</code>, <code>Sglang</code>, or <code>Llamacpp</code> (wire: <code>ollama</code> / <code>vllm</code>
-/ <code>vllm-omni</code> / <code>sglang</code> / <code>llamacpp</code>). The vLLM backends take a
+<code>VllmOmni</code>, <code>VllmExl3</code>, <code>Sglang</code>, <code>Llamacpp</code>, <code>StableDiffusionCpp</code>,
+or <code>Strata</code> (wire: <code>ollama</code> / <code>vllm</code> / <code>vllm-omni</code> / <code>vllm-exl3</code>
+/ <code>sglang</code> / <code>llamacpp</code> / <code>stablediffusioncpp</code> / <code>strata</code>). The vLLM backends take a
 <code>command</code> and an optional <code>vllm_version</code>; <code>llamacpp</code> takes a verbatim
-<code>llama-server</code> command pointed at a GGUF model.
+<code>llama-server</code> command pointed at a GGUF model; <code>strata</code> takes a
+<code>strata --family ... --model ...</code> command (a big MoE model on one NVIDIA GPU) and an optional
+<code>strata_version</code>.
 </dd>
 
 <dt id="worker">Worker (cloud / private)</dt>

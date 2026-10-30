@@ -368,9 +368,14 @@ class Backend(str, Enum):
     OLLAMA = "ollama"
     VLLM = "vllm"
     VLLM_OMNI = "vllm-omni"
+    VLLM_EXL3 = "vllm-exl3"
     SGLANG = "sglang"
     LLAMACPP = "llamacpp"
+    STABLE_DIFFUSION_CPP = "stablediffusioncpp"
+    STRATA = "strata"
 ```
+
+`WorkloadSpec.backend` also accepts a plain string: any value that is not a member is a custom backend slug, sent verbatim.
 
 ### TaskType
 
