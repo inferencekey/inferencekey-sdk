@@ -104,8 +104,8 @@ A rented GPU can look fine on paper and still be unfit. Check these over ssh bef
 | The engine dies at once: "cannot pin 322 MiB, nor place it in VRAM" | CUDA does not initialise on the host, or a second engine runs next to a live one | Run the CUDA init check; on a healthy host, look for a leftover `engine/strata --serve` process. |
 | Eight users get much less than 115 tokens/s in total | The CPU quota limits the pool, and the 256K context limits the expert cache | Use the CPU quota recipe (`--context 65536 --pool-workers 12`, or the pool size your quota allows). |
 
-<Aside type="caution" title="Use an up-to-date worker">
-Older worker builds could start a second Strata engine after a worker restart, and on some hosts stopping the workload restarted the whole container. Update the worker before you run Strata.
+<Aside type="caution" title="Two worker fixes are pending release">
+The measurements above found two worker bugs, fixed but not yet in a released worker (as of 2026-10-31): after a worker restart, a Strata engine that the supervisor had relaunched could get a second engine next to it, and on some container images stopping a workload could restart the whole container. Until your worker includes the fixes, restart the worker only while the Strata engine runs from its first start, and if the container restarts when you stop the workload, start the worker again. Update the worker as soon as a release with the fixes is out.
 </Aside>
 
 ## Next steps
