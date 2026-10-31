@@ -209,8 +209,8 @@ What changes compared with the vLLM workload:
   | One user (speculative decoding, fastest single stream) | `strata --family coder --model IQ1_M --context 262144 --kv int8` |
   | Up to eight users together | `strata --family coder --model IQ1_M --context 262144 --kv int8 --parallel 8 --vram-reserve-mib 1536` |
 
-  `--parallel 8` serves 8 users together but turns speculative decoding off. Keep `--vram-reserve-mib 1536` with 8 slots, or the engine pages VRAM. Measured on an RTX 5090: about 144 tok/s for one user, about 130 tok/s in aggregate for 8 users (about 19-21 tok/s each). Strata does not scale up like vLLM batching: keep the assignment's **Concurrent requests** in line with the `--parallel` value (1 without `--parallel`); further requests are queued.
-- **First start:** the worker downloads and builds about 60-70 GB (engine, model, expert packs, MTP draft). Expect 20-40 minutes before **Model ready**.
+  `--parallel 8` serves 8 users together but turns speculative decoding off. Keep `--vram-reserve-mib 1536` with 8 slots, or the engine pages VRAM. Measured on an RTX 5090 container with a 13.6-core CPU quota: 162.9 tok/s for one user with the one-user recipe, 81.2 tok/s in total for 8 users with the eight-user recipe, and 115.3 tok/s in total with `--context 65536 --pool-workers 12` added (details and host checks in [Qwen3.8 Coder 125B on one RTX 5090](/en/guides/strata-coder-one-rtx-5090/)). Strata does not scale up like vLLM batching: keep the assignment's **Concurrent requests** in line with the `--parallel` value (1 without `--parallel`); further requests are queued.
+- **First start:** the worker downloads and builds about 60-70 GB (engine, model, expert packs, MTP draft). It took 10 min 42 s on a host with about 200 MB/s to Hugging Face; expect 20-40 minutes on a slower link, and hours on a host with a few MB/s per stream.
 
 The same workload from code:
 

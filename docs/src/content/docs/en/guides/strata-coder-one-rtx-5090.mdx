@@ -1,0 +1,119 @@
+---
+title: Qwen3.8 Coder 125B on one RTX 5090 with Strata
+description: "Serve Qwen3.8-Flash-Next Coder 125B (IQ1_M) on one 32 GB RTX 5090 with the built-in strata backend: measured throughput for one and eight users, how to qualify a rented GPU host, the recipes and the fixes for a slow start."
+---
+
+import { Aside, Steps, LinkCard, CardGrid } from "@astrojs/starlight/components";
+
+This guide serves **Qwen3.8-Flash-Next Coder 125B**, a mixture-of-experts coding model in its 1-bit IQ1_M build, on a private worker with **one NVIDIA RTX 5090 (32 GB)** and the host's RAM. The engine is [Strata](https://github.com/Niko1221/Strata): the hot experts stay in VRAM, the cold ones run on the CPU from host RAM. On InferenceKey it is the built-in **`strata`** backend, so there is nothing to publish: you declare a workload with a `strata ...` command, the worker installs Strata, downloads the model and serves it behind an OpenAI-compatible endpoint (and `/v1/messages` for Claude Code).
+
+## Measured on a real RTX 5090
+
+Measured on a rented RTX 5090 container (sm_120, CUDA 13, power limit 600 W, 125 GB RAM, a **13.6-core CPU quota**, so the worker sized the CPU pool to 7 workers), Strata `v0.1.40`, Coder 125B IQ1_M, `--context 262144 --kv int8` unless the row says otherwise:
+
+| Setup | Measured |
+| --- | --- |
+| One user, one-user recipe (speculative decoding on), on the engine port | 162.9 tokens/s for one 600-token answer; per-stream decode median 201.9 tokens/s (min 183.1) over a multi-turn coding session |
+| One user, seen by the client through the gateway | 124.8 tokens/s in a test setup where the worker reached the gateway over a tunnel (the stream relay costs the difference) |
+| Eight users at once, `--parallel 8 --vram-reserve-mib 1536` | 81.2 tokens/s in total, about 11.9 per user; at least 1038 MiB of VRAM stayed free |
+| Eight users, same plus `--pool-workers 12` | 90.0 tokens/s in total, but only 559 MiB of VRAM free at the lowest point |
+| Eight users, `--context 65536 --pool-workers 12` | 115.3 tokens/s in total, about 17 per user, at least 1038 MiB of VRAM free |
+| First install (engine compile, about 63 GB of downloads) | 10 min 42 s on a host with about 200 MB/s to Hugging Face, then 66 s to load |
+| Second start on the same node | no clone, no compile, no download: ready in about 22 s |
+
+With eight users, the throughput depends on the CPU: eight slots leave less VRAM for the expert cache, so more expert picks go to the CPU pool. On a host with a CPU quota, a shorter context (`--context 65536`) frees VRAM for the cache and a bigger pool uses the cores the quota allows. An earlier test on an RTX 5090 host with 24 CPU pool workers measured about 144 tokens/s for one user and about 130 tokens/s in total for eight users. Strata does not scale up like vLLM batching: do not plan capacity that way.
+
+## Before you start
+
+The **worker** needs:
+
+| | |
+| --- | --- |
+| **GPU** | One NVIDIA GPU with 24-32 GB of VRAM on Linux x86_64 (the numbers above are an RTX 5090). Driver 580 or newer for the CUDA 13 engine. AMD, macOS and multi-GPU are refused. |
+| **RAM** | At least 64 GB (the container limit, not the host total). About 126 GB or more for the full 125B. |
+| **Disk** | About 70 GB free on fast NVMe for the Strata data dir. |
+| **CPU** | The cold experts run on the CPU. The worker sizes the CPU pool from the container quota (quota minus 6 cores). |
+
+You also need an SDK token with `workload:read` and `workload:write`, an `ik_live_` API key, your project slug and the worker id. See [Tokens](/en/quickstart/tokens/).
+
+### Qualify a rented GPU host first
+
+A rented GPU can look fine on paper and still be unfit. Check these over ssh before you create the workload, and replace the host at once if one fails. Each of them failed on a real host during the measurements above.
+
+- **Idle GPU.** With nothing of yours running, `nvidia-smi` should show about 0 MiB used, about 0 % utilisation and a few watts. One host showed 744 MiB used, 100 % and 400 W while idle (another tenant on the card): one-user decode halved.
+- **Power limit.** `nvidia-smi --query-gpu=power.limit --format=csv` should show the card default (575-600 W for an RTX 5090). A 400 W cap cannot be raised from inside the container.
+- **Bandwidth.** Strata's installer downloads with one stream. Time a short download from Hugging Face: at a few MB/s per stream, the 63 GB install takes hours.
+- **CUDA init.** A working `nvidia-smi` is not enough. Run `python3 -c "import torch; torch.zeros(1).cuda()"`: one host failed with `CUDA unknown error` (`cuInit` 999), and the engine died with "cannot pin 322 MiB, nor place it in VRAM".
+- **CPU quota.** Read `/sys/fs/cgroup/cpu.max` (or `cpu.cfs_quota_us` on cgroup v1). It sets the CPU pool and with it the eight-user number.
+
+<Steps>
+
+1. ### Pick a recipe
+
+   | Users | `command` |
+   | --- | --- |
+   | One user (speculative decoding, fastest single stream) | `strata --family coder --model IQ1_M --context 262144 --kv int8` |
+   | Up to eight users | `strata --family coder --model IQ1_M --context 262144 --kv int8 --parallel 8 --vram-reserve-mib 1536` |
+   | Up to eight users on a host with a CPU quota | `strata --family coder --model IQ1_M --context 65536 --kv int8 --parallel 8 --vram-reserve-mib 1536 --pool-workers 12` |
+
+   `--parallel 8` turns speculative decoding off, so one user is faster without it. Keep `--vram-reserve-mib 1536` with eight slots, or the engine pages VRAM. Keep `--pool-workers` at or below the container's CPU quota (12 was measured on a 13.6-core quota). Never add `--port`, `--host` or `--data-dir`: the worker owns them.
+
+2. ### Declare the workload
+
+   ```python title="strata_workload.py"
+   import os
+   from inferencekey import ManagementClient, WorkloadSpec, Backend, ExecutionPolicy
+
+   mgmt = ManagementClient.from_env()
+   ref = mgmt.ensure(WorkloadSpec(
+       name="Qwen3.8 Coder 125B (Strata)",
+       slug="strata-coder",
+       model="qwen3.8-flash-next-coder-iq1_m",
+       backend=Backend.STRATA,
+       task_type="text2text",
+       command="strata --family coder --model IQ1_M --context 262144 --kv int8",
+       execution_policy=ExecutionPolicy.FIXED,
+       worker_id=os.environ["IK_WORKER_ID"],
+   ))
+   mgmt.wait_until_ready(ref.workload_slug, timeout=3600)
+   ```
+
+   Or from the dashboard: **Create workload**, backend **Strata (big MoE on one GPU)**, task type Text to Text, and one of the recipes under **Example model**. The runnable version is the [`strata-qwen-coder-private-nvidia`](https://github.com/inferencekey/inferencekey-sdk/tree/main/examples/strata-qwen-coder-private-nvidia) example.
+
+3. ### Wait for the first start
+
+   The worker's drawer shows `install_strata` ("Downloading/compiling Strata engine and model"), then "Loading Strata experts (can take several minutes)", then **Model ready**. The first start clones Strata, builds or downloads the engine and fetches about 63 GB. The next starts on the same node reuse all of it.
+
+4. ### Set the concurrency
+
+   On the **Workloads** page, set the assignment's **Concurrent requests** to the `--parallel` value (1 for the one-user recipe, 8 for the eight-user ones). Further requests wait in the queue instead of crowding the slots.
+
+5. ### Call it
+
+   The endpoint is `https://api.inferencekey.com/endpoint/<project>/strata-coder/v1` (OpenAI chat completions). For Claude Code, follow [Connect Claude Code](/en/guides/deploy-your-own-code-assistant/#connect-claude-code) with `strata-coder` as the slug and every model name.
+
+</Steps>
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| The engine load sits for many minutes with one CPU at 100 %, mostly kernel time, and `compact_stall` grows in `/proc/vmstat` | Strata's expert arena asks for transparent huge pages, and memory compaction stalls on a fragmented host with THP `madvise` (seen for 9+ minutes) | Prefix the command with `STRATA_NO_ARENA_THP=1`, for example `STRATA_NO_ARENA_THP=1 strata --family coder ...`. The prefix reaches the front and the engine. |
+| The first install takes hours | The host's per-stream bandwidth to Hugging Face is low | Move to another host (see [Qualify a rented GPU host first](#qualify-a-rented-gpu-host-first)). |
+| One user gets far less than the numbers above | The GPU is busy with another tenant, or power capped | Check idle `nvidia-smi` and `power.limit`; replace the host. |
+| The engine dies at once: "cannot pin 322 MiB, nor place it in VRAM" | CUDA does not initialise on the host, or a second engine runs next to a live one | Run the CUDA init check; on a healthy host, look for a leftover `engine/strata --serve` process. |
+| Eight users get much less than 115 tokens/s in total | The CPU quota limits the pool, and the 256K context limits the expert cache | Use the CPU quota recipe (`--context 65536 --pool-workers 12`, or the pool size your quota allows). |
+
+<Aside type="caution" title="Use an up-to-date worker">
+Older worker builds could start a second Strata engine after a worker restart, and on some hosts stopping the workload restarted the whole container. Update the worker before you run Strata.
+</Aside>
+
+## Next steps
+
+<CardGrid>
+  <LinkCard title="Strata reference" href="/en/reference/backends-and-policies/#strata" description="Every flag the strata command accepts and refuses." />
+  <LinkCard title="Deploy your own code assistant" href="/en/guides/deploy-your-own-code-assistant/" description="API keys, Claude Code over /v1/messages and the error shapes." />
+  <LinkCard title="Workloads by policy, worker and modality" href="/en/guides/workloads-by-policy-worker-modality/" description="Fixed policy and private workers." />
+</CardGrid>
+
+Credits: the engine, the installer and the expert offload come from [Strata](https://github.com/Niko1221/Strata) by Niko1221 and contributors, on top of llama.cpp and ggml.

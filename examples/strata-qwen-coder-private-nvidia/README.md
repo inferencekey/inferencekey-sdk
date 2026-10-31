@@ -64,24 +64,32 @@ Strata's installer, writes the engine config, and launches the server itself.
 unset keeps the platform's default tag. Never a branch name.
 
 ## Expected numbers
-Measured on an **RTX 5090** with Coder 125B IQ1_M, `--context 262144 --kv int8`:
+Measured on a rented **RTX 5090** container (power limit 600 W, 125 GB RAM, a
+13.6-core CPU quota, so the worker sized the CPU pool to 7 workers), Strata
+`v0.1.40`, Coder 125B IQ1_M, `--context 262144 --kv int8` unless the row says
+otherwise:
 
 | Recipe | Throughput |
 | --- | --- |
-| One user (speculative decoding on) | about 144 tok/s |
-| Eight users, `--parallel 8 --vram-reserve-mib 1536` | about 130 tok/s in aggregate, about 19-21 tok/s per client |
-| Four users | about 125 tok/s in aggregate |
+| One user (speculative decoding on), engine port | 162.9 tok/s for one 600-token answer; per-stream median 201.9 tok/s over a multi-turn coding session |
+| Eight users, `--parallel 8 --vram-reserve-mib 1536` | 81.2 tok/s in aggregate, at least 1038 MiB of VRAM free |
+| Eight users, plus `--context 65536 --pool-workers 12` | 115.3 tok/s in aggregate, at least 1038 MiB of VRAM free |
 
-The aggregate stays about 125-145 tok/s from 1 to 8 clients: Strata does not
-scale up like vLLM batching, so do not plan capacity that way. Other GPUs give
-other numbers.
+The eight-user number follows the CPU quota: with 8 slots the expert cache
+shrinks and more experts run on the CPU pool. An earlier test on a 5090 host
+with 24 pool workers measured about 144 tok/s for one user and about 130 tok/s
+in aggregate for 8. Strata does not scale up like vLLM batching, so do not plan
+capacity that way. Other GPUs give other numbers. Host checks and every
+variant: the
+[Strata guide](https://docs.inferencekey.com/en/guides/strata-coder-one-rtx-5090/).
 
 ## Cold start (why the timeout is 3600 s)
 The first start on a fresh node downloads and builds about 60-70 GB (the Strata
 engine, the model GGUFs, the expert packs and the MTP draft) and then loads the
-experts before the port answers: 20-40 minutes on a fast link, more on a slow
-one. `main.py` waits up to **3600 s**; override it with `IK_READY_TIMEOUT`
-(seconds). A second start on the same node reuses the downloads.
+experts before the port answers. Measured on an RTX 5090 host with about
+200 MB/s to Hugging Face: 10 min 42 s for the install, then 66 s to load.
+Expect 20-40 minutes on a slower link, hours at a few MB/s per stream.
+`main.py` waits up to **3600 s**; override it with `IK_READY_TIMEOUT` (seconds). A second start on the same node reuses the downloads.
 
 ## Run
 ```bash

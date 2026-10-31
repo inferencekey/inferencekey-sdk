@@ -140,7 +140,20 @@ const spec = {
   </TabItem>
 </Tabs>
 
-The node needs a 24-32 GB NVIDIA GPU, at least 64 GB of RAM (about 126 GB or more for the full 125B model) and about 70 GB of fast NVMe. The first start downloads and builds about 60-70 GB, so wait with a long timeout (`wait_until_ready(timeout=3600)`). Throughput stays about 125-145 tok/s in aggregate from 1 to 8 users (measured on an RTX 5090): Strata does not scale up like vLLM batching. A runnable example is [`strata-qwen-coder-private-nvidia`](https://github.com/inferencekey/inferencekey-sdk/tree/main/examples/strata-qwen-coder-private-nvidia).
+The node needs a 24-32 GB NVIDIA GPU, at least 64 GB of RAM (about 126 GB or more for the full 125B model) and about 70 GB of fast NVMe. The first start downloads and builds about 60-70 GB, so wait with a long timeout (`wait_until_ready(timeout=3600)`). A runnable example is [`strata-qwen-coder-private-nvidia`](https://github.com/inferencekey/inferencekey-sdk/tree/main/examples/strata-qwen-coder-private-nvidia).
+
+#### Measured on an RTX 5090
+
+Rented RTX 5090 container (power limit 600 W, 125 GB RAM, a 13.6-core CPU quota, so the worker sized the CPU pool to 7 workers), Strata `v0.1.40`, Coder 125B IQ1_M, `--context 262144 --kv int8` unless the row says otherwise:
+
+| Recipe | Measured |
+| --- | --- |
+| One user | 162.9 tok/s for one 600-token answer on the engine port; per-stream decode median 201.9 tok/s over a multi-turn coding session |
+| Eight users, `--parallel 8 --vram-reserve-mib 1536` | 81.2 tok/s in total, at least 1038 MiB of VRAM free |
+| Eight users, `--context 65536 --parallel 8 --vram-reserve-mib 1536 --pool-workers 12` | 115.3 tok/s in total, at least 1038 MiB of VRAM free |
+| First install (about 63 GB of downloads) | 10 min 42 s on a host with about 200 MB/s to Hugging Face |
+
+With eight slots the expert cache shrinks and more experts run on the CPU, so the eight-user number follows the CPU quota. Strata does not scale up like vLLM batching. How to qualify a rented host, every measured variant and the fixes for a stalled start: [Qwen3.8 Coder 125B on one RTX 5090](/en/guides/strata-coder-one-rtx-5090/).
 
 ## Task types (modalities)
 
