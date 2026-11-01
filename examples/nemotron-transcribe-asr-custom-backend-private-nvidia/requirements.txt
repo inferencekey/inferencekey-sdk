@@ -1,0 +1,8 @@
+# Requirements of the CUSTOM BACKEND itself (installed by the worker into the
+# backend's own venv). The model runtime (vLLM 0.32.0 + NeMo Speech) is NOT
+# listed here: backend.py builds it in a separate Python 3.13 environment
+# from the NeMo Speech lock file, with uv, the way the model card says.
+inferencekey
+huggingface-hub[hf_xet]>=0.36
+uv>=0.9
+soundfile>=0.13
