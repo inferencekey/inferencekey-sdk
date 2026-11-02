@@ -1,0 +1,8 @@
+# Requirements of the CUSTOM BACKEND itself (installed by the worker into the
+# backend's own venv). The model runtime (the authors' SGLang build) is NOT
+# listed here: backend.py installs it from the model repository into a
+# separate Python 3.10 environment with uv, the way the model card says.
+inferencekey
+huggingface-hub[hf_xet]>=0.36
+uv>=0.9
+pymupdf>=1.26
