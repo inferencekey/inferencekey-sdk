@@ -1,0 +1,4 @@
+dist/
+outputs/
+.env
+clips/

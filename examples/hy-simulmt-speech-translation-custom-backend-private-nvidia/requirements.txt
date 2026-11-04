@@ -1,0 +1,11 @@
+# Requirements of the CUSTOM BACKEND itself (installed by the worker into the
+# backend's own venv). The model runtime (vLLM 0.32.0 + simulst + SimulInfer,
+# and vLLM-Omni for the optional voice) is NOT listed here: backend.py builds it
+# in separate Python 3.12 environments with uv.
+inferencekey
+huggingface-hub[hf_xet]>=0.36
+uv>=0.9
+numpy>=1.26
+soundfile>=0.13
+soxr>=0.5
+websockets>=13
