@@ -78,6 +78,11 @@ Smaller cards (emulated on the 48 GB card, not real cards):
 | 32 GB cap | `HYSIMULMT_GPU_MEMORY_UTILIZATION=0.66`, `HYSIMULMT_MAX_MODEL_LEN=4096`, `HYSIMULMT_MAX_NUM_SEQS=1` | starts, 7,136 tokens of KV cache, 32.3 GB on the card (no headroom on a real 32 GB card); both clips translated, chrF 62.8 / 37.6 |
 | 24 GB | the authors' GGUF Q4_K_M (19.7 GB, translation only) on llama.cpp PR #31198, `llama-mtmd-cli`, offline file | 20.9 GB on the card, about 16x faster than real time, all sentences, chrF 66.1 / 42.3. Not servable yet: llama-server support for this model is a follow-up of that PR |
 
+The cap only limits what vLLM keeps after it starts: during startup its audio
+encoder profiling briefly filled the whole 48 GB card in every run (it hit
+out-of-memory, retried and recovered), so a real 32 GB card may fail at that
+step. Not tried on a real 32 GB or 24 GB card.
+
 ## Run it
 
 ```bash
