@@ -1,0 +1,21 @@
+# Requirements of the CUSTOM BACKEND (installed by the worker with uv into the
+# backend's own venv). The client side (main.py) only needs the local SDK build
+# and `requests`, see README.
+
+# InferenceKey SDK runtime: provides `python -m inferencekey.backend.serve`.
+inferencekey
+
+# LFM3-Omni-2B runtime, as the model card lists it ("transformers>=5.20.2").
+# The modeling code ships with the checkpoint (trust_remote_code).
+transformers==5.22.2
+torch==2.15.0
+torchvision==0.29.2
+torchcodec
+accelerate
+pillow
+librosa
+soundfile
+numpy
+
+# Weights download (4.5 GB).
+huggingface_hub[hf_xet]
