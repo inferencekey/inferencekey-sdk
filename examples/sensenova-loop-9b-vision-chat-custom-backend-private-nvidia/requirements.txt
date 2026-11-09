@@ -1,0 +1,23 @@
+# Requirements of the CUSTOM BACKEND (installed by the worker with uv into the
+# backend's own venv). The client side (main.py) only needs the local SDK build
+# and `requests`, see README.
+
+# InferenceKey SDK runtime: provides `python -m inferencekey.backend.serve`.
+inferencekey
+
+# The environment the model card checked: Transformers 5.18.0 and PyTorch 2.11.0.
+# The modeling code ships with the checkpoint (trust_remote_code).
+transformers==5.18.0
+torch==2.11.0
+torchvision==0.26.0
+accelerate
+safetensors
+pillow
+numpy
+
+# Triton kernels for the gated delta rule of the linear-attention layers
+# (without it Transformers falls back to a much slower PyTorch reference path).
+flash-linear-attention
+
+# Weights download (about 38 GB).
+huggingface_hub[hf_xet]
