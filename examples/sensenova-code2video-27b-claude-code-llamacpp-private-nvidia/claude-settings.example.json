@@ -1,0 +1,13 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://cloud.inferencekey.com/endpoint/your-project-slug/sensenova-code2video",
+    "ANTHROPIC_MODEL": "sensenova-code2video",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "sensenova-code2video",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "98304",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "80",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "16384",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "API_TIMEOUT_MS": "1800000"
+  },
+  "model": "sensenova-code2video"
+}
