@@ -1,0 +1,19 @@
+# Requirements of the CUSTOM BACKEND (installed by the worker with uv into the
+# backend's own venv). The client side (main.py) only needs the SDK and `requests`.
+
+# InferenceKey SDK runtime: provides `python -m inferencekey.backend.serve`.
+inferencekey
+
+# PyTorch 2.10.0 built for CUDA 12.8, as pinned by the authors (uv.lock, extra cu128).
+# Direct wheel so the rest resolves from PyPI. Triton 3.6 comes with it.
+torch @ https://download.pytorch.org/whl/cu128/torch-2.10.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl
+
+# The rest of the authors' locked versions (github.com/kopperx/RelayVSR, uv.lock).
+diffusers==0.37.1
+accelerate==1.15.0
+einops==0.8.2
+av==18.1.0
+safetensors==0.8.0
+numpy==2.4.6
+pillow==12.3.0
+huggingface-hub==1.31.0
