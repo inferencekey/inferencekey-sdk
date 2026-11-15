@@ -1,0 +1,17 @@
+# Requirements of the CUSTOM BACKEND (installed by the worker with uv into the
+# backend's own venv). The client side (main.py) only needs the local SDK build
+# and `requests`, see README.
+
+# InferenceKey SDK runtime: provides `python -m inferencekey.backend.serve`.
+inferencekey
+
+# The backend itself is a thin client of the local SGLang-Omni server. SGLang-Omni
+# (torch 2.14.1, SGLang 0.5.23, CUDA 13 wheels) goes into a SEPARATE Python 3.12
+# venv that backend.py builds with uv at a pinned commit, because its dependency
+# set needs pre-release resolution (flash-attn-4) and an override (protobuf).
+# CUDA 13 wheels: the GPU needs an NVIDIA driver for CUDA 13.0 or newer (580+).
+uv
+requests
+
+# Weights download (about 14.5 GB); hf_xet makes it parallel.
+huggingface_hub[hf_xet]
