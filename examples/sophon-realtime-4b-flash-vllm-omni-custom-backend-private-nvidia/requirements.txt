@@ -1,0 +1,18 @@
+# Requirements of the CUSTOM BACKEND (installed by the worker with uv into the
+# backend's own venv). The client side (main.py) only needs the local SDK build
+# and `requests`, see README.
+
+# InferenceKey SDK runtime: provides `python -m inferencekey.backend.serve`.
+inferencekey
+
+# The backend is a thin client of the authors' local vLLM-Omni server. vLLM 0.30,
+# vLLM-Omni 0.30 and the Sophon plugin go into a SEPARATE Python 3.12 venv that the
+# authors' flash/install.sh builds (backend.py runs it at a pinned commit).
+websockets
+numpy
+soundfile
+requests
+pyyaml
+
+# Weights download (13 GB); hf_xet makes it parallel.
+huggingface_hub[hf_xet]
