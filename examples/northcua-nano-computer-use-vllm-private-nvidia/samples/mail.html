@@ -1,0 +1,64 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Larchmont Mail</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font:14px/1.4 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#202124;background:#f6f8fc}
+header{height:64px;display:flex;align-items:center;gap:16px;padding:0 16px}
+.logo{font-weight:600;font-size:20px;width:220px;color:#444}
+#search{flex:0 0 640px;height:46px;border-radius:24px;border:0;background:#e9eef6;padding:0 20px;font-size:15px}
+.icons{margin-left:auto;display:flex;gap:6px}
+.icon{width:40px;height:40px;border-radius:50%;border:0;background:transparent;font-size:20px;cursor:pointer;color:#444}
+.icon:hover{background:#e3e6ea}
+main{display:flex}
+nav{width:240px;padding:8px}
+#compose{display:flex;align-items:center;gap:10px;height:56px;padding:0 22px;border-radius:16px;border:0;background:#c2e7ff;font-size:14px;font-weight:600;cursor:pointer;margin-bottom:12px}
+nav a{display:flex;justify-content:space-between;height:32px;align-items:center;padding:0 18px;border-radius:16px;color:#202124;text-decoration:none}
+nav a.active{background:#d3e3fd;font-weight:600}
+section{flex:1;background:#fff;border-radius:16px;margin:0 16px 16px 0;min-height:680px}
+.toolbar{height:48px;display:flex;align-items:center;gap:4px;padding:0 12px;border-bottom:1px solid #eee}
+.tb{width:36px;height:36px;border:0;background:transparent;border-radius:50%;cursor:pointer;font-size:17px;color:#555}
+.tb:hover{background:#eee}
+.row{display:flex;align-items:center;height:44px;padding:0 12px;border-bottom:1px solid #f1f1f1;cursor:pointer}
+.row:hover{box-shadow:inset 1px 0 0 #dadce0,inset -1px 0 0 #dadce0,0 1px 2px rgba(60,64,67,.3)}
+.row.sel{background:#c2dbff}
+.row input{margin:0 12px 0 4px;width:16px;height:16px}
+.from{width:190px;font-weight:600}.subj{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.subj span{color:#5f6368;font-weight:400}
+.date{width:70px;text-align:right;font-size:12px;font-weight:600}
+#toast{position:fixed;left:24px;bottom:24px;background:#323232;color:#fff;padding:12px 20px;border-radius:6px;display:none}
+</style></head><body>
+<header><div class="logo">&#9993; Larchmont Mail</div><input id="search" placeholder="Search mail"><div class="icons"><button class="icon" id="help" title="Support">?</button><button class="icon" id="settings" title="Settings">&#9881;</button><button class="icon" id="apps" title="Apps">&#8942;&#8942;</button></div></header>
+<main><nav><button id="compose">&#9998; Compose</button>
+<a href="#" class="active" id="f-inbox" data-f="inbox"><span>Inbox</span><b id="c-inbox">7</b></a>
+<a href="#" id="f-starred" data-f="starred"><span>Starred</span></a>
+<a href="#" id="f-snoozed" data-f="snoozed"><span>Snoozed</span></a>
+<a href="#" id="f-sent" data-f="sent"><span>Sent</span></a>
+<a href="#" id="f-drafts" data-f="drafts"><span>Drafts</span><b>2</b></a>
+<a href="#" id="f-archive" data-f="archive"><span>Archive</span></a>
+<a href="#" id="f-spam" data-f="spam"><span>Spam</span></a>
+<a href="#" id="f-trash" data-f="trash"><span>Trash</span></a></nav>
+<section><div class="toolbar"><button class="tb" id="selall" title="Select">&#9744;</button><button class="tb" id="refresh" title="Refresh">&#8635;</button><button class="tb" id="archive" title="Archive">&#128229;</button><button class="tb" id="report" title="Report spam">&#9888;</button><button class="tb" id="delete" title="Delete">&#128465;</button><button class="tb" id="markread" title="Mark as read">&#9993;</button><button class="tb" id="more" title="More">&#8942;</button></div>
+<div id="list"></div></section></main><div id="toast"></div>
+<script>
+const mails=[
+{id:1,from:"Daniel Okafor",subj:"Warehouse inventory count",prev:"Hi team, the Friday count is moved to Monday at 8:00",date:"10:42",f:"inbox"},
+{id:2,from:"Priya Shah",subj:"Q3 invoice #4471",prev:"Please find attached the Q3 invoice for the Lisbon order",date:"09:15",f:"inbox"},
+{id:3,from:"Marta Ruiz",subj:"Lunch on Thursday?",prev:"There is a new place near the office that opened",date:"08:03",f:"inbox"},
+{id:4,from:"Priya Shah",subj:"Q2 invoice #4302 (paid)",prev:"Thanks, payment received, nothing else needed",date:"Nov 14",f:"inbox"},
+{id:5,from:"Larchmont IT",subj:"Password expires in 5 days",prev:"Your password will expire soon. Change it from the portal",date:"Nov 13",f:"inbox"},
+{id:6,from:"Tom Becker",subj:"Truck 12 maintenance",prev:"The truck is back from the garage, new tyres fitted",date:"Nov 12",f:"inbox"},
+{id:7,from:"Ana Lima",subj:"Supplier shortlist for 2027",prev:"I narrowed the list down to four suppliers, see notes",date:"Nov 11",f:"inbox"}];
+let folder="inbox",sel=new Set(),opened=null;
+function render(){const L=document.getElementById('list');L.innerHTML='';
+ mails.filter(m=>m.f===folder).forEach(m=>{const r=document.createElement('div');r.className='row'+(sel.has(m.id)?' sel':'');r.id='m'+m.id;
+ r.innerHTML=`<input type="checkbox" ${sel.has(m.id)?'checked':''}><div class="from">${m.from}</div><div class="subj">${m.subj} <span>- ${m.prev}</span></div><div class="date">${m.date}</div>`;
+ r.querySelector('input').onclick=e=>{e.stopPropagation();sel.has(m.id)?sel.delete(m.id):sel.add(m.id);render()};
+ r.onclick=()=>{opened=m.id;toast('Opened: '+m.subj)};L.appendChild(r)});
+ document.getElementById('c-inbox').textContent=mails.filter(m=>m.f==='inbox').length;
+ document.querySelectorAll('nav a').forEach(a=>a.classList.toggle('active',a.dataset.f===folder));
+ window.appState={folder,selected:[...sel],opened,folders:Object.fromEntries(mails.map(m=>[m.id,m.f]))}}
+function toast(t){const e=document.getElementById('toast');e.textContent=t;e.style.display='block';clearTimeout(window._t);window._t=setTimeout(()=>e.style.display='none',2500)}
+document.querySelectorAll('nav a').forEach(a=>a.onclick=e=>{e.preventDefault();folder=a.dataset.f;sel.clear();render()});
+document.getElementById('archive').onclick=()=>{if(!sel.size)return toast('Select a conversation first');sel.forEach(id=>mails.find(m=>m.id===id).f='archive');toast(sel.size+' conversation archived');sel.clear();render()};
+document.getElementById('delete').onclick=()=>{if(!sel.size)return;sel.forEach(id=>mails.find(m=>m.id===id).f='trash');toast('Moved to Trash');sel.clear();render()};
+document.getElementById('compose').onclick=()=>{window.composeOpened=true;toast('New message')};
+document.getElementById('settings').onclick=()=>{window.settingsOpened=true;toast('Settings')};
+render();
+</script></body></html>

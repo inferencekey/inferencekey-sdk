@@ -1,0 +1,36 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Account settings</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font:14px/1.4 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:rgba(20,24,30,.55);height:100vh}
+.bg{position:fixed;inset:0;background:#e8ebef;z-index:-1}
+.dlg{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:720px;background:#fff;border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,.35)}
+.hd{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid #e5e7eb}.hd h1{font-size:17px;margin:0}
+#close{width:28px;height:28px;border:0;background:transparent;font-size:18px;cursor:pointer;color:#6b7280}
+.body{display:flex}.tabs{width:180px;border-right:1px solid #e5e7eb;padding:10px 0}.tabs div{padding:8px 18px;color:#374151;cursor:pointer}.tabs .on{background:#eef2ff;color:#3730a3;font-weight:600}
+.pane{flex:1;padding:8px 22px}
+.item{display:flex;align-items:center;justify-content:space-between;padding:14px 0;border-bottom:1px solid #f3f4f6}.item p{margin:2px 0 0;font-size:12px;color:#6b7280}
+.sw{width:40px;height:22px;border-radius:11px;background:#d1d5db;position:relative;cursor:pointer;border:0}.sw::after{content:"";position:absolute;width:18px;height:18px;border-radius:50%;background:#fff;top:2px;left:2px;transition:.15s}
+.sw.on{background:#4f46e5}.sw.on::after{left:20px}
+select{height:32px;border:1px solid #d1d5db;border-radius:6px;padding:0 8px;min-width:160px}
+.ft{display:flex;justify-content:flex-end;gap:10px;padding:14px 20px;border-top:1px solid #e5e7eb}
+.ft button{height:34px;padding:0 16px;border-radius:6px;border:1px solid #d1d5db;background:#fff;cursor:pointer}#savebtn{background:#4f46e5;color:#fff;border-color:#4f46e5}
+#saved{position:fixed;top:20px;left:50%;transform:translateX(-50%);background:#065f46;color:#fff;padding:8px 16px;border-radius:6px;display:none}
+</style></head><body><div class="bg"></div>
+<div class="dlg"><div class="hd"><h1>Account settings</h1><button id="close" title="Close">&#10005;</button></div>
+<div class="body"><div class="tabs"><div class="on">General</div><div>Notifications</div><div>Privacy</div><div>Billing</div></div>
+<div class="pane">
+<div class="item"><div><b>Dark mode</b><p>Use a dark theme across the app</p></div><button class="sw" id="dark"></button></div>
+<div class="item"><div><b>Email notifications</b><p>Get an email for new comments</p></div><button class="sw on" id="emailn"></button></div>
+<div class="item"><div><b>Compact layout</b><p>Show more rows on each screen</p></div><button class="sw" id="compact"></button></div>
+<div class="item"><div><b>Language</b><p>Interface language</p></div><select id="lang" data-w="170px"><option>English</option><option>Deutsch</option><option>Español</option><option>Français</option><option>Português</option></select></div>
+<div class="item"><div><b>Time zone</b><p>Used for dates and reminders</p></div><select id="tz" data-w="170px"><option>Europe/Lisbon</option><option>Europe/Madrid</option><option>Europe/Berlin</option><option>America/New_York</option></select></div>
+</div></div>
+<div class="ft"><button id="cancelbtn">Cancel</button><button id="savebtn">Save changes</button></div></div><div id="saved">Settings saved</div>
+<script src="cselect.js"></script><script>
+let saved=null;
+function st(){return{dark:dark.classList.contains('on'),email:emailn.classList.contains('on'),compact:compact.classList.contains('on'),lang:lang.value,tz:tz.value}}
+document.querySelectorAll('.sw').forEach(b=>b.onclick=()=>{b.classList.toggle('on');upd()});
+lang.onchange=upd;tz.onchange=upd;
+savebtn.onclick=()=>{saved=st();const s=document.getElementById('saved');s.style.display='block';setTimeout(()=>s.style.display='none',2500);upd()};
+close.onclick=()=>{window.closedDialog=true};
+function upd(){window.appState={current:st(),saved}}upd();
+</script></body></html>

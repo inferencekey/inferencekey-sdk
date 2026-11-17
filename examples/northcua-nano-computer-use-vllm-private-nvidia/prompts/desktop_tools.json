@@ -1,0 +1,415 @@
+[
+ {
+  "type": "function",
+  "function": {
+   "name": "note",
+   "description": "Record important text for later steps without interacting with the desktop. Use this as explicit working memory for facts you just discovered, values that must be entered later, mistakes to avoid repeating, constraints, precautions, and next-step plans. The tool returns the note in its text result so it remains visible in tool-call history even when screenshot history is compacted.",
+   "parameters": {
+    "additionalProperties": false,
+    "description": "Parameters for the desktop ``note`` tool.",
+    "properties": {
+     "key": {
+      "default": "",
+      "description": "Stable memory key. Reuse a key to replace its previous value; omit to append.",
+      "maxLength": 160,
+      "title": "Key",
+      "type": "string"
+     },
+     "text": {
+      "description": "The exact information to preserve, such as copied values, confirmed facts, or a mistake/prevention reminder.",
+      "maxLength": 8000,
+      "title": "Text",
+      "type": "string"
+     },
+     "reason": {
+      "default": "",
+      "description": "Why this note matters for later steps, for example 'needed before filling the form' or 'avoid retyping the wrong email'.",
+      "maxLength": 2000,
+      "title": "Reason",
+      "type": "string"
+     },
+     "kind": {
+      "default": "fact",
+      "description": "The category of information being preserved.",
+      "enum": [
+       "fact",
+       "mistake",
+       "precaution",
+       "plan",
+       "constraint",
+       "decision",
+       "other"
+      ],
+      "title": "Kind",
+      "type": "string"
+     }
+    },
+    "required": [
+     "text"
+    ],
+    "title": "DesktopNoteParams",
+    "type": "object"
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "screenshot",
+   "description": "Capture a fresh desktop screenshot without sending any click, key, or typing input. Use this when you need an updated visual read of the desktop before deciding the next action. Returns plain-text feedback plus the screenshot path and format.",
+   "parameters": {
+    "additionalProperties": false,
+    "description": "Parameters for the desktop action ``screenshot`` tool.",
+    "properties": {
+     "all_screens": {
+      "default": false,
+      "description": "Set to true to capture the full virtual desktop across all monitors. Leave false to capture the primary display only.",
+      "title": "All Screens",
+      "type": "boolean"
+     }
+    },
+    "title": "DesktopScreenshotParams",
+    "type": "object"
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "click",
+   "description": "Click a desktop coordinate interpreted using the configured coordinate policy. Returns a dictionary with plain-text action feedback plus the post-action screenshot path and format.",
+   "parameters": {
+    "additionalProperties": false,
+    "description": "Parameters for the desktop ``click`` tool.",
+    "properties": {
+     "x": {
+      "description": "Horizontal coordinate.",
+      "title": "X",
+      "type": "number"
+     },
+     "y": {
+      "description": "Vertical coordinate.",
+      "title": "Y",
+      "type": "number"
+     },
+     "button": {
+      "default": "left",
+      "description": "Mouse button to click: \"left\", \"right\", or \"middle\". Use \"right\" for a right-click/context menu.",
+      "title": "Button",
+      "type": "string"
+     }
+    },
+    "required": [
+     "x",
+     "y"
+    ],
+    "title": "DesktopClickParams",
+    "type": "object"
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "double_click",
+   "description": "Double-click a desktop coordinate interpreted using the configured coordinate policy. Returns a dictionary with plain-text action feedback plus the post-action screenshot path and format.",
+   "parameters": {
+    "additionalProperties": false,
+    "description": "Parameters for the desktop ``double_click`` tool.",
+    "properties": {
+     "x": {
+      "description": "Horizontal coordinate.",
+      "title": "X",
+      "type": "number"
+     },
+     "y": {
+      "description": "Vertical coordinate.",
+      "title": "Y",
+      "type": "number"
+     },
+     "button": {
+      "default": "left",
+      "description": "Mouse button to use: \"left\", \"right\", or \"middle\".",
+      "title": "Button",
+      "type": "string"
+     }
+    },
+    "required": [
+     "x",
+     "y"
+    ],
+    "title": "DesktopDoubleClickParams",
+    "type": "object"
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "drag",
+   "description": "Drag through an ordered list of desktop coordinates interpreted using the configured coordinate policy. The path must contain at least two points. Returns plain-text feedback plus the post-action screenshot path and format.",
+   "parameters": {
+    "$defs": {
+     "DesktopPointParams": {
+      "additionalProperties": false,
+      "description": "Single pixel coordinate for native desktop actions.",
+      "properties": {
+       "x": {
+        "description": "Horizontal coordinate.",
+        "title": "X",
+        "type": "number"
+       },
+       "y": {
+        "description": "Vertical coordinate.",
+        "title": "Y",
+        "type": "number"
+       }
+      },
+      "required": [
+       "x",
+       "y"
+      ],
+      "title": "DesktopPointParams",
+      "type": "object"
+     }
+    },
+    "additionalProperties": false,
+    "description": "Parameters for the desktop ``drag`` tool.",
+    "properties": {
+     "path": {
+      "description": "Ordered drag path.",
+      "items": {
+       "$ref": "#/$defs/DesktopPointParams"
+      },
+      "minItems": 2,
+      "title": "Path",
+      "type": "array"
+     },
+     "button": {
+      "default": "left",
+      "description": "Mouse button to hold during drag: \"left\", \"right\", or \"middle\".",
+      "title": "Button",
+      "type": "string"
+     }
+    },
+    "required": [
+     "path"
+    ],
+    "title": "DesktopDragParams",
+    "type": "object"
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "move",
+   "description": "Move the mouse pointer to a desktop coordinate interpreted using the configured coordinate policy. Returns plain-text feedback plus the post-action screenshot path and format.",
+   "parameters": {
+    "additionalProperties": false,
+    "description": "Parameters for the desktop ``move`` tool.",
+    "properties": {
+     "x": {
+      "description": "Horizontal coordinate.",
+      "title": "X",
+      "type": "number"
+     },
+     "y": {
+      "description": "Vertical coordinate.",
+      "title": "Y",
+      "type": "number"
+     }
+    },
+    "required": [
+     "x",
+     "y"
+    ],
+    "title": "DesktopMoveParams",
+    "type": "object"
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "scroll",
+   "description": "Scroll the desktop at the current pointer location or at a specific desktop coordinate interpreted using the configured coordinate policy. Vertical deltas follow pyautogui wheel semantics: positive `delta_y` scrolls up and negative `delta_y` scrolls down. Returns plain-text feedback plus the post-action screenshot path and format.",
+   "parameters": {
+    "additionalProperties": false,
+    "description": "Parameters for the desktop ``scroll`` tool.",
+    "properties": {
+     "x": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "Optional horizontal coordinate.",
+      "title": "X"
+     },
+     "y": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "Optional vertical coordinate.",
+      "title": "Y"
+     },
+     "delta_x": {
+      "default": 0,
+      "description": "Horizontal scroll delta.",
+      "title": "Delta X",
+      "type": "number"
+     },
+     "delta_y": {
+      "default": 0,
+      "description": "Vertical scroll delta; positive scrolls up, negative scrolls down.",
+      "title": "Delta Y",
+      "type": "number"
+     }
+    },
+    "title": "DesktopScrollParams",
+    "type": "object"
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "type",
+   "description": "Literal text to enter into the currently focused editable control. Make sure the intended field is focused; for documents, editors, browser inputs, and terminal prompts, click or otherwise focus the exact insertion point before calling this tool. Use `target_kind` to choose paste semantics: `auto` preserves the legacy best-effort behavior; `editable` is for normal editable controls such as browser fields, LibreOffice cells/documents, filename dialogs, and code editors and uses the ordinary paste shortcut; `terminal` is only for shell prompts, REPLs, terminal emulators, and IDE-integrated terminals and uses the terminal paste shortcut on Linux. Do not choose `terminal` for LibreOffice or normal editors because it may trigger Paste Special or other shortcuts. Do not choose `editable` for Linux terminals because Ctrl+V may insert a literal ^V instead of pasting. Avoid pasting large blocks directly into terminals: newlines may execute early, some terminal apps show Unsafe Paste confirmation prompts, and terminal paste semantics vary across environments. For large multi-line code, JSON/YAML, here-docs, or REPL sessions, prefer opening a file, writing the content there, saving it, and then executing the file or command; otherwise use `editable`/`terminal` deliberately and verify the next screenshot. Prefer `keypress` for shortcuts, navigation keys, enter/escape, or exact key behavior. Returns plain-text feedback plus the post-action screenshot path and format.",
+   "parameters": {
+    "additionalProperties": false,
+    "description": "Parameters for the desktop ``type`` tool.",
+    "properties": {
+     "text": {
+      "description": "Literal text to enter into the currently focused editable control. Make sure the intended field is focused; for documents, editors, browser inputs, and terminal prompts, click or otherwise focus the exact insertion point before calling this tool. Use `target_kind` to choose paste semantics: `auto` preserves the legacy best-effort behavior; `editable` is for normal editable controls such as browser fields, LibreOffice cells/documents, filename dialogs, and code editors and uses the ordinary paste shortcut; `terminal` is only for shell prompts, REPLs, terminal emulators, and IDE-integrated terminals and uses the terminal paste shortcut on Linux. Do not choose `terminal` for LibreOffice or normal editors because it may trigger Paste Special or other shortcuts. Do not choose `editable` for Linux terminals because Ctrl+V may insert a literal ^V instead of pasting. Avoid pasting large blocks directly into terminals: newlines may execute early, some terminal apps show Unsafe Paste confirmation prompts, and terminal paste semantics vary across environments. For large multi-line code, JSON/YAML, here-docs, or REPL sessions, prefer opening a file, writing the content there, saving it, and then executing the file or command; otherwise use `editable`/`terminal` deliberately and verify the next screenshot.",
+      "title": "Text",
+      "type": "string"
+     },
+     "target_kind": {
+      "default": "auto",
+      "description": "Focused control kind for text entry. `auto` keeps backward-compatible best-effort behavior. `editable` means a normal editable control, document, form field, browser input, filename dialog, or code editor; the backend uses ordinary paste semantics. `terminal` means a shell, REPL, terminal emulator, or IDE-integrated terminal; on Linux the backend uses terminal paste semantics such as Ctrl+Shift+V. If you are not in a terminal, choose `editable`.",
+      "enum": [
+       "auto",
+       "editable",
+       "terminal"
+      ],
+      "title": "Target Kind",
+      "type": "string"
+     }
+    },
+    "required": [
+     "text"
+    ],
+    "title": "DesktopTypeParams",
+    "type": "object"
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "keypress",
+   "description": "Press one key or a key chord/ordered key sequence. Provide exactly one of `key` or `keys`. In `keys`, each array item is one ordered press unit. Use `keys=[\"ctrl+l\", \"ctrl+l\", \"tab\"]` to send Ctrl+L, Ctrl+L, then Tab; use `keys=[\"ctrl\", \"shift\", \"p\"]` only when you mean one legacy chord. Prefer platform-native modifier names in the tool call itself: on macOS prefer `cmd`; on Windows or Linux prefer `win`. Aliases such as `meta`, `command`, `super`, and `windows` are accepted. Make sure the intended target has focus before sending shortcuts. Use this for shortcuts, navigation, enter/escape, repeated chords, and explicit symbol key presses. Returns plain-text feedback plus the post-action screenshot path and format.",
+   "parameters": {
+    "additionalProperties": false,
+    "description": "Parameters for the desktop ``keypress`` tool.",
+    "oneOf": [
+     {
+      "properties": {
+       "key": {
+        "type": "string"
+       },
+       "keys": {
+        "type": "null"
+       }
+      },
+      "required": [
+       "key"
+      ]
+     },
+     {
+      "properties": {
+       "key": {
+        "type": "null"
+       },
+       "keys": {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       }
+      },
+      "required": [
+       "keys"
+      ]
+     }
+    ],
+    "properties": {
+     "key": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "Single key to press. Use this only when `keys` is omitted.",
+      "title": "Key"
+     },
+     "keys": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "Ordered key press units. Use this only when `key` is omitted. Each array item is one independent press unit fired in order. Put `+` inside a single item for a simultaneous chord: `keys=[\"ctrl+l\", \"ctrl+l\", \"tab\"]` sends Ctrl+L, Ctrl+L, then Tab. Legacy `keys=[\"ctrl\", \"shift\", \"p\"]` is accepted as one Ctrl+Shift+P chord. Use platform-native modifiers: `cmd` on macOS, `win` on Windows/Linux.",
+      "title": "Keys"
+     }
+    },
+    "title": "DesktopKeypressParams",
+    "type": "object"
+   }
+  }
+ },
+ {
+  "type": "function",
+  "function": {
+   "name": "wait",
+   "description": "Wait without sending input. The tool sleeps for the requested time and then captures a fresh screenshot. Returns plain-text feedback plus the post-wait screenshot path and format.",
+   "parameters": {
+    "additionalProperties": false,
+    "description": "Parameters for the desktop ``wait`` tool.",
+    "properties": {
+     "ms": {
+      "default": 1000,
+      "description": "Wait duration in milliseconds.",
+      "title": "Ms",
+      "type": "integer"
+     }
+    },
+    "title": "DesktopWaitParams",
+    "type": "object"
+   }
+  }
+ }
+]

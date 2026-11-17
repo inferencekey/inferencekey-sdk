@@ -1,0 +1,18 @@
+Current observation:
+- Current retained image count: {{ total_image_count }}
+{% if has_current_image %}
+{% if current_image_role == "overlay_trace" %}
+- The image below is a retained historical overlay trace from the sliding image window, not the current clean desktop state.
+- Use it to understand the annotated action path only. The newest historical tool-result screenshot is the freshest clean post-action desktop state.
+{% else %}
+- The image below is the latest full desktop state for this turn. Use it as the primary grounding image for the next action.
+{% endif %}
+- If prior tool results include screenshots, treat them as ordered historical trace. The most recent tool-result screenshot is the freshest historical post-action state, and any earlier screenshots are older history only.
+- Any tool coordinates must refer to pixel positions in the freshest clean grounding image you are using for this action, not to stale overlay markers unless you are intentionally following that marker.
+{% else %}
+- Use the most recent tool-result screenshot as the freshest visual state.
+- Treat any older screenshots as history only.
+- Otherwise reason from the textual observation only.
+{% endif %}
+
+Use this observation and the retained tool-call trace to determine current progress, whether recovery or backtracking is needed, and what the next best action should be.
