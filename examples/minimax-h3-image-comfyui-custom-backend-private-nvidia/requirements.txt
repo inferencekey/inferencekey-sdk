@@ -1,0 +1,46 @@
+# Requirements of the CUSTOM BACKEND (installed by the worker into the
+# backend's own venv). The client side (main.py) only needs the SDK,
+# `requests` and Pillow, see README.
+
+# InferenceKey SDK runtime: provides `python -m inferencekey.backend.serve`.
+inferencekey
+
+# Weights download.
+huggingface-hub
+hf_xet
+
+# ComfyUI v0.45.0 runs from a source checkout inside the same venv: these are
+# the essential lines of its requirements.txt, with torch pinned.
+torch==2.14.1
+torchvision
+torchaudio
+torchsde
+comfyui-frontend-package==1.58.5
+comfyui-workflow-templates==0.11.105
+comfyui-embedded-docs==0.5.16
+comfy-aimdo==0.6.0
+comfy-kitchen==0.2.41
+numpy>=1.25.0
+einops
+transformers>=4.50.3
+tokenizers>=0.13.3
+sentencepiece
+safetensors>=0.4.2
+aiohttp>=3.11.8
+yarl>=1.18.0
+pyyaml
+Pillow>=10.1.0
+scipy
+tqdm
+psutil
+alembic
+SQLAlchemy>=2.0.0
+filelock
+av>=17.0.0
+requests
+simpleeval>=1.0.0
+blake3
+kornia>=0.7.1
+spandrel
+pydantic~=2.0
+pydantic-settings~=2.0
