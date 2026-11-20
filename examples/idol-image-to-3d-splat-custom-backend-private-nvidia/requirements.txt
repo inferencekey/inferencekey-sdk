@@ -1,0 +1,24 @@
+# Requirements of the CUSTOM BACKEND (installed by the worker into the
+# backend's own venv). The client side (main.py) only needs the SDK,
+# `requests` and Pillow, see README.
+
+# InferenceKey SDK runtime: provides `python -m inferencekey.backend.serve`.
+inferencekey
+
+# Idol's code, at the commit this example was tested with (Apache-2.0).
+idol @ https://github.com/speridlabs/idol-sdk/archive/8db700349a5570aac390e4780fa32e3eed6b587a.tar.gz
+
+# What idol-sdk declares, with torch pinned to the version we ran.
+torch==2.14.1
+torchvision
+transformers>=4.56
+diffusers>=0.40
+accelerate>=1.0
+huggingface-hub>=0.34
+hf_xet
+safetensors>=0.4
+tensordict>=0.8
+numpy>=1.26
+pillow>=10.0
+plyfile>=1.0
+tqdm>=4.66
