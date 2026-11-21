@@ -1,0 +1,23 @@
+# Requirements of the CUSTOM BACKEND (installed by the worker into the
+# backend's own venv). The client side (main.py) only needs the SDK and
+# `requests`, see README.
+
+# InferenceKey SDK runtime: provides `python -m inferencekey.backend.serve`.
+inferencekey
+
+# PAN 2 runs on the authors' Diffusers integration (ModularPipeline, first in 0.43.0).
+diffusers==0.43.0
+transformers==5.23.0
+torch==2.14.1
+accelerate>=1.13
+huggingface-hub>=1.0
+hf_xet
+safetensors>=0.6
+numpy>=2.0
+pillow>=11.0
+# MP4 encoding (H.264).
+av>=14.0
+
+# Optional, the authors' guardrail (Qwen3Guard-Gen-4B on the request, a frame
+# classifier on the video). Uncomment and set PAN2_GUARDRAIL=1 to use it.
+# pan2-guardrail @ git+https://github.com/ifm-ai/pan2-guardrail
