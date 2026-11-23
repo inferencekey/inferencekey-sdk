@@ -1,0 +1,17 @@
+# Requirements of the CUSTOM BACKEND (installed by the worker with uv into the
+# backend's own venv). The client side (main.py) only needs the local SDK build
+# and `requests`, see README.
+
+# InferenceKey SDK runtime: provides `python -m inferencekey.backend.serve`.
+inferencekey
+
+# The authors' PyTorch package (github.com/higurashi-ai/Haru, haru/): model,
+# DuplexSession, character cards. Pulls torch, transformers, tokenizers.
+# The triton extra enables the authors' faster audio codec on NVIDIA GPUs.
+haru-speech[triton]==0.1.1
+
+# Weights download (one 10.5 GB file); hf_xet makes it parallel.
+huggingface_hub[hf_xet]
+numpy
+scipy
+soundfile
