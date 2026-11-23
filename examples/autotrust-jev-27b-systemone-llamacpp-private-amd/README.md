@@ -183,6 +183,9 @@ Every question in a request is a separate prompt evaluation: with a
 bidirectional model, questions cannot share a prefix. Put what you can in one
 question with more options.
 
+Step-by-step guide, self-hosted or on InferenceKey: [How to deploy
+AutoTrust-JEV-27B](https://docs.inferencekey.com/en/deploy/autotrust-jev-27b/).
+
 ## What we measured
 
 On our ik-node-1 worker (AMD Radeon AI PRO R9700 32 GB, ROCm), llama.cpp

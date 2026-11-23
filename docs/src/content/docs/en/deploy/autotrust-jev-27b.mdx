@@ -1,0 +1,211 @@
+---
+title: How to deploy AutoTrust-JEV-27B
+description: "Deploy the AutoTrust-JEV-27B decision model on one AMD R9700 32 GB with llama.cpp: self-hosted or on InferenceKey. Tested on the Radeon AI PRO R9700."
+sidebar:
+  label: AutoTrust-JEV-27B (decision model)
+---
+
+import { Aside, Steps, LinkCard } from "@astrojs/starlight/components";
+
+**AutoTrust-JEV-27B** v1.1 by AutoTrust AI Lab (Apache-2.0) is a 27B decision model: you send it a state and a question with options, and it returns a probability for every option instead of writing text. This guide serves it on one AMD GPU with llama.cpp's native System One API (`/v1/systemone`) in two ways: **self-hosted**, running `llama-server` by hand, and **on InferenceKey**, with the SDK's `ensure()`. There is no public GGUF of v1.1, so the guide also shows how we made our own Q6_K. We ran it from 2026-10-22 to 2026-11-23 on an AMD Radeon AI PRO R9700 32 GB.
+
+## What you need
+
+| | |
+| --- | --- |
+| **GPU** | One AMD R9700 32 GB (gfx120x, RDNA4, ROCm). The Q6_K took about 22.4 GB on the card. We did not try a smaller card or an NVIDIA card with this setup. |
+| **Disk** | 22.1 GB for the Q6_K GGUF on a local disk. Making it needs about 50 GB free (a 27 GB Q8_0 first, then the Q6_K). |
+| **Runtime** | llama.cpp **b11815** (it has the System One API and the `vllm-d3` decision readout), its ROCm 10.0 build. Python 3.9 or newer for the scripts; the conversion ran with Python 3.13 on CPU. |
+| **Inputs** | A JSON state and `choice` (or yes/no) questions with named options. Text only. |
+| **Licence** | Apache-2.0. The authors ask you to validate the model on your own data before relying on its probabilities. |
+
+## Get the code
+
+Everything is in one folder of the SDK repository:
+[`examples/autotrust-jev-27b-systemone-llamacpp-private-amd`](https://github.com/inferencekey/inferencekey-sdk/tree/main/examples/autotrust-jev-27b-systemone-llamacpp-private-amd).
+
+| File | What it does |
+| --- | --- |
+| [`publish.py`](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/autotrust-jev-27b-systemone-llamacpp-private-amd/publish.py) | Deploys it on InferenceKey with `ensure()` and the exact `llama-server` command, then waits until ready. `--dry-run` plans only, `--delete` tears it down. |
+| [`decide.py`](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/autotrust-jev-27b-systemone-llamacpp-private-amd/decide.py) | Sends one real driving decision to `/v1/systemone` and prints the choice, the probabilities and the latency. |
+| [`autotrust_jev.py`](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/autotrust-jev-27b-systemone-llamacpp-private-amd/autotrust_jev.py) | The llama.cpp converter module we wrote to turn the checkpoint into a GGUF. |
+| [`convert_retry.py`](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/autotrust-jev-27b-systemone-llamacpp-private-amd/convert_retry.py) | Runs llama.cpp's converter with retries and timeouts on every Hugging Face read. |
+| [`.env.example`](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/autotrust-jev-27b-systemone-llamacpp-private-amd/.env.example) | The variables both scripts read. |
+| [`requirements.txt`](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/autotrust-jev-27b-systemone-llamacpp-private-amd/requirements.txt) | Client side: the SDK (for `publish.py`) and `requests`. |
+| [`README.md`](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/autotrust-jev-27b-systemone-llamacpp-private-amd/README.md) | The full request format, the conversion log and every number we measured. |
+
+```bash
+git clone --depth 1 https://github.com/inferencekey/inferencekey-sdk.git
+cd inferencekey-sdk/examples/autotrust-jev-27b-systemone-llamacpp-private-amd
+```
+
+### Make the GGUF
+
+Upstream llama.cpp b11815 does not recognise the checkpoint, so `autotrust_jev.py` maps it onto llama.cpp's `vllm-d3` decision model (d3 is the model Jev builds on). The GGUF it writes says `qwen35.attention.causal = false`: the prompt is read bidirectionally, as the model was trained. These are the commands we ran, on CPU:
+
+```bash
+git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
+git checkout b11815
+cp ../autotrust_jev.py conversion/autotrust_jev.py
+python3 - <<'EOF'          # register the module next to vllm_d3
+p = "conversion/__init__.py"; s = open(p).read()
+s = s.replace('    "VllmD3Model": "vllm_d3",\n',
+              '    "VllmD3Model": "vllm_d3",\n    "AutoTrustJevModel": "autotrust_jev",\n', 1)
+open(p, "w").write(s)
+EOF
+python3 -m venv ../venv
+../venv/bin/pip install -r requirements/requirements-convert_hf_to_gguf.txt huggingface_hub
+
+# Q8_0 first, streaming the safetensors from Hugging Face (no 54 GB download):
+../venv/bin/python ../convert_retry.py convert_hf_to_gguf.py --remote autotrust/AutoTrust-JEV-27B-v1.1 \
+  --outtype q8_0 --outfile AutoTrust-JEV-27B-v1.1-Q8_0.gguf
+
+# then Q6_K with llama-quantize (a CPU build is enough):
+../venv/bin/pip install cmake ninja
+cmake -B build-cpu -G Ninja -DGGML_NATIVE=ON -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build-cpu -j8 --target llama-quantize
+build-cpu/bin/llama-quantize --allow-requantize AutoTrust-JEV-27B-v1.1-Q8_0.gguf \
+  AutoTrust-JEV-27B-v1.1-Q6_K.gguf Q6_K 12
+```
+
+The conversion took 43 min 52 s (7 dropped connections retried) and the quantization 155 s: 21,049 MiB, 6.57 bits per weight. The [README](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/autotrust-jev-27b-systemone-llamacpp-private-amd/README.md#1-make-the-gguf-once) has the checksum, the metadata we read back and what we did not confirm.
+
+## Option 1: self-host it without InferenceKey
+
+This path runs the engine directly: llama.cpp's `llama-server` serves `/v1/systemone` on your own machine, with no account and no platform. The SDK comes in on Option 2.
+
+<Steps>
+
+1. Download the llama.cpp b11815 ROCm build, `llama-b11815-bin-ubuntu-rocm-10.0-x64.tar.gz`, from the [b11815 release](https://github.com/ggml-org/llama.cpp/releases/tag/b11815) and unpack it.
+
+2. Start `llama-server` from the folder that holds it, with the same flags as the example's command. They keep every prompt in one micro-batch (`-ub 2048`), alone (`--parallel 1`), with no context checkpoints and no prompt cache, which the bidirectional model needs:
+
+   ```bash
+   LD_LIBRARY_PATH=$PWD ./llama-server -m /path/to/AutoTrust-JEV-27B-v1.1-Q6_K.gguf \
+     -ngl 99 -c 4096 -b 2048 -ub 2048 --parallel 1 --ctx-checkpoints 0 --cache-ram 0 \
+     --host 127.0.0.1 --port 8080
+   ```
+
+3. Wait until `curl -s http://127.0.0.1:8080/health` answers, then send the example's decision to it:
+
+   ```bash
+   pip install requests
+   JEV_URL=http://127.0.0.1:8080/v1/systemone python decide.py
+   ```
+
+4. You get the chosen option and a probability per option:
+
+   ```text
+   call 1: accelerate_slight_right  (768 ms, 453 input tokens)
+        0.880  accelerate_slight_right
+        0.120  accelerate_straight
+   ```
+
+</Steps>
+
+<Aside type="note">
+The same `llama-server` command, with the same GGUF and llama.cpp b11815, ran on our R9700 by hand on 2026-10-22 (inside the worker's container, about 510 ms per decision with no proxy) and through the InferenceKey worker since then. The output above is from `decide.py` through the InferenceKey endpoint on 2026-11-23; we did not run `decide.py` against a bare `llama-server` on that date.
+</Aside>
+
+## Option 2: deploy it on InferenceKey with the SDK
+
+On InferenceKey the same command runs on your registered AMD worker, behind an authenticated endpoint, and `ensure()` creates or updates the workload from code.
+
+<Steps>
+
+1. Put the Q6_K on the worker host, on a local disk the worker container reads, and set `JEV_GGUF` to the path as the worker sees it.
+
+2. Fill in `.env` from `.env.example`: an SDK token (`ik_sdk_`, scopes `workload:read` and `workload:write`), a data-plane key (`ik_live_`), your project slug and your worker id. See [Tokens](/en/quickstart/tokens/).
+
+   ```bash
+   cp .env.example .env
+   ```
+
+3. Deploy it. `python publish.py --dry-run` first shows what `ensure()` would do without changing anything:
+
+   ```bash
+   python publish.py
+   ```
+
+4. Ask it a decision:
+
+   ```bash
+   python decide.py --runs 5
+   ```
+
+</Steps>
+
+The heart of `publish.py` is one `WorkloadSpec` for the built-in `llamacpp` backend:
+
+```python
+import os
+from inferencekey import Backend, ExecutionPolicy, ManagementClient, TaskType, WorkloadSpec
+
+MODEL = "autotrust/AutoTrust-JEV-27B-v1.1"
+GGUF = os.environ.get("JEV_GGUF", "/models/huggingface/jevtaxi/AutoTrust-JEV-27B-v1.1-Q6_K.gguf")
+SLUG = os.environ.get("JEV_WORKLOAD", "autotrust-jev-27b-llamacpp-amd")
+COMMAND = (
+    "INFERENCEKEY_LLAMACPP_TAG=b11815 INFERENCEKEY_LLAMACPP_ASSET=ubuntu-rocm-10.0-x64 llama-server "
+    f"-m {GGUF} -ngl 99 -c 4096 -b 2048 -ub 2048 --parallel 1 --ctx-checkpoints 0 --cache-ram 0"
+)
+
+mgmt = ManagementClient.from_env()
+spec = WorkloadSpec(
+    name="AutoTrust JEV 27B v1.1 (llama.cpp, AMD)",
+    slug=SLUG,
+    model=MODEL,
+    description="Decision model (System One API) for the Crazy Taxi experiment.",
+    backend=Backend.LLAMACPP,
+    command=COMMAND,
+    # A decision model: options in, probabilities out.
+    task_type=TaskType.CLASSIFICATION,
+    # Pin to your AMD ROCm box. The vendor/arch (RDNA4) lives on the worker.
+    worker_id=os.environ["IK_WORKER_ID"],
+    # Private + fixed: one always-on replica. It keeps the GPU until deleted.
+    execution_policy=ExecutionPolicy.FIXED,
+)
+ref = mgmt.ensure(spec)
+mgmt.wait_until_ready(ref.workload_slug, timeout=3600)
+```
+
+A call is `POST {base}/endpoint/{project}/autotrust-jev-27b-llamacpp-amd/v1/systemone` with the `ik_live_` key, a body of `{"state": {...}, "questions": {...}}`, and an answer with `choice` and `probabilities` per question. The [README](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/autotrust-jev-27b-systemone-llamacpp-private-amd/README.md#the-request) has the full format.
+
+## What we measured
+
+On an InferenceKey worker with an AMD Radeon AI PRO R9700 32 GB (a real card), llama.cpp b11815, our Q6_K. Latency measured on the client, end to end, through the public endpoint:
+
+| What | Result |
+| --- | --- |
+| `decide.py`, game's 2 options, 5 calls (2026-11-23) | `accelerate_slight_right` 0.880, `accelerate_straight` 0.120; 0.716 to 0.806 s, median 0.719 s; 453 input tokens |
+| `decide.py`, 5 options, 5 calls (2026-11-23) | `accelerate_slight_right` 0.871, `accelerate_straight` 0.092, `accelerate_right` 0.033; 0.732 to 0.855 s, median 0.766 s; 495 input tokens |
+| One 10 minute game (2026-11-23) | 1,512 decisions, 197 sent to the model: 0.686 to 0.888 s, median 0.76 s |
+| Memory on the card (2026-10-22) | about 22.4 GB (24.7 GB in use with another 2.3 GB workload loaded) |
+| Cold start (2026-10-22) | about 19 minutes until ready |
+
+- The same request gave the same probabilities on every call, and exactly what the game logged for that state during play.
+- The cold start was slow and we did not find out why; the host has 5.8 GB of system RAM for a 22 GB file.
+- We did not compare our Q6_K's probabilities with the authors' bf16 model on vLLM.
+
+## Troubleshooting
+
+- **The GGUF has no decision metadata.** The converter log must say `Model architecture: AutoTrustJevModel`, and the GGUF must carry `qwen35.decision.type = vllm-d3` and `qwen35.attention.causal = false`. If not, the converter module was not picked up: copy `autotrust_jev.py` into `conversion/` and add its line to `conversion/__init__.py`.
+- **The conversion dies halfway with a read error.** `--remote` streams the weights with no retry. Run it through `convert_retry.py`, which retries each read and sets a timeout; our run needed 7 retries.
+- **Probabilities that look wrong.** Check that each prompt fits in `-ub` and that `--parallel 1` is set: a prompt split across micro-batches, or batched with another, is not read the way the model was trained. Raise `-b`, `-ub` and `-c` together for long prompts.
+- **The workload never gets a worker on InferenceKey.** Assign the worker to the project in the Manager. We created our own workload with an explicit worker assignment and have not checked that `ensure()` alone creates it.
+- **Readiness times out.** The first start installs llama.cpp b11815 and loads 22 GB; it took about 19 minutes on our host. `publish.py` waits up to an hour.
+
+## FAQ
+
+**How much GPU memory does AutoTrust-JEV-27B need?** Our Q6_K used about 22.4 GB on the R9700 with a 4,096 token context. We did not test smaller cards.
+
+**Can I use AutoTrust-JEV-27B commercially?** The model card releases it under Apache-2.0. The authors say to validate it on your own data before relying on its probabilities or decisions.
+
+**Does it work with the OpenAI API?** No. It does not generate text: it answers on llama.cpp's System One route, `/v1/systemone`, with a probability per option.
+
+**Why llama.cpp and not vLLM on AMD?** The authors' vLLM setup reads the prompt bidirectionally through a plugin that needs FlashAttention, which is CUDA only. llama.cpp b11815 does it from the GGUF metadata, and runs on ROCm.
+
+## Read more
+
+<LinkCard title="The example on GitHub" href="https://github.com/inferencekey/inferencekey-sdk/tree/main/examples/autotrust-jev-27b-systemone-llamacpp-private-amd" description="publish.py, decide.py, the converter module and every number we measured." />
+<LinkCard title="AutoTrust-JEV-27B v1.1 on Hugging Face" href="https://huggingface.co/autotrust/AutoTrust-Decider-Pro-Vision-27B-v1.1" description="The authors' model card, weights and licence (the repo was renamed; the old name redirects)." />
+<LinkCard title="llama.cpp b11815" href="https://github.com/ggml-org/llama.cpp/releases/tag/b11815" description="The release with the System One API and the ROCm 10.0 build." />
