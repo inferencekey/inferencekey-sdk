@@ -25,6 +25,9 @@ the model wrote with its timing, how long each 133 ms frame took on the GPU,
 and when the model started to talk after the caller's last word. It is not a
 live microphone stream: the platform has no WebSocket passthrough yet.
 
+Step-by-step guide, self-hosted or on InferenceKey:
+[How to deploy Haru-4B](https://docs.inferencekey.com/en/deploy/haru-4b/).
+
 ## What we measured (2026-11-23)
 
 Inputs: synthetic callers (English: Pocket TTS stock voice `anna`; Spanish: a

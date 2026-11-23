@@ -1,0 +1,169 @@
+---
+title: How to deploy Haru-4B
+description: "Deploy Haru-4B full-duplex voice on one NVIDIA GPU with about 12 GB: self-hosted with the InferenceKey SDK or on InferenceKey. Tested on RTX 4090 and RTX 2000 Ada."
+sidebar:
+  label: Haru-4B (full-duplex voice)
+---
+
+import { Aside, Steps, LinkCard } from "@astrojs/starlight/components";
+
+**Haru-4B** by higurashi (Apache-2.0) is a full-duplex spoken dialogue model: it listens and speaks at the same time, one 133 ms frame at a time, in nine languages (English, Spanish, Portuguese, German, French, Chinese, Japanese, Russian and Korean). This guide deploys it on one NVIDIA GPU in two ways, both with the InferenceKey SDK: **self-hosted**, with the SDK's backend runtime on your own machine, and **on InferenceKey**, with `ensure()`. We tested it on 2026-11-23 on an RTX 4090 and on a 70 W RTX 2000 Ada 16 GB.
+
+## What you need
+
+| | |
+| --- | --- |
+| **GPU** | One NVIDIA GPU with about 12 GB of memory. It ran on a real RTX 4090 24 GB and a real RTX 2000 Ada 16 GB, and under an 11 GiB PyTorch cap (an emulated 12 GB card, not a real one). It does not load in 10 GB: the weights alone are 9.92 GiB. |
+| **Disk** | 10.5 GB for the weights (one bf16 file), on a local disk. |
+| **Python** | 3.10 to 3.13. The backend installs `haru-speech` 0.1.1, the authors' PyTorch package, with its Triton audio codec. |
+| **Voice** | Haru ships without voices: you give it 3 s to 3 min of ONE speaker. Only use a voice you have the right to use. |
+| **Licence** | Apache-2.0 (weights and code). It is a pretrained base model for research: natural small talk, not a reliable source of facts. |
+
+## Get the code
+
+Everything is in one folder of the SDK repository:
+[`examples/haru-4b-full-duplex-custom-backend-private-nvidia`](https://github.com/inferencekey/inferencekey-sdk/tree/main/examples/haru-4b-full-duplex-custom-backend-private-nvidia).
+
+| File | What it does |
+| --- | --- |
+| [`backend.py`](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/haru-4b-full-duplex-custom-backend-private-nvidia/backend.py) | The custom backend: downloads the weights, loads the model, feeds the caller's clip frame by frame and returns the model's side of the call. |
+| [`requirements.txt`](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/haru-4b-full-duplex-custom-backend-private-nvidia/requirements.txt) | The backend's dependencies (`inferencekey`, `haru-speech[triton]==0.1.1`, ...). |
+| [`main.py`](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/haru-4b-full-duplex-custom-backend-private-nvidia/main.py) | Deploys it on InferenceKey with `ensure()`, makes one call and saves the audio. |
+| [`publish.py`](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/haru-4b-full-duplex-custom-backend-private-nvidia/publish.py) | Packages `backend.py` and uploads it to your tenant as a custom backend. |
+| [`README.md`](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/haru-4b-full-duplex-custom-backend-private-nvidia/README.md) | The full request format, every option and every number we measured. |
+
+```bash
+git clone --depth 1 https://github.com/inferencekey/inferencekey-sdk.git
+cd inferencekey-sdk/examples/haru-4b-full-duplex-custom-backend-private-nvidia
+```
+
+## Option 1: self-host it without InferenceKey
+
+The SDK's backend runtime serves `backend.py` on your own GPU, the same way an InferenceKey worker runs it, with no account and no platform.
+
+<Steps>
+
+1. Create a virtual environment and install the backend's dependencies (the SDK is the `inferencekey` line; see [Custom backends](/en/guides/custom-backends/) for how to install it today):
+
+   ```bash
+   python -m venv .venv && . .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+
+2. Serve the backend on a loopback port. The first start downloads the 10.5 GB checkpoint to `~/.cache/haru-backend` (`HARU_CACHE_DIR` moves it):
+
+   ```bash
+   python -m inferencekey.backend.serve \
+     --port 8099 \
+     --backend backend:HaruDuplexBackend
+   ```
+
+3. Wait until it is ready, then send one call: the caller's clip and a voice clip, both base64 WAV.
+
+   ```bash
+   curl -s http://127.0.0.1:8099/healthz   # 200 once setup() has finished
+
+   python - <<'EOF' > request.json
+   import base64, json
+   b64 = lambda p: base64.b64encode(open(p, "rb").read()).decode()
+   print(json.dumps({"id": "call-1", "input": {
+       "audio_b64": b64("caller.wav"),        # what the other person says
+       "voice_clip_b64": b64("my-voice.wav"), # 3 s to 3 min of one speaker
+       "language": "es", "tail_seconds": 8, "seed": 7}}))
+   EOF
+
+   curl -s -X POST http://127.0.0.1:8099/process \
+     -H "Content-Type: application/json" --data-binary @request.json > reply.json
+   ```
+
+4. `reply.json` holds `output.audio_b64` (the model's side, 24 kHz), `output.conversation_b64` (caller left, model right), `output.text` with its timing (`words`) and `output.timings` (GPU time per frame, when the model started to talk).
+
+</Steps>
+
+<Aside type="note">
+We checked this path on 2026-11-23 with the SDK's `python -m inferencekey.backend.serve` and this exact `backend.py`, on a CPU with the authors' tiny random test checkpoint: `/healthz` answered 200 and `/process` returned a WAV. The GPU numbers below come from the same backend running on InferenceKey workers. The runtime binds `127.0.0.1` only; put your own proxy in front if other machines must reach it.
+</Aside>
+
+## Option 2: deploy it on InferenceKey with the SDK
+
+On InferenceKey the same `backend.py` runs on your registered GPU worker, behind an authenticated endpoint, and `ensure()` creates or updates the workload from code.
+
+<Steps>
+
+1. Fill in `.env` from `.env.example`: an SDK token (`ik_sdk_`, scopes `workload:read` and `workload:write`), a data-plane key (`ik_live_`), your project slug and your worker id. See [Tokens](/en/quickstart/tokens/).
+
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Publish the backend once (or upload `dist/*.tar.gz` from Dashboard, Custom backends):
+
+   ```bash
+   python publish.py
+   ```
+
+3. Deploy and call it. `main.py` runs `ensure()`, waits until the worker is ready, makes one call and deletes the workload at the end (`IK_KEEP_ALIVE=1` keeps it):
+
+   ```bash
+   python main.py caller.wav my-voice.wav --language es
+   ```
+
+</Steps>
+
+The heart of `main.py` is one `WorkloadSpec` with the custom backend's slug:
+
+```python
+import os
+from inferencekey import ExecutionPolicy, ManagementClient, WorkloadSpec
+
+spec = WorkloadSpec(
+    slug="haru-4b",
+    name="Haru-4B voice line",
+    model="higurashi-ai/Haru-4B",
+    backend="haru-4b-full-duplex",      # the custom backend published by publish.py
+    task_type="text2audio",
+    worker_id=os.environ["IK_WORKER_ID"],
+    execution_policy=ExecutionPolicy.FIXED,
+    config={"ready_timeout_secs": 2400, "request_timeout_secs": 300},
+)
+ref = mgmt.ensure(spec)
+mgmt.wait_until_ready(ref.workload_slug, timeout=2400)
+```
+
+A call is an OpenAI-style chat request with the caller's audio as an `input_audio` part, sent to `POST {base}/endpoint/{project}/haru-4b/v1/chat/completions` with the `ik_live_` key. The voice and the character card go in `extra_body`; the [README](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/haru-4b-full-duplex-custom-backend-private-nvidia/README.md#the-request) has the full format.
+
+## What we measured
+
+On InferenceKey workers, 2026-11-23, synthetic callers, timings measured by the backend on the GPU:
+
+| Card | GPU time per 133 ms frame (median) | Peak on the card | Ready after `ensure()` |
+| --- | --- | --- | --- |
+| RTX 4090 24 GB | 44 to 48 ms | 11,248 MiB | 76.2 s (fresh worker) |
+| RTX 2000 Ada 16 GB (70 W) | 57 ms | 10,920 MiB | 84.7 s (fresh worker) |
+| 11 GiB cap (emulated 12 GB card) | 44 to 46 ms (4090), 57 ms (2000 Ada) | 10,920 to 11,242 MiB | same words as uncapped with the same seed |
+| 9 GiB cap (emulated 10 GB card) | does not load: CUDA out of memory | | |
+
+- No frame took longer than 133 ms in 41 calls (worst single frame 74.6 ms).
+- Without the Triton codec (`HARU_CODEC_BACKEND=torch`) a frame took 64 to 67 ms on the RTX 4090.
+- After a greeting or a question the model started talking 0.12 to 1.13 s after the caller's last word.
+- Asked for the capital of Australia it stayed silent, changed the subject or said "Sydney": do not use it for facts.
+
+## Troubleshooting
+
+- **A long call returns 504 `inference_timeout` on InferenceKey.** A result travels in one message of at most 8 MB. The backend switches to FLAC and drops the two-channel copy when needed, and returns a clear error if the reply alone is too big: send a shorter clip or less `tail_seconds`.
+- **Warnings about Gated DeltaNet kernels falling back to PyTorch.** Harmless: real time holds. Installing `flash-linear-attention` 0.6.0 by hand in the backend's environment took a frame from 44 to 48 ms down to 38 to 41 ms on the RTX 4090 (430 MiB more on the card).
+- **One conversation at a time.** The backend holds a lock per worker; a second request waits for the first. The authors' vLLM-Omni plugin serves many conversations at once; this example does not use it.
+
+## FAQ
+
+**How much GPU memory does Haru-4B need?** About 11 GB at peak in our runs, so a 12 GB card is the floor (tested as an emulated cap, not on a real 12 GB card). A 10 GB budget runs out of memory while loading.
+
+**Can I use Haru-4B commercially?** The weights and code are Apache-2.0. The voice you clone is your responsibility: only use one you have the right to use.
+
+**Does it stream from a live microphone?** Not in this example: each request carries one recorded clip, fed to the model frame by frame like a live line.
+
+## Read more
+
+<LinkCard title="Full write-up: Haru-4B in Spanish on a small GPU" href="https://inferencekey.com/research/haru-4b-full-duplex-voice-spanish" description="The test, the calls we recorded, the memory ladder and what went wrong." />
+<LinkCard title="Video: Haru-4B plays your customer" href="https://www.youtube.com/watch?v=yjDr5hIwjT8" description="Every audio demo played in full, with the numbers on screen." />
+<LinkCard title="Haru-4B on Hugging Face" href="https://huggingface.co/higurashi-ai/Haru-4B" description="The authors' model card, weights and licence." />

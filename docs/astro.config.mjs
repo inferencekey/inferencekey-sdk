@@ -88,6 +88,14 @@ export default defineConfig({
           translations: { es: "Referencia de API", fr: "Référence API" },
           autogenerate: { directory: "api" },
         },
+        {
+          // One "How to deploy <model>" page per model we have run end to end
+          // (each one has its runnable example under examples/).
+          label: "Deploy a model",
+          translations: { es: "Desplegar un modelo", fr: "Déployer un modèle" },
+          collapsed: true,
+          autogenerate: { directory: "deploy" },
+        },
       ],
     }),
   ],
