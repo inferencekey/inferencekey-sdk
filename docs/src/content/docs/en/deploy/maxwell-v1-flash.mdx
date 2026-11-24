@@ -1,0 +1,216 @@
+---
+title: How to deploy Maxwell-V1.0-Flash
+description: "Deploy Maxwell-V1.0-Flash (FP8, 128K context) with vLLM on one 48 GB NVIDIA GPU: self-hosted or on InferenceKey. Tested on L40S and RTX 4090."
+sidebar:
+  label: Maxwell-V1.0-Flash (long-context MoE)
+---
+
+import { Aside, Steps, LinkCard } from "@astrojs/starlight/components";
+
+**Maxwell-V1.0-Flash** by the Maxwell team (Apache-2.0) is a 35B-total, 3B-active mixture-of-experts language model built to read long documents: its block-sparse attention lets each KV group look at no more than 32 blocks of 128 tokens, so the attention work per token stops growing with the context. The KV cache still keeps every token, so memory still grows. This guide serves the official FP8 build with vLLM on one NVIDIA GPU in two ways, both with the InferenceKey SDK example: **self-hosted**, running `vllm serve` by hand, and **on InferenceKey**, with `ensure()`. We tested it on 2026-11-24 on an L40S 48 GB and on a real RTX 4090 24 GB with CPU offload.
+
+## What you need
+
+| | |
+| --- | --- |
+| **GPU** | One NVIDIA GPU with 48 GB, Ada (sm_89) or newer, for full speed and a 131,072-token window: it ran on a real L40S 48 GB. The smallest card that passed is a real RTX 4090 24 GB with `--cpu-offload-gb 20`, about 10x slower. 32 GB and 24 GB caps were emulated on the L40S. Without offload 48 GB is the floor: the FP8 weights alone take 34.68 GiB on the card. We did not try 16 GB or 12 GB, a real 32 GB card, or Ampere (the FP8 KV cache needs sm_89 or newer). |
+| **Host RAM** | Only for offload: about 20 GB free for the 24 GB setup. |
+| **Disk** | 38.6 GB for the FP8 weights plus about 8 GB for the vLLM environment. 100 GB was enough. |
+| **Runtime** | Linux, Python 3.12, a CUDA 13 driver (580 or newer; we ran 595.112.07). vLLM is the upstream nightly wheel `0.30.1rc1.dev219+ga9eafde59` (torch 2.13.0+cu130) with the authors' fork files copied on top; `prepare_worker.sh` installs it. |
+| **Inputs** | Text, through the OpenAI chat API. It thinks before every answer and supports tool calls. |
+| **Licence** | Apache-2.0, not gated. The authors' own Docker image (`maxwellmodel/vllm-openai:v0.30.0`) is built for Hopper and Blackwell only and does not run on Ada or Ampere cards. |
+
+## Get the code
+
+Everything is in one folder of the SDK repository:
+[`examples/maxwell-v1-flash-fp8-long-context-vllm-private-nvidia`](https://github.com/inferencekey/inferencekey-sdk/tree/main/examples/maxwell-v1-flash-fp8-long-context-vllm-private-nvidia).
+
+| File | What it does |
+| --- | --- |
+| [`prepare_worker.sh`](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/maxwell-v1-flash-fp8-long-context-vllm-private-nvidia/prepare_worker.sh) | One-time setup: builds a venv with the upstream vLLM wheel of commit `a9eafde5` and `ninja`, copies the authors' 31 fork files over it and checks the version. |
+| [`main.py`](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/maxwell-v1-flash-fp8-long-context-vllm-private-nvidia/main.py) | Deploys it on InferenceKey with `ensure()`, waits until ready, asks the model card's question, optionally reads a long document, makes a tool call and deletes the workload. |
+| [`.env.example`](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/maxwell-v1-flash-fp8-long-context-vllm-private-nvidia/.env.example) | The variables `main.py` reads, including the context, GPU share and offload options. |
+| [`requirements.txt`](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/maxwell-v1-flash-fp8-long-context-vllm-private-nvidia/requirements.txt) | Client side: the SDK and `requests`. |
+| [`.gitignore`](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/maxwell-v1-flash-fp8-long-context-vllm-private-nvidia/.gitignore) | Keeps `.env` and `outputs/` out of git. |
+| [`README.md`](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/maxwell-v1-flash-fp8-long-context-vllm-private-nvidia/README.md) | Compatibility, the exact command, every number we measured and the troubleshooting notes. |
+
+```bash
+git clone --depth 1 https://github.com/inferencekey/inferencekey-sdk.git
+cd inferencekey-sdk/examples/maxwell-v1-flash-fp8-long-context-vllm-private-nvidia
+```
+
+## Option 1: self-host it without InferenceKey
+
+This path runs the engine directly: vLLM serves an OpenAI-compatible API on your own machine, with no account and no platform. The SDK comes in on Option 2.
+
+<Steps>
+
+1. Build the vLLM environment with the example's script. `INFERENCEKEY_RUNTIME_DIR` puts it in a folder you own instead of `/opt/inferencekey`:
+
+   ```bash
+   INFERENCEKEY_RUNTIME_DIR=$HOME/maxwell ./prepare_worker.sh
+   . $HOME/maxwell/venvs/vllm-26a731c5684ad61c/bin/activate   # puts vllm and ninja on PATH
+   ```
+
+2. Start vLLM with the example's command. The first start downloads the 38.6 GB of weights and compiles kernels:
+
+   ```bash
+   vllm serve maxwell-model/Maxwell-V1-Flash-FP8 --revision 6f91969de0d39c9fdbb98306e8826ba4f661125b \
+     --trust-remote-code --block-size 128 --max-model-len 131072 --kv-cache-dtype fp8 \
+     --gpu-memory-utilization 0.965 --max-num-seqs 4 \
+     --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+     --host 127.0.0.1 --port 8000
+   ```
+
+   On a 24 GB card use `--max-model-len 40960 --gpu-memory-utilization 0.92 --cpu-offload-gb 20` instead.
+
+3. Wait until `curl -s http://127.0.0.1:8000/health` answers, then ask the model card's question with the OpenAI client and the authors' sampling:
+
+   ```python
+   from openai import OpenAI
+
+   client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="unused")
+   r = client.chat.completions.create(
+       model="maxwell-model/Maxwell-V1-Flash-FP8",
+       messages=[{"role": "user", "content": "Why is it harder to keep a room cool when the door is open "
+                                             "on a hot day? Explain in 3-4 simple sentences."}],
+       max_tokens=4096, temperature=0.6, top_p=0.95, extra_body={"top_k": 20},
+   )
+   print(r.choices[0].message.content)
+   ```
+
+4. The answer is in `content`. The thinking that came before it is in a separate reasoning field of the message, split out by `--reasoning-parser qwen3`.
+
+</Steps>
+
+<Aside type="note">
+The same `vllm serve` command, with this environment (upstream wheel `a9eafde5` plus the fork files), ran through the InferenceKey worker on an L40S on 2026-11-24. On the same day we also ran `vllm serve` by hand on the GPU host for the smaller-card tests (L40S with memory caps, and a real RTX 4090), with CPU offload and without the reasoning and tool parsers, and sent it the model card's question and a 32K review over plain HTTP. We did not run the OpenAI client snippet above against a bare server. `prepare_worker.sh` itself was run end to end on a CPU machine; on the GPU hosts the same steps ran from our setup script.
+</Aside>
+
+## Option 2: deploy it on InferenceKey with the SDK
+
+On InferenceKey the same command runs on your registered NVIDIA worker, behind an authenticated endpoint, and `ensure()` creates or updates the workload from code.
+
+<Steps>
+
+1. On the worker host, once, as the user the worker runs as. The worker finds vLLM already installed at the path it derives from `vllm_version` and skips its own install:
+
+   ```bash
+   ./prepare_worker.sh
+   ```
+
+2. On your machine, fill in `.env` from `.env.example`: an SDK token (`ik_sdk_`, scopes `workload:read` and `workload:write`), a data-plane key (`ik_live_`), your project slug and your worker id. See [Tokens](/en/quickstart/tokens/).
+
+   ```bash
+   cp .env.example .env
+   pip install -r requirements.txt
+   ```
+
+3. Deploy and call it. `main.py` runs `ensure()`, waits until vLLM serves, runs the calls, saves `outputs/answers.json` and deletes the workload at the end (`IK_KEEP_ALIVE=1` keeps it):
+
+   ```bash
+   python main.py
+   ```
+
+</Steps>
+
+The heart of `main.py` is one `WorkloadSpec` for the built-in `vllm` backend:
+
+```python
+import os
+
+from inferencekey import (
+    Backend,
+    DataClient,
+    ExecutionPolicy,
+    InferenceKeyError,
+    ManagementClient,
+    WorkloadSpec,
+)
+
+MODEL = "maxwell-model/Maxwell-V1-Flash-FP8"
+REVISION = "6f91969de0d39c9fdbb98306e8826ba4f661125b"
+CONTEXT = int(os.environ.get("MAXWELL_CONTEXT", "131072"))
+KV_DTYPE = os.environ.get("MAXWELL_KV_DTYPE", "fp8")
+GPU_UTIL = os.environ.get("MAXWELL_GPU_UTIL", "0.965")
+HF_HOME = os.environ.get("MAXWELL_HF_HOME", "")
+
+COMMAND = (
+    (f"HF_HOME={HF_HOME} " if HF_HOME else "")
+    + f"vllm serve {MODEL} --revision {REVISION} --trust-remote-code --block-size 128 "
+    f"--max-model-len {CONTEXT} --kv-cache-dtype {KV_DTYPE} --gpu-memory-utilization {GPU_UTIL} "
+    "--max-num-seqs 4 --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder"
+)
+if os.environ.get("MAXWELL_EXTRA_ARGS"):
+    COMMAND += " " + os.environ["MAXWELL_EXTRA_ARGS"]
+
+VLLM_VERSION = "0.30.1rc1.dev219+ga9eafde59"
+
+SLUG = "maxwell-v1-flash"
+
+mgmt = ManagementClient.from_env()
+spec = WorkloadSpec(
+    name="Maxwell-V1.0-Flash (FP8, vLLM)",
+    slug=SLUG,
+    model=MODEL,
+    backend=Backend.VLLM,
+    command=COMMAND,
+    vllm_version=VLLM_VERSION,
+    task_type="text2text",
+    # Pin to your NVIDIA worker (48 GB). Never hard-code the id.
+    worker_id=os.environ["IK_WORKER_ID"],
+    execution_policy=ExecutionPolicy.FIXED,
+)
+ref = mgmt.ensure(spec)
+mgmt.wait_until_ready(ref.workload_slug, timeout=3600)
+```
+
+A call is an OpenAI chat request to `POST {base}/endpoint/{project}/maxwell-v1-flash/v1/chat/completions` with the `ik_live_` key, or `DataClient.from_env().endpoint("maxwell-v1-flash").generate_text(...)` from the SDK. The [README](https://github.com/inferencekey/inferencekey-sdk/blob/main/examples/maxwell-v1-flash-fp8-long-context-vllm-private-nvidia/README.md#what-it-does) has the command and the notes on thinking and tool calls.
+
+## What we measured
+
+On InferenceKey workers, 2026-11-24, official FP8 weights, FP8 KV cache, one request at a time, streaming through the endpoint unless the row says otherwise:
+
+| What | Result |
+| --- | --- |
+| Window on a real L40S 48 GB | 131,072 tokens. KV cache 7.49 GiB = 155,136 tokens at `--gpu-memory-utilization 0.965`. At 0.95 it did not fit (vLLM offered 129,408) |
+| Decode, 512 tokens (L40S) | 122.0 tok/s short prompt, 118.1 at 4K, 115.8 at 32K, 106.8 to 108.4 at 125K |
+| First token, cold prefix (L40S) | 0.86 s at 4K, 5.07 s at 32K, 19.05 to 19.31 s at 125K (about 6,500 prompt tokens/s) |
+| Contract review, 3 questions (L40S) | 125K tokens: right with values in 3 of 3 runs. 32K: 1 of 1. 4K: 2 of 3 with values, 1 gave only the clause numbers |
+| Ready after `ensure()` (L40S) | 169.9 s on the second start (load 20.7 s, 34.68 GiB on the card; engine init 111.25 s) |
+| Tool call (L40S) | `get_contract({"contract_id": "MSA-2291"})` in 1.3 s, final answer 1.0 s, correct |
+| 32 GB cap, emulated on the L40S (direct `vllm serve`) | `--cpu-offload-gb 12`: 18.7 tok/s, 32K first token 43.02 s, peak 31,546 MiB. Values only in the thinking, answer listed clause numbers |
+| 24 GB cap, emulated on the L40S (direct `vllm serve`) | `--cpu-offload-gb 20`: 12.9 tok/s, 32K first token 64.11 s, peak 23,625 MiB. Same answer as the 32 GB cap |
+| Real RTX 4090 24 GB (direct `vllm serve`) | `--cpu-offload-gb 20`, 40,960 window: 12.1 tok/s, 32K first token 68.97 s, peak 22,851 MiB. Right with values |
+
+- Writing speed barely drops with context: 122 tok/s on a short prompt, about 107 at 125K. Reading the prompt is what costs time: 19 s at 125K on the L40S.
+- The authors' Docker image could not run on the L40S: its core vLLM kernels exist only for sm_90 and sm_100. We read that from the binaries and used the upstream wheel plus the fork files instead.
+- The clause-numbers-only answer showed up at 4K on the L40S and with the same text on both emulated caps (same seed), so we read it as a prompt-following slip, not an offload effect.
+- Through the InferenceKey endpoint the model always thinks: `enable_thinking: false` had no effect.
+
+## Troubleshooting
+
+- **`No matching distribution found for vllm==0.30.1rc1.dev219+ga9eafde59` on InferenceKey.** `prepare_worker.sh` has not run on that worker, or ran as another user, so the worker found no vLLM in its venv and tried PyPI. Run it as the worker's user.
+- **`ValueError: To serve at least one request with the model's max seq len (131072) ...` at start.** The KV cache does not fit. Raise `--gpu-memory-utilization` a little (0.95 was not enough on a 46,068 MiB L40S; 0.965 was) or lower `--max-model-len`: the error prints the largest length that fits.
+- **`FileNotFoundError: ... 'ninja'` at warm-up.** vLLM builds a few kernels with `ninja`. `prepare_worker.sh` installs it into the venv; activate the venv or put its `bin` on `PATH`.
+- **A request with a 125K prompt gets a 400.** Prompt plus `max_tokens` must fit in the window: 124,929 prompt tokens with `max_tokens` 6,144 is one token over 131,072. On InferenceKey, a streaming request that vLLM refused this way closed empty after 180 s with no error event; that is an open issue on our side.
+- **The authors' image fails on an L40S, RTX 4090 or Ampere card.** It is built for Hopper and Blackwell only. Use `prepare_worker.sh` instead.
+- **The answer lists clause numbers without the values.** Ask explicitly for the values in the final answer, and leave `max_tokens` room for the thinking.
+- **403 `endpoint_forbidden` on InferenceKey.** Add `<project>/maxwell-v1-flash` (or `<project>/*`) to the API key's allowed endpoints.
+
+## FAQ
+
+**How much GPU memory does Maxwell-V1.0-Flash need?** With the official FP8 weights, 48 GB for everything on the card: the weights take 34.68 GiB and the 131,072-token FP8 KV cache 7.49 GiB on an L40S. Smaller cards need CPU offload.
+
+**Does Maxwell-V1.0-Flash run on a 24 GB card?** Yes, slowly: on a real RTX 4090 with `--cpu-offload-gb 20` and a 40,960-token window it wrote 12.1 tok/s and took 68.97 s to the first token on a 32K prompt, and answered right.
+
+**Can I use Maxwell-V1.0-Flash commercially?** The model card releases it under Apache-2.0, and the weights are not gated.
+
+**Does it work with the OpenAI API?** Yes. vLLM serves `/v1/chat/completions`; with the example's parsers the thinking comes back separately from the answer, and tool calls come back as OpenAI `tool_calls`.
+
+## Read more
+
+<LinkCard title="Full write-up: Maxwell-V1.0-Flash reads a 125K-token contract on one 48 GB card" href="https://inferencekey.com/research/maxwell-flash-long-context-one-card" description="The 125K contract test, the speeds, the smaller-card ladder and what went wrong." />
+<LinkCard title="Video: Maxwell-V1.0-Flash reads a 125K-token contract bundle" href="https://youtu.be/jD-MVDIPEvQ" description="The deploy, the long read on one L40S and the GPU ladder, with the numbers on screen." />
+<LinkCard title="The example on GitHub" href="https://github.com/inferencekey/inferencekey-sdk/tree/main/examples/maxwell-v1-flash-fp8-long-context-vllm-private-nvidia" description="prepare_worker.sh, main.py and every number we measured." />
+<LinkCard title="Maxwell-V1-Flash-FP8 on Hugging Face" href="https://huggingface.co/maxwell-model/Maxwell-V1-Flash-FP8" description="The authors' model card, weights and licence." />

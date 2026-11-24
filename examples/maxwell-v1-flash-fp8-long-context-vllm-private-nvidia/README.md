@@ -43,6 +43,9 @@ KV cache, and then:
   Python files. The MBSA kernel library itself is for Hopper and Blackwell; on
   other cards the fork runs its Triton block-sparse path.
 
+Step-by-step guide, self-hosted or on InferenceKey: [How to deploy
+Maxwell-V1.0-Flash](https://docs.inferencekey.com/en/deploy/maxwell-v1-flash/).
+
 ## Measured on one L40S 48 GB (2026-11-24)
 
 | What | Value |
