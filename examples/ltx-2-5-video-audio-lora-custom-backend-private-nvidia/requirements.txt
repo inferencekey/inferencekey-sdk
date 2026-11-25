@@ -1,0 +1,27 @@
+# Requirements of the CUSTOM BACKEND (installed by the worker into the
+# backend's own venv). The client side (main.py) only needs the SDK and
+# `requests`, see README.
+
+# InferenceKey SDK runtime: provides `python -m inferencekey.backend.serve`.
+inferencekey
+
+# PyTorch 2.13 built for CUDA 13.2, like the LTX-2 repo (needs an NVIDIA driver
+# for CUDA 13.2 or newer). torchaudio 2.11.1 needs torch 2.13 (with 2.12.1 it
+# fails: "libtorchaudio.so: undefined symbol"). torch 2.13.0 pins cuDNN
+# 9.20.0.48, which the authors override to 9.24.0.43 in their uv workspace; a
+# requirements.txt cannot override a pin, so backend.py setup() applies it.
+--extra-index-url https://download.pytorch.org/whl/cu132
+torch==2.13.0+cu132
+torchvision==0.28.0+cu132
+torchaudio==2.11.1+cu132
+
+# The authors' code (Apache-2.0) at the commit we tested: the model and the pipelines.
+ltx-core @ git+https://github.com/Lightricks/LTX-2.git@c3a7efb18256cba2d76cc32f5b47811d7c9ad642#subdirectory=packages/ltx-core
+ltx-pipelines @ git+https://github.com/Lightricks/LTX-2.git@c3a7efb18256cba2d76cc32f5b47811d7c9ad642#subdirectory=packages/ltx-pipelines
+transformers>=5.8.0,<5.15
+
+huggingface-hub>=0.31,<2
+hf_xet
+pyyaml>=6
+Pillow>=10
+av>=14
