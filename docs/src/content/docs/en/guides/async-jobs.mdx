@@ -274,9 +274,10 @@ X-InferenceKey-Signature: t=1769385600,v1=5257a869e7ecebe7…
   "data": {
     "job_id": "9f1c3a7e-5d02-4a11-b7c8-2e6481c1cf29",
     "status": "ok",
-    "payload": { "data": [{ "embedding": [0.013, -0.271, "…"] }] },
+    "output": "Here is a short summary of the order…",
     "metrics": { "…": "…" },
-    "usage": { "input_tokens": 7, "output_tokens": 0, "total_tokens": 7 }
+    "usage": { "input_tokens": 7, "output_tokens": 42, "total_tokens": 49 },
+    "finish_reason": "stop"
   }
 }
 ```
@@ -296,13 +297,16 @@ Inside `data`:
 | Field | Meaning |
 |---|---|
 | `status` | `ok` or an error status. |
-| `payload` | The JSON result, for JSON-returning modalities (embeddings, rerank, chat, forecast). |
-| `output` | Plain-text output, when the modality produces text. |
-| `binary_b64` | Base64 result bytes for binary modalities (audio, images). |
+| `output` | The result as a string: the generated text for chat, or a JSON string (parse it) for results served by a custom SDK backend. |
+| `binary_b64` | Base64 result bytes, read together with `content_type`. Native runtimes deliver embeddings, rerank, transcriptions, images and audio here. |
 | `content_type` | MIME type that pairs with `binary_b64`, e.g. `image/png`. |
 | `usage` | Token counts, when the runtime reports them. |
 | `units` | Physical units — audio seconds, images generated. |
 | `error` | Present when `event` is `job.failed`; carries the failure reason. |
+
+A rule that works for every modality: if `binary_b64` is present, decode it and interpret it by `content_type`; otherwise the result is in `output`.
+
+The callback does **not** echo your request back. There is no `payload` field with the `messages`, `max_tokens` or `temperature` you sent, so a large input (an image in `messages`, for example) does not make the callback larger. Use `job_id` and your `context` to match a callback to its request.
 
 <Aside type="note" title="Your context is never mixed with ours">
 We attach internal routing metadata to the job as well, but it is stripped before delivery. The `context` you read is exactly the JSON you sent — no wrapper keys to unpick.
